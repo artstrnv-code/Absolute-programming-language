@@ -109,6 +109,10 @@ func linker.link_instruction(instruction, function_names) {
     return [opcode, linker.link_expr(get(instruction, 1), function_names)]
   }
 
+  if opcode == ir.OP_ERR_RETURN {
+    return [opcode, linker.link_expr(get(instruction, 1), function_names), linker.link_expr(get(instruction, 2), function_names)]
+  }
+
   if opcode == ir.OP_RETURN {
     return [opcode, linker.link_expr(get(instruction, 1), function_names)]
   }
@@ -118,7 +122,23 @@ func linker.link_instruction(instruction, function_names) {
   }
 
   if opcode == ir.OP_WHILE {
-    return [opcode, linker.link_expr(get(instruction, 1), function_names), get(instruction, 2), linker.link_program(get(instruction, 3), function_names)]
+    return [opcode, linker.link_expr(get(instruction, 1), function_names), linker.link_expr(get(instruction, 2), function_names), linker.link_program(get(instruction, 3), function_names), linker.link_program(get(instruction, 4), function_names), linker.link_program(get(instruction, 5), function_names)]
+  }
+
+  if opcode == ir.OP_MATCH {
+    VTime cases = []
+    pick(get(instruction, 2)): case_entry {
+      VTime patterns = []
+      pick(get(case_entry, 0)): pattern {
+        VTime linked_pattern = [get(pattern, 0), linker.link_expr(get(pattern, 1), function_names)]
+        if get(pattern, 0) == parser.MATCH_RANGE {
+          add(linked_pattern, linker.link_expr(get(pattern, 2), function_names))
+        }
+        add(patterns, linked_pattern)
+      }
+      add(cases, [patterns, linker.link_program(get(case_entry, 1), function_names)])
+    }
+    return [opcode, linker.link_expr(get(instruction, 1), function_names), cases, linker.link_program(get(instruction, 3), function_names)]
   }
 
   if opcode == ir.OP_PICK {
@@ -236,6 +256,11 @@ func linker.collect_instruction_calls(instruction, function_names, reachable) {
     return linker.collect_expr_calls(get(instruction, 1), function_names, reachable)
   }
 
+  if opcode == ir.OP_ERR_RETURN {
+    reachable = linker.collect_expr_calls(get(instruction, 1), function_names, reachable)
+    return linker.collect_expr_calls(get(instruction, 2), function_names, reachable)
+  }
+
   if opcode == ir.OP_RETURN {
     return linker.collect_expr_calls(get(instruction, 1), function_names, reachable)
   }
@@ -248,6 +273,23 @@ func linker.collect_instruction_calls(instruction, function_names, reachable) {
 
   if opcode == ir.OP_WHILE {
     reachable = linker.collect_expr_calls(get(instruction, 1), function_names, reachable)
+    reachable = linker.collect_expr_calls(get(instruction, 2), function_names, reachable)
+    reachable = linker.collect_program_calls(get(instruction, 3), function_names, reachable)
+    reachable = linker.collect_program_calls(get(instruction, 4), function_names, reachable)
+    return linker.collect_program_calls(get(instruction, 5), function_names, reachable)
+  }
+
+  if opcode == ir.OP_MATCH {
+    reachable = linker.collect_expr_calls(get(instruction, 1), function_names, reachable)
+    pick(get(instruction, 2)): case_entry {
+      pick(get(case_entry, 0)): pattern {
+        reachable = linker.collect_expr_calls(get(pattern, 1), function_names, reachable)
+        if get(pattern, 0) == parser.MATCH_RANGE {
+          reachable = linker.collect_expr_calls(get(pattern, 2), function_names, reachable)
+        }
+      }
+      reachable = linker.collect_program_calls(get(case_entry, 1), function_names, reachable)
+    }
     return linker.collect_program_calls(get(instruction, 3), function_names, reachable)
   }
 

@@ -1,0 +1,1670 @@
+# APL Context
+
+This file records the language decisions we made during early design. Keep it
+updated when the language changes.
+
+## Identity
+
+APL means Absoluta Programming Language.
+
+APL is a standalone general-purpose native language for application,
+architecture, and systems programming. It must be able to express and execute
+computation directly instead of depending on another language for ordinary
+high-level or low-level work. Orchestration, contracts, routing, security
+boundaries, and typed shared state remain defining strengths.
+
+Foreign-language containers are a first-party library ecosystem built on
+generic contracts, ABI, and security capabilities. Python, JavaScript, C,
+C++, Rust, and other adapters must not become compiler-special-cased language
+constructs. A program that does not include the container libraries must not
+carry their runtime or dependencies.
+
+Long-term target: APL must become an AOT native compiled language, not
+permanently a language hosted by a Rust runtime or bytecode VM. The current
+Rust implementation is a bootstrap host. The production compiler should lower
+APL into a low-level native IR, emit inspectable assembly and/or platform object
+files, and invoke a platform linker to produce PE executables on Windows, ELF
+executables on Linux, and Mach-O applications on macOS. AppImage is a packaging
+target around a Linux executable, not a separate code-generation format. A
+freestanding native runtime path must eventually support kernel and OS-level
+development without depending on the Rust host or a managed runtime.
+
+Native APL may expose raw memory and hardware control through explicit,
+separately includable system libraries. These operations are not implicit
+ordinary-language behavior: their use must be visible, capability-controlled,
+and removable from builds that do not need them. APL must not require a foreign
+language or managed runtime to implement its own allocator, ISO builder,
+bootloader tooling, or OS components.
+
+Core phrase:
+
+```text
+APL computes and controls.
+Libraries extend.
+Contracts protect boundaries.
+```
+
+## Roadmap
+
+Current high-level plan:
+
+1. Build the base language.
+2. Build the interpreted runtime.
+3. Close the portable self-host compiler/VM bootstrap and move standard
+   behavior into APL.
+4. Stabilize core-language semantics against the Rust reference runtime.
+5. Add an APL-owned native lowering/backend that can emit assembly, object
+   files, and linked platform executables.
+6. Add a freestanding runtime profile suitable for future OS work.
+7. Add explicit system libraries, including controlled raw-memory and hardware
+   access for freestanding programs.
+8. Add first-party foreign-language container libraries behind strict generic
+   contracts.
+9. Build APL-owned packaging libraries for executables, AppImage, ISO, disk
+   images, and other deployment formats.
+10. Polish tooling, diagnostics, and platform packaging.
+
+Current implementation has parser, checker, CLI, GUI shell, runtime v0.1
+interpreter coverage for the current base language, an in-memory Rust-hosted
+opcode runtime, a closed portable self-host compiler/VM loop, and the first
+APL-owned target-neutral lowering, platform ABI, and x86-64 textual assembly
+layers. The bootstrap native runtime and host linker path now run ordinary APL
+programs as x86-64 PE/ELF executables. A reusable native compiler executable
+also owns source parsing through final assembly emission without running the
+portable VM. The project does not yet have an APL-written or freestanding
+runtime, direct object/linker implementation, ARM64/Mach-O backend, or container
+bundle system.
+
+There are currently three compiled execution paths. The legacy Rust-hosted path
+stores a checked `Program` in binary `.aplc` form, then lowers it at load time
+to an in-memory `CompiledProgram`: linear statement opcodes with program-counter
+jumps and stack opcodes for expressions. `.aplc` is therefore not itself the
+runtime bytecode format. The APL-written self-host path emits `APLMOD3` and
+`APLLINK3`, which serialize recursive list-based IR interpreted by `std/vm.apl`.
+That portable IR is a bootstrap and semantic-reference format. The third path
+lowers linked programs through `APLLOW1`, `APLABI1`, and `APLASM1` into a host
+native executable backed by `apl_native_runtime`. Bytecode may remain useful as
+a VM/debugging target, but native output is the primary production goal.
+
+The native path now begins with `APLLOW1`. `std/native.apl` consumes a verified
+linked image after reachability and composition, flattens expressions to stack
+operations, turns structured control flow into labels/jumps, records explicit
+scope unwinds, and preserves final function slots and the `APLMAN1` manifest.
+This target-neutral artifact is the contract between language semantics and
+future x86-64/ARM64 emitters. It is not executable machine code.
+
+`APLABI1` is the next native boundary. `std/abi.apl` converts `APLLOW1` strings
+and typed literals into a canonical constant pool plus stable numeric IDs for
+all current operations, types, protections, operators, and builtins. The image
+contains an exact target descriptor instead of leaving calling-convention
+choices to emitters. Current descriptors cover Windows x64 (`win64`, COFF,
+32-byte shadow space) and Linux x64 (`sysv64`, ELF, no shadow space), including
+word size, stack alignment, and argument registers. This is still an
+intermediate artifact, not assembly or machine code.
+
+`APLASM1` is the first real machine-backend output. `std/assembly.apl` consumes
+a verified `APLABI1` image and emits GNU/LLVM Intel-syntax x86-64 assembly for
+Win64/COFF or SysV64/ELF. It owns prologues, stack alignment, direct control
+flow, APL function calls, read-only constant records, UTF-8 encoding, parameter
+tables, and mutation-target tables. Semantic operations call narrow `apl_rt_*`
+entry points; builtins have separate symbols so ordinary platform linkers can
+discard unreferenced implementations. `apl_native_runtime` implements that ABI,
+and `build-native`/`compile-native` generate, assemble, link, and run host PE or
+ELF programs. Tests cover a real executable rather than contract stubs alone.
+`compile-native-toolchain` closes the APL-written frontend, linker, native IR,
+ABI, and assembly emitter into a reusable native executable. The runtime is
+still written in bootstrap Rust; APL ownership and a freestanding profile
+remain open.
+
+## Library Composition
+
+APL programs must be able to control their complete library surface and final
+linked image. The source form is:
+
+```apl
+include >> math
+exclude "sqrt" << math
+exclude "pick" << std
+```
+
+`include` makes a library's permitted exports available. `exclude` removes a
+specific export from the program environment, including exports of the
+automatically supplied `std` library. Exclusion is not merely a namespace
+alias or an optimizer hint: referring to an excluded symbol must be a compile
+error, and its implementation and otherwise unreachable dependencies must not
+be linked into the result.
+
+Composition is resolved before semantic checking and reachability analysis so
+the checker, linker, and final image agree on the exact available surface. The
+irreducible compiler core should remain small. Facilities that can live in
+`base`, `std`, `system`, `build`, or `containers` should be removable library
+exports rather than permanently linked compiler features.
+
+The first implemented composition layer covers the implicit `base` library in
+both the Rust reference frontend and the APL-written frontend:
+
+```apl
+include >> base
+exclude "len" << base
+exclude "pick" << base
+out 42
+```
+
+`base` is available implicitly; an explicit include is accepted but not
+required. Directives are compile-time-only top-level AST nodes and apply to the
+whole program regardless of their relative position. They are removed before
+runtime IR is emitted. Duplicate directives, nested directives, unknown
+libraries, and unknown exports are compile errors. A call to an excluded
+builtin is rejected before lowering; `exclude "pick" << base` similarly gates
+the parser-level `pick` construct before its opcode can be emitted. Current
+removable base exports are `pick`, `add`, `set`, `get`, `pop`, conversions,
+string/list helpers, `ord`, `char`, and `pow`.
+
+The portable `APLLINK3` result contains neither composition AST nodes nor
+unreachable user functions. Its base builtin implementations still live in the
+external bootstrap VM, so this stage proves surface removal, not native binary
+section removal. Once the native backend owns builtin code, the same checked
+surface and reachability result must control emitted sections.
+
+The second composition layer resolves named external libraries to verified
+`APLMOD3` artifacts. `bootstrap.linked_artifact_with_libraries_report` accepts
+an explicit base source, a list of `[name, encoded_module]` pairs, and user
+source. It decodes and validates every module, rejects duplicate or invalid
+names and attempts to replace `base`, exposes only libraries selected by the
+user's top-level `include` directives, and filters excluded exports before
+checking user code. Module internals keep access to their own excluded exports;
+the final reachability pass drops a function when neither public entry code nor
+another retained function needs it.
+
+The host resolver maps `project/program.apl` plus `include >> math` to
+`project/libraries/math.aplmod`. Dotted library names are preserved as dotted
+file names. CLI `check`, `run`, `emit-linked`, linked package construction, and
+saved-file execution in APL Studio use this resolver. Missing files and invalid
+module payloads fail compilation. Unsaved Studio buffers must be saved before
+using external libraries so resolution has an unambiguous root.
+
+Library exports are qualified with `::` in source:
+
+```apl
+math::sqrt(value)
+std::len(items)
+```
+
+Standard functions require `std::` in executable source. `using namespace std`
+opens exactly that namespace. `nc std, math` opens several namespaces only
+after the checker proves that their complete public export sets do not
+conflict. At most one `using namespace` or one `nc` directive is permitted;
+they cannot be combined, repeated, or nested. External namespaces named by
+either form must already be selected with `include`. Namespace directives are
+compile-time-only and calls are rewritten to stable internal ABI names before
+IR emission. The old `base` composition name remains a bootstrap compatibility
+alias while manifests and bootstrap modules are migrated to `std`.
+
+Legacy host `.aplc` generation does not carry a named-library catalog. The
+reusable compiler artifact does: an `APLCREQ1:` request sends the catalog count,
+`name`/`APLMOD3` pairs, and source through distinct VM input values, while its
+`APLCOMP2` response stays backward compatible. The compiler links libraries
+over its precompiled base module rather than recompiling the runtime source.
+Final `APLLINK3` carries a required `APLMAN1` composition manifest. It records
+implicit `base`, every selected named library, and exclusions in source order;
+the verifier rejects duplicate/malformed libraries, invalid exclusions, or a
+manifest without `base`. `inspect-linked` exposes it without executing the
+program. The decoder still accepts manifest-less `APLLINK2`, and re-encoding
+migrates that image to v3. Module content digests are not recorded yet; native
+builtin and data-section elimination remains the responsibility of the future
+native linker.
+
+Standalone calls such as `record(42)` are expression statements. The
+APL-written frontend already represented them as `NODE_EXPR`/`OP_EXPR`; the
+Rust AST, parser, binary `.aplc` codec, checker, and runtime now implement the
+same behavior instead of misdiagnosing the call as a missing assignment.
+
+Secret `=self=` remains deliberately unavailable. It would reveal whether a
+protected value changed, and the current checker cannot track implicit flow
+through a branch. Password verification should use an explicit future
+`secure_eq(candidate, secret)` capability from a security/crypto library. Its
+contract may intentionally declassify one Boolean result and must use a
+constant-time native implementation; general secret declassification is not
+introduced into the core language.
+
+## Tracked Memory Tables
+
+The planned manual-memory library uses stable allocation identity rather than
+exposing `malloc` as an untracked raw-address operation. Every successful
+allocation creates a table record containing at least an address and a unique
+allocation ID. The ID is the default result:
+
+```apl
+include >> unsafe.memory
+
+VTime block = malloc(4096)
+free(block)
+```
+
+Allocation IDs are never reused. `free(id)` releases the live storage but does
+not erase or recycle the identity record. A stale ID therefore cannot silently
+start referring to a later allocation at the same address. Dereference through
+an ID must validate that its record is still live; this gives the runtime a
+defined place to diagnose use-after-free and double-free operations. A moving
+allocator may update a record's current address without changing its ID.
+
+`where(source, field)` queries the table. Its planned selectors are:
+
+```text
+0 -> address
+1 -> allocation ID
+2 -> variable name
+3 -> value
+```
+
+`source` may be an address, allocation ID, variable, or value. In particular,
+`where(x, 1)` obtains the allocation ID associated with `x`. A variable-name
+query cannot be implemented as an ordinary eager function call, because
+evaluating `x` would discard the name before `where` receives it. The compiler
+therefore must preserve source identity in a descriptor passed to the memory
+library, while allocation and table policy remain outside the language core.
+
+Several details deliberately remain open until the memory model is designed:
+equal values may match several records, one allocation may have several alias
+names, and a freed record has a historical address/value but no live storage.
+The final contract must define ambiguity, aliasing, query behavior after
+`free`, table-history lifetime, concurrency, and protection checks before this
+API is implemented. Raw addresses and values derived from `ASV` or `SASV`
+records must not become a route around APL's existing information-flow rules.
+
+## Variable Families
+
+Absolute variables are global architecture-level variables. Their names are
+globally unique: two variables cannot share a name even if their types or
+protection levels differ.
+
+```apl
+AVInt x = 4
+ASVStr token = secret input
+SASVStr master_key = "raw"
+```
+
+Families:
+
+- `AV` is a normal absolute variable.
+- `ASV` is an absolute secret variable.
+- `SASV` is a super absolute secret variable.
+
+Types:
+
+- `Int`
+- `Float`
+- `Bool`
+- `Str`
+- `Bytes`
+- `Json`
+
+The declared type never changes. `AVStr` cannot become a number. `NONE` is an
+empty value state and does not change the declared type.
+
+## SASV
+
+`SASV` is mainly for keys, root secrets, integrity checks, and security gates.
+
+Important rule: `SASV` is not just "more secret ASV". Its value is for APL
+runtime use only. Containers must never receive `SASV` values. The value must
+not be copied into ordinary variables or output channels.
+
+`info(SASV)` is allowed because it exposes metadata, not the value.
+
+## VTime
+
+`VTime` is not an absolute variable. It is a local temporary variable.
+
+```apl
+VTime tmp = input
+```
+
+Rules:
+
+- local to the current function/block/loop scope;
+- destroyed after leaving that scope;
+- can hold any value type;
+- can change its held value type;
+- does not have its own protection level;
+- can hold a value that carries a protection label;
+- compound assignment keeps the maximum protection of the old value and the
+  right-hand side;
+- cannot be used with `info()`;
+- cannot be passed to `secretup()`.
+
+Protection is checked when writing from `VTime` into another variable.
+
+Example:
+
+```apl
+ASVStr token = secret input
+VTime item = token
+
+AVStr public = item   # invalid: ASV -> AV downgrade
+SASVStr sealed = item # valid: ASV -> SASV upgrade
+```
+
+## Names
+
+Variable names are strict for future compatibility with other languages.
+
+Allowed:
+
+```text
+[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*
+```
+
+Names may use ASCII letters, digits, `_`, and `.` namespaces. Digits cannot be
+the first character of a name segment.
+
+Reserved words and builtin function names cannot be used as names. The same
+validation applies to source declarations, function parameters, `pick` items,
+and symbols imported from portable modules.
+
+Function parameters must be unique within their parameter list. They are local
+values and may shadow a global value while the function body is checked and
+executed. Function calls use the function namespace, so a parameter with the
+same name as a function does not hide that function from call syntax. A bare
+function name is not a first-class value. `pick` items cannot shadow an already
+visible name.
+
+## Arithmetic
+
+Six arithmetic operators exist in the base language:
+
+```apl
++
+-
+*
+/
+%
+**
+```
+
+Compound assignments are allowed:
+
+```apl
+x += 1
+x -= 1
+x *= 2
+x /= 2
+x %= 2
+```
+
+Rules:
+
+- `Int / Int` returns `Int`;
+- no implicit `Int` to `Float` conversion;
+- no string concatenation with `+`;
+- integer addition, subtraction, multiplication, division, remainder, and
+  unary negation use checked `i64` arithmetic; overflow is a runtime error;
+- integer literals cover the complete signed `i64` range. The Rust parser and
+  APL-written frontend both accept `-9223372036854775808` without evaluating an
+  overflowing negation, and reject integer literals outside that range;
+- float literals require decimal digits on both sides of `.`, so `1.` is not a
+  valid float literal;
+- integer division or remainder by zero is a runtime error; integer remainder
+  follows the dividend's sign. `Float` arithmetic retains IEEE-754 behavior;
+- roots, trigonometry, and heavy math belong in functions or external
+  languages.
+
+Power is available as both `base ** exponent` and `pow(base, exponent)`. The
+base must be `Int` or `Float`, and the exponent must be `Int`. The operator is
+right-associative and binds more tightly than `*`, `/`, and `%`; unary `-` binds to
+its operand first, so `-2 ** 2` means `(-2) ** 2`. Negative or out-of-range
+exponents and integer power overflow return `NONE`. The result preserves the
+base type and the strongest protection level of both operands.
+
+## Comparisons
+
+Supported:
+
+```apl
+==
+!=
+>
+<
+>=
+<=
+```
+
+`=self=` checks whether an absolute variable still equals its initial declared
+value:
+
+```apl
+AVInt x = 4
+x =self= # true
+x = 5
+x =self= # false
+```
+
+`=self=` is only for absolute variables.
+
+## Conditions
+
+Branching:
+
+```apl
+if condition {
+} else if condition {
+} else {
+}
+```
+
+Logical operators:
+
+```apl
+and
+or
+not
+```
+
+When `and` or `or` are used, operands must be explicitly grouped with
+parentheses. This is intentional, because APL conditions may control security
+and access policy.
+
+```apl
+if (a == true) and (b == true) {
+}
+```
+
+## Loops
+
+`while` always has a limit:
+
+```apl
+while (condition) (limit) {
+}
+```
+
+Rules:
+
+- `limit` is an integer literal in parentheses;
+- `-1` means unlimited;
+- values below `-1` are invalid;
+- reaching the limit is a safe exit, not an error;
+- `break` and `continue` work inside loops.
+
+## Pick
+
+`pick(value): item` iterates over a value and creates `item` as a scoped
+`VTime`.
+
+```apl
+pick("APL"): ch {
+  out ch
+}
+```
+
+`pick` remains supported, but slices/indexing are preferred for many
+architecture/routing tasks.
+
+## Lists
+
+Lists are flexible containers:
+
+```apl
+List items = []
+List mixed = [1, "abc", true, NONE]
+List matrix = [[1, 2], [3, 4]]
+```
+
+Lists can contain other lists. This is important for compatibility with Python
+nested lists, Java 2D arrays, and similar structures.
+
+Lists themselves do not have a protection family like `AV/ASV/SASV`. Protection
+lives on elements.
+
+Element protection defaults to `AV`:
+
+```apl
+List items = [1, "abc"]
+```
+
+Explicit labels:
+
+```apl
+List items = [1:SASV, "abc":ASV, true:AV]
+add(items, "hidden":ASV)
+set(items, 0, "vault":SASV)
+```
+
+Minimal list operations:
+
+```apl
+add(items, value)
+set(items, index, value)
+VTime x = get(items, 0)
+VTime y = pop(items)
+```
+
+`get` and `pop` return `VTime` values carrying the element protection label.
+`add` and `set` are statement-only because they have no value result. `add`,
+`set`, and `pop` require a named `List` or list-valued `VTime`; list literals,
+slices, calls, and other temporary expressions cannot be mutation targets.
+`set` accepts negative indexes (`-1` is the last element). An out-of-range
+index leaves the list unchanged. Adding or replacing with an `ASV` or `SASV`
+value raises the protection tracked for the complete dynamic value and prevents
+later public output or assignment. Replacing an element also replaces its own
+protection label, so subsequent `get` and `pick` observe the new label.
+
+## Indexing And Slices
+
+Supported:
+
+```apl
+VTime first = values[0]
+VTime cell = matrix[0][1]
+VTime head = values[:3]
+VTime tail = values[1:]
+VTime every_second = values[::2]
+VTime reversed = values[::-1]
+VTime middle = values[1:3:1]
+```
+
+Slice shape:
+
+```apl
+value[start?:end?:step?]
+```
+
+`start`, `end`, and `step` are optional. Index and slice bounds must be `Int` or
+`VTime`. Negative step is supported for reverse slices. A zero step returns
+`NONE` instead of crashing.
+
+No special nested syntax like `get(list, 0(0))`. Users can write:
+
+```apl
+VTime row = get(matrix, 0)
+VTime cell = get(row, 0)
+```
+
+or:
+
+```apl
+VTime cell = matrix[0][0]
+```
+
+## Input And Output
+
+Output:
+
+```apl
+out value
+```
+
+`out` appends exactly the rendered value and does not add a newline. Programs
+compose output explicitly:
+
+```apl
+out "value="
+out value
+out "\n"
+```
+
+String literals decode `\n`, `\r`, `\t`, `\0`, `\\`, and `\"`. Unknown
+escapes and a trailing backslash are syntax errors. The Rust reference parser
+and APL-written lexer use the same rules. Raw line breaks inside a string remain
+accepted for compatibility, although escaped line endings are preferred in
+source.
+
+`out` is an external channel and must not output secret values. This includes
+nested list values: if any element inside a list is `ASV` or `SASV`, rendering
+the whole list to `out` is denied. `stop reason` remains a separate termination
+channel and currently appends its reason followed by a newline in the Rust
+reference runtime.
+
+Input:
+
+```apl
+AVStr raw = input
+AVInt age = input
+ASVStr token = secret input
+```
+
+Bad typed input should become `NONE`, not crash the program. Most real input
+validation is expected to happen in external languages such as Python later.
+
+## Info
+
+`info()` returns metadata into two `AVStr` variables:
+
+```apl
+AVStr typ = ""
+AVStr level = ""
+
+typ, level = info(master_key)
+```
+
+It returns:
+
+- declared type as string;
+- protection family as string.
+
+`info()` works for absolute variables, including `SASV`. It does not work for
+`VTime`.
+
+## Executable Entry
+
+An executable has exactly one explicit entry point:
+
+```apl
+AVInt std::main() {
+  out "hello\n"
+  return 0
+}
+```
+
+`std::main` takes no parameters and must definitely return a public `AVInt`.
+Executable statements belong inside it; only declarations and function bodies
+may remain at file scope. Library modules do not declare `std::main`. The
+portable compiler inserts one internal call to the checked entry before
+reachability analysis, so the same rule feeds VM, native IR, ABI, and assembly
+paths instead of being a CLI-only convention.
+
+## Functions
+
+Functions:
+
+```apl
+func name(arg1, arg2) {
+  return arg1
+}
+```
+
+Call syntax:
+
+```apl
+AVInt result = add_one(4)
+```
+
+Function arguments are scoped `VTime` variables. Return values are dynamic and
+are checked when written into typed absolute variables. Function parameters are
+local to the function body; the APL bootstrap checker uses them while validating
+the body, but does not leak parameter names into the outer declaration
+namespace.
+
+## Conversions
+
+Explicit conversions:
+
+```apl
+std::int(x)
+std::float(x)
+std::bool(x)
+std::str(x)
+std::bytes(x)
+std::json(x)
+```
+
+The shorter legacy spellings remain available inside bootstrap/library modules.
+Executable source may use them only after `using namespace std` or an `nc`
+directive that includes `std`.
+
+On invalid input, conversion returns `NONE`; it should not crash the program.
+
+## Secretup
+
+`secretup(x)` raises an absolute variable's protection:
+
+```apl
+AVStr token = input
+secretup(token) # AV -> ASV
+secretup(token) # ASV -> SASV
+```
+
+Downgrades are never allowed. `secretup()` does not apply to `VTime`.
+
+## Stop And Fail
+
+```apl
+stop
+stop "done"
+fail "bad config"
+```
+
+`stop` exits normally. `fail` exits with failure.
+
+`stop "reason"` and `fail "reason"` are also external channels, so secret
+reasons are denied. `stop` inside a function stops the whole program, not only
+that function call.
+
+## Current Project State
+
+Rust workspace:
+
+- `apl_core`: AST and semantic checker.
+- `apl_parser`: Rust reference lexer/parser. Every token retains its source byte
+  offset for diagnostics; public `ParseError` values expose one-based `line`
+  and Unicode-character `column` coordinates in addition to the byte `offset`.
+- `apl_runtime`: runtime v0.1 interpreter for the current base language.
+- `apl_native_runtime`: bootstrap implementation of the stable `apl_rt_*` ABI
+  used by generated x86-64 assembly. It owns the native operand stack,
+  absolute/VTime/list storage, AV/ASV/SASV propagation, scopes, calls, loops,
+  picks, builtins, input, output, and process status. It does not embed the
+  portable VM or load `.apllink` artifacts.
+- `apl_ir`: binary `.aplc` IR encoder/decoder for checked APL programs.
+- `apl_compiler`: generates Rust-hosted executable packages from portable
+  linked artifacts and retains the earlier host `.aplc` package generator for
+  compiler bootstrap tests. It exposes a narrow host bridge that asks the
+  APL-written bootstrap pipeline to compile source into portable `APLLINK3`
+  artifacts and to load, verify, and run those artifacts. The bridge passes an
+  explicit input count so an empty input line remains a real value instead of
+  becoming an end-of-stream marker. Both the Rust runtime and the APL VM return
+  `NONE` when that counted input stream is exhausted. Linked compilation
+  composes `std/runtime.apl` and user source inside the APL bridge before
+  checking and lowering. Runtime helpers and user functions therefore receive
+  one function table and one `CALL_SLOT` namespace without copying compiler
+  implementation modules into the artifact. The bridge runs on a dedicated
+  32 MiB-stack thread while the bootstrap parser still uses recursive host
+  calls. `compile_module_artifact_sources` feeds an explicit source count and
+  compiles multiple module sources inside one APL invocation; the combined IR
+  and symbol table remain in memory until one final `APLMOD3` encoding.
+  `compile_standard_module_artifact` uses that path for every `std/*.apl`
+  compiler/runtime layer. Runtime strings cache Unicode characters and runtime
+  lists use copy-on-write storage, avoiding whole-source and whole-AST copies
+  during bootstrap while preserving APL value semantics. It can also build a
+  reusable compiler `APLLINK3` containing the complete APL-written compiler and
+  an embedded runtime `APLMOD3`. Running that artifact compiles input source
+  inside the APL VM and returns a linked artifact or diagnostic through the
+  versioned, Unicode-character-length-framed `APLCOMP2` protocol. The host
+  rejects truncated and trailing payloads and remains able to consume legacy
+  `APLCOMP1` responses from already emitted compiler artifacts.
+  `compile_linked_artifact_with_libraries` passes named modules into the APL
+  bootstrap as explicit catalog entries. `resolve_named_libraries` implements
+  the source-relative `libraries/<name>.aplmod` convention without teaching
+  the Rust host to decode the portable module format. The reusable compiler
+  path uses the same resolver. When libraries are present, the host frames an
+  `APLCREQ1:` request as separate input values; the APL compiler validates the
+  catalog and links selected modules over its embedded precompiled base module.
+  Source-only requests retain the original one-input shape for compatibility.
+  It can also build and invoke two native compiler images: the intermediate
+  compiler returns `APLLINK3`, while the full toolchain executes native/ABI/
+  assembly lowering and returns `APLASM1`. The host then performs only module
+  file transport, generated-package writing, and platform assembly/linking.
+- `apl_cli`: CLI with source `check`/`run`, host-side `.aplc` `emit`/`run-ir`,
+  APL-owned portable artifact `emit-linked`/`run-linked`, default
+  portable-artifact package `build`/`compile` (plus explicit `-linked`
+  aliases), relocatable module `emit-module`/`extend-module`/
+  `emit-standard-module`/`emit-linked-module`, compiler-in-VM
+  `emit-bootstrap-compiler`/`emit-linked-bootstrap`, native compiler/toolchain
+  and self-host package commands, and legacy `.aplc` package
+  `build-host`/`compile-host` commands.
+  Portable execution crosses the host boundary through the versioned
+  length-framed `APLRUN1` response. `run_linked_artifact_report` exposes the
+  exact `OK`/`STOP`/`FAIL` status and original output fragments, including
+  empty, Unicode, newline, colon, and NUL-containing strings. The older
+  `run_linked_artifact` shape remains as a compatibility wrapper: it
+  concatenates successful fragments and maps `FAIL` to
+  `RuntimeError::Failed` with the VM's actual reason. Source `check` and `run`
+  always use the APL-written frontend and portable linked path. The host asks
+  `bootstrap.requested_libraries_report` which external modules the source
+  requests, then only performs source-relative filesystem loading for those
+  exact artifacts. `emit-linked` and linked package commands resolve the same
+  catalog.
+- `apl_studio`: small Windows-only native Win32 editor for opening, saving,
+  checking, and running `.apl` source without leaving the window. It calls the
+  APL-written parser/checker/linker and portable VM through the narrow Rust
+  host bridge, keeps execution off the UI thread, and displays output and
+  diagnostics in a read-only lower pane. Its
+  multiline input pane maps lines, including empty lines, to successive
+  `input` and `secret input` expressions. Input remains visible plain text and
+  is only intended for testing. `F5` runs, while `Ctrl+O` and `Ctrl+S` use
+  standard Windows file dialogs. Studio is intentionally not a full IDE.
+  Ordinary and library-using buffers share the same portable compile/run path
+  as the CLI. Its starter buffer declares `AVInt std::main()`, and unsaved
+  buffers receive the same executable-entry and `std::` validation as saved
+  source. An unsaved buffer must be saved before external modules can be
+  resolved. Portable lexer, parser, and semantic-checker diagnostics carry
+  one-based, Unicode-character `line:column` positions. Semantic locations
+  point to the start of the containing statement.
+  Its Win32 output control renders an
+  embedded NUL visibly as `\0` so later output is not truncated; the runtime
+  and CLI retain the actual NUL character.
+- `apl_router`: placeholder for future router/container phase.
+
+### Portable Bootstrap Exit Gate
+
+The portable bootstrap stage is closed when all of these remain true:
+
+1. Ordinary source is lexed, parsed, checked, lowered, linked, verified, and
+   executed by the implementations in `std/*.apl`.
+2. Default CLI `check`/`run` and APL Studio use that route for source with or
+   without named libraries; the Rust host only supplies files, framed values,
+   process I/O, and VM hosting at this boundary.
+3. Named library discovery and composition decisions are made by APL code.
+   The host may read the exact requested `.aplmod` files but does not parse APL
+   source or decode portable modules to decide language semantics.
+4. A reusable compiler artifact can compile a program from inside the APL VM,
+   and the resulting `APLLINK3` artifact can be independently loaded, verified,
+   and run by the portable path.
+5. The Rust reference frontend/runtime remain an explicit oracle and legacy
+   host target, not the default user execution route.
+
+The repository currently satisfies this portable gate. This is not the native
+runtime exit: the portable oracle remains Rust-hosted, and generated programs
+still link `apl_native_runtime`. The compiler bootstrap itself is now closed
+through assembly: the reusable native toolchain executes the APL-written lexer,
+parser, checker, linker, verifier, native IR, ABI, and assembly emitter without
+the portable VM. The next native phase moves runtime and platform-link ownership
+out of Rust and adds a freestanding profile.
+
+APL-owned runtime code:
+
+- The standard prelude is composed from APL files in `std/`.
+- `std/runtime.apl`: core runtime helpers written in APL.
+- Current core functions: `apl.is_none`, `apl.not_none`, `apl.first`,
+  `apl.pow_int`.
+- `std/lexer.apl`: the first APL-written lexer helpers:
+  `lexer.is_keyword`, `lexer.is_digit`, `lexer.is_int`,
+  `lexer.is_space`, `lexer.is_single_symbol`, `lexer.make_token`,
+  `lexer.token_kind`, `lexer.token_value`, `lexer.token_type`, and
+  `lexer.tokenize`.
+- `lexer.tokenize(source)` now scans source text character by character in APL.
+  It returns token records as nested lists: `[kind, value]`. It recognizes
+  whitespace, `#` line comments, quoted string literals, `=self=`,
+  two-character operators such as `==`, `!=`, `>=`, `<=`, `+=`, and `**`,
+  single-character symbols, integer/float literals, keywords, and identifiers.
+  Unterminated strings produce a `TOKEN_ERROR` carrying
+  `unterminated string literal`, which the parser propagates to compile reports.
+  `lexer.tokenize_with_offsets(source)` returns the same compact tokens plus a
+  parallel list of Unicode-character offsets. The ordinary successful path does
+  not build that table: `parser.diagnostic` invokes the offset-producing pass
+  lazily only after detecting a syntax failure. It converts the selected offset
+  to one-based Unicode `line:column`, including exact EOF, CRLF, and escape
+  locations. Successful compilation keeps the compact statement AST. On a
+  semantic failure, the frontend reparses with internal statement token
+  indexes, rechecks to preserve the innermost failing statement, and uses the
+  same lazy offset pass to render its one-based `line:column` location.
+- `examples/test_lexer.apl` is the current lexer smoke-test. It uses public
+  `AVStr` input so the token list can be printed safely.
+- `std/parser.apl`: the first APL-written parser bootstrap. It consumes lexer
+  tokens and returns AST records as nested lists. Current node coverage:
+  absolute variable declarations, `List` declarations, `VTime` declarations,
+  `info()` assignments, simple assignments, expression statements,
+  `if/else if/else` blocks, `while(condition)(limit)` blocks, `pick(value): item` blocks, function
+  declarations, `return`, `break`, `continue`, `secretup`, `out`, `stop`, and
+  `fail`.
+  Bounded-loop parsing accepts both non-negative integer limits and the
+  tokenized negative literal `-1`, matching the Rust parser and the language's
+  unlimited-loop syntax.
+  Delimiters and special forms are selected by token kind as well as token
+  value. A `Str` token whose value is `(`, `[`, `]`, `input`, `secret`, or `-`
+  is therefore parsed as a string literal instead of syntax. Call/list commas,
+  closing delimiters, grouped expressions, and postfix indexing apply the same
+  token-kind rule.
+  Current expression coverage: int, float, string, bool, `NONE`, `input`,
+  `secret input`, variable references, list literals, tagged values `value:ASV` / `value:SASV`,
+  function/builtin calls, postfix indexing/slicing, unary `-`/`not`
+  expressions, and binary expressions with precedence levels for `*`/`/`,
+  `+`/`-`, comparisons, `and`, and `or`.
+  Structural failures are represented by `EXPR_ERROR` or `NODE_ERROR` and are
+  rejected by the checker before IR lowering. Nested blocks must close with
+  `}`, unmatched `}` is rejected at top level, groups/calls close with `)`,
+  and lists/indexes/slices close with `]`. Calls and list literals require
+  commas between values and reject trailing commas, matching
+  the Rust parser's acceptance rules for these cases.
+  Identifier positions require `Ident` tokens, and keywords, delimiters, unary
+  and binary operators, `=self=`, tags, and `secret input` require their exact
+  token kinds. A quoted string with syntax-like contents therefore remains data
+  and cannot impersonate source grammar. Bare `stop` is recognized before the
+  end of a block and before an unambiguous following statement, matching the
+  Rust parser instead of trying to parse `}` or the next keyword as a reason.
+- `examples/test_parser.apl` is the successful parser smoke-test;
+  `examples/test_parser_errors.apl` exercises structural failures through
+  `bootstrap.compile_report`, and `examples/test_parser_token_roles.apl`
+  exercises lexer termination and token-role failures.
+- `std/checker.apl`: the first APL-written semantic checker layer. It validates
+  duplicate declaration/function names before IR lowering, including names found
+  in nested `if`, `while`, `pick`, and function bodies. It also rejects unknown
+  assignment targets, unknown/invalid `secretup` targets, and unknown/invalid
+  `info()` targets/sources before VM execution. Assignments are limited to
+  absolute variables or `VTime`, and compound assignments are limited to
+  `VTime` or public numeric absolute variables. This moves the global name
+  uniqueness and basic mutation-target rules into compiled APL-owned runtime
+  code. Expression validation rejects unknown variable reads across
+  declarations, assignments, output, conditions, function-call arguments, list
+  literals, indexing/slicing, tags, and `=self=` targets. Function-call
+  validation accepts known VM builtins, accepts user functions including
+  top-level forward calls, rejects unknown function names, rejects attempts to
+  call non-function values, and checks both builtin and user-function argument
+  counts. Builtin arities match the untrusted-artifact verifier, so malformed
+  calls such as `len()` or `pow(2, 3, 4)` fail before IR lowering. The checker
+  also conservatively infers expression types for literals, absolute variables,
+  lists, slices, unary/binary result shapes, conversions, and builtin results.
+  It rejects statically invalid builtin arguments while allowing `VTime`,
+  function results, and other genuinely dynamic values to defer to runtime. It
+  now applies the same conservative inference to typed absolute declarations
+  and assignments: a statically known value must exactly match the declared
+  base type, with no implicit `Int`/`Float` widening, while `VTime`, `NONE`,
+  `input`, and `secret input` remain dynamically assignable. Unary and binary
+  operands follow the Rust checker rules for numeric, equality, ordered, and
+  logical operations. Index/slice operands, `pick` values, and `if`/`while`
+  conditions are also rejected when a statically known type is incompatible;
+  `VTime` defers these decisions to runtime. Control-flow context is explicit:
+  `return` is valid only in a function, `break`/`continue` require a `while` or
+  `pick` in the current function, and a function body does not inherit an
+  enclosing declaration site's loop context. `while` limits below `-1` are
+  rejected before lowering. The checker also propagates `AV`/`ASV`/`SASV`
+  through expressions, dynamic `VTime` values, lists, tags, mutation calls,
+  `secretup`, calls, and block merges. It rejects static protection downgrades,
+  secret public-channel expressions, secret self-checks, and invalid
+  input/protection combinations. A compound `VTime` assignment cannot lower
+  the protection already carried by the temporary. Runtime declarations and
+  assignments independently reject protection downgrades even if the checker
+  is bypassed; runtime checks also remain authoritative for genuinely dynamic
+  values.
+  `VTime` declarations and function parameters remain local to their function
+  or block during validation. Leaving a function, `if`, `while`, or `pick`
+  merges only newly discovered absolute, list, and function names into the
+  enclosing global uniqueness table. This permits independent local names such
+  as `index` or `text` without allowing nested global declarations to evade the
+  repository-wide uniqueness rule.
+  `checker.validate_report_with_symbols` accepts a verified external symbol
+  table for functions, absolute variables, and lists. It rejects collisions
+  with user declarations and validates imported reads, mutation targets, and
+  calls before module and user IR are combined. The function-only facade remains
+  available for `APLMOD1` compatibility.
+- `examples/test_checker.apl`, `examples/test_checker_targets.apl`,
+  `examples/test_checker_exprs.apl`, `examples/test_checker_calls.apl`,
+  `examples/test_checker_builtin_types.apl`,
+  `examples/test_checker_assign_types.apl`,
+  `examples/test_checker_operand_types.apl`,
+  `examples/test_checker_literals.apl`,
+  `examples/test_checker_control_flow.apl`,
+  `examples/test_checker_protection.apl`,
+  `examples/test_checker_names.apl`, and
+  `examples/test_checker_mutations.apl` are the checker smoke-tests.
+- `std/ir.apl`: the first APL-written IR bootstrap. It lowers the parser AST
+  into list-based IR instructions. Current instruction coverage mirrors the
+  parser bootstrap: `DECL`, `ASSIGN`, `IF`, `WHILE`, `PICK`, `BREAK`,
+  `CONTINUE`, `FUNC`, `RETURN`, `SECRETUP`, `LIST_DECL`, `VTIME_DECL`,
+  `INFO_ASSIGN`, `EXPR`, `OUT`, `STOP`, `FAIL`, and `ERROR`.
+  Current expression IR includes `LITERAL`, `LOAD`, `NONE`, `UNARY`,
+  `BINARY`, `CALL`, `LIST`, `INDEX`, `SLICE`, `SELF`, and `TAG`.
+  Omitted slice bounds are lowered to canonical `NONE` expressions, preserving
+  their type through linked-artifact serialization.
+- `examples/test_ir.apl` is the current IR smoke-test.
+- `std/linker.apl`: the APL-written link stage. It recursively walks entry code,
+  nested blocks, expression trees, and transitively reachable function bodies.
+  Unreachable function records are removed while source order among retained
+  functions stays stable. The reduced table receives a fresh slot namespace,
+  so calls remain valid even when an earlier function was removed. Recursive
+  and mutually recursive functions are handled by a finite worklist.
+  User-function `CALL` expressions are then resolved once to numeric
+  `CALL_SLOT` expressions; builtin calls remain named. It emits versioned
+  `APLLOAD2` images. This reachability pass is the current linker foundation
+  for future `include`/`exclude`; builtin/native-section elimination requires
+  the future native backend. Relocatable-module validation deliberately uses
+  `linker.link_complete_image` through `vm.load_module_ir_report`: every export
+  is checked and retained for future consumers. Only final loaded images use
+  reachability pruning.
+- `std/verifier.apl`: the APL-written loaded-image verifier. It recursively
+  validates expression and instruction opcodes/arity, operators, literal types,
+  nested blocks, builtin arity, function-table consistency, unique function and
+  parameter names, loop limits, and `CALL_SLOT` bounds before VM execution.
+  It also recursively detects `CALL_SLOT` in relocatable programs, including
+  nested expressions, blocks, and function bodies. It also validates the
+  complete `APLMAN1` library manifest: `base` must be first, library names must
+  be unique, and exclusions must be valid and unique. An APL module must be
+  unlinked so slot assignment can happen once after all code is combined.
+- `std/artifact.apl`: the APL-written portable codec for linked images. It
+  emits `APLLINK3:` wire strings with tagged scalar nodes, length-prefixed
+  payloads, recursive lists, and a required `APLMAN1` composition manifest.
+  The APL decoder reconstructs the linked image without source parsing and
+  rejects bad headers, malformed/truncated nodes, unknown tags, trailing data,
+  invalid manifests, and structures rejected by the APL verifier. It accepts
+  legacy manifest-less `APLLINK2:` and upgrades it when encoding again.
+  The same scalar/list codec emits `APLMOD3:` relocatable modules containing
+  unlinked IR and a symbol table for functions, absolute variables, and `List`
+  declarations. Function symbols carry arity; absolute symbols retain their
+  complete declaration type, and all symbols retain the checker's conservative
+  protection state. Module decoding rejects malformed/trailing data,
+  duplicate or inconsistent exports, pre-existing `CALL_SLOT`, and programs
+  that cannot produce a valid loaded image. The decoder remains compatible
+  with `APLMOD1:` and `APLMOD2:` and normalizes their exports for the external
+  checker. Because old module formats did not store list protection, their
+  lists are conservatively imported as `SASV`.
+- `std/native.apl`: the first APL-owned production-backend pass. It lowers a
+  verified `APLLOAD2`/`APLLINK3` image to versioned `APLLOW1` linear IR after
+  library composition, reachability pruning, and function-slot assignment.
+  Expressions become postorder stack operations. `if`, bounded `while`, and
+  `pick` become explicit labels and jumps; `break`/`continue` become unwind
+  jumps carrying the exact number of lexical scopes to remove. Function bodies
+  are stored by final slot, and mutating `add`/`set`/`pop` calls keep named target
+  descriptors so a native runtime updates the correct binding rather than a
+  copied value. The decoder validates opcodes and arities, literal/operator
+  shape, builtin arity, call-slot bounds, unique labels and function records,
+  every jump target, the library manifest, and linear stack discipline.
+  `emit-native-ir` writes `.apllow`; `inspect-native-ir` renders its entry code,
+  function slots, and manifest.
+- `std/abi.apl`: the APL-owned runtime/machine ABI pass. It lowers verified
+  `APLLOW1` to `APLABI1`, deduplicates names and typed literals in a constant
+  pool, and replaces language-level strings with stable numeric identifiers.
+  It retains function slots, lexical-control metadata, mutation-target name
+  references, and the `APLMAN1` manifest. Exact target descriptors currently
+  cover Windows x64 COFF/win64 and Linux x64 ELF/sysv64, including word size,
+  stack alignment, shadow space, and argument registers. The verifier rejects
+  altered targets, duplicate/malformed pool entries, wrong pool-reference
+  kinds, bad calls and labels, function-table inconsistencies, stack errors,
+  and malformed manifests. `emit-native-abi` writes `.aplabi`, and
+  `inspect-native-abi` renders it.
+- `std/assembly.apl`: the first APL-owned machine emitter. It lowers every one
+  of the 37 `APLABI1` operations to GNU/LLVM Intel-syntax x86-64 assembly.
+  Windows output follows Win64/COFF register, shadow-space, and alignment rules;
+  Linux output follows SysV64/ELF rules and marks the stack non-executable.
+  Control-flow operations become direct local labels/jumps, user functions are
+  direct slot-symbol calls, and semantic operations call narrow `apl_rt_*`
+  entry points. Constant records, function parameter tables, and builtin
+  mutation-target tables are emitted into a read-only section. Names and
+  strings are encoded as actual UTF-8 bytes. `emit-assembly` writes `.s` files.
+  Tests feed host-target output to LLVM's integrated assembler and linker with
+  contract stubs, proving the emitted syntax and relocations are accepted.
+
+Native runtime ABI version 1 uses `apl_program_entry(context) -> status` as the
+public generated entry point. Generated slot functions are named `apl_fn_N`,
+take the same context pointer, and return status. The context stays in `r12`
+across generated code. Ordinary `apl_rt_*` calls return zero on success and a
+nonzero terminal/error status; branch, loop-check, and pick-next calls return
+negative on error, zero to continue, and positive to take the emitted branch.
+`apl_rt_finish(context)` converts root context state to the final process
+status. `stop`, `fail`, and `return` always transfer directly to the current
+generated epilogue after their runtime call.
+
+The referenced runtime surface is deliberately granular:
+
+```text
+apl_rt_push_const / push_none / input / secret_input / load
+apl_rt_unary / binary / list / index / slice / self / tag
+apl_rt_declare / declare_list / declare_vtime / assign / info_assign
+apl_rt_drop / secretup / out / stop / fail / return
+apl_rt_scope_enter / scope_exit / unwind
+apl_rt_loop_enter / loop_check / loop_exit
+apl_rt_pick_enter / pick_next / pick_exit
+apl_rt_branch_false / function_enter / finish
+apl_rt_builtin_<get|split|join|contains|pow|add|len|ord|char|pop|
+               int|float|bool|str|bytes|json|set>
+```
+
+Constant records have `[kind:u64, byte_length:u64, payload]` layout and
+eight-byte alignment. Name/string payloads are un-terminated UTF-8; numeric and
+bool payloads occupy eight bytes. Reference tables contain record pointers or
+zero for `NONE` mutation targets. `apl_native_runtime` implements this contract;
+generated assembly sees only the opaque context pointer and ABI records, not
+Rust VM structures.
+
+Native compiler process boundaries use `APLIN1`. The byte-framed stream begins
+with a NUL-prefixed magic, a value count, then byte length and UTF-8 payload for
+each value. This preserves multiline source, empty input, NULs, Unicode, and
+whole `APLMOD3` libraries as distinct APL `input` values. The intermediate
+native bootstrap compiler returns `APLCOMP2`/`APLLINK3`. The full native
+toolchain accepts `APLNREQ1` values and returns character-length-framed
+`APLNATIVE1` containing `APLASM1` or a diagnostic.
+
+`apl_native_runtime` stores strings with cached Unicode characters and uses
+reference-counted copy-on-write lists. Loop and `pick` state is stacked per
+static instruction ID, so recursive calls may re-enter the same generated loop
+without overwriting their caller's state.
+
+- `std/vm.apl`: the first APL-written VM bootstrap. It executes the list-based
+  IR from `std/ir.apl`. Its environment is
+  `[bindings, inputs, input_index, scope_depth]`, where each compact binding is
+  `[name, value, kind, type, initial, depth]`. Updating a name replaces the
+  prior binding at the same depth instead of growing an assignment history.
+  Function calls and `if`/`while`/`pick` bodies enter explicit scopes; leaving
+  them removes local `VTime` bindings while retaining outer/global mutations
+  and the advanced input cursor. Consequently independent functions may use
+  the same local names, block locals do not leak, and absolute/list uniqueness
+  remains global. It supports declarations with `AV`/`ASV`/`SASV` metadata,
+  dynamic `VTime` values,
+  lists, `get`/`len`/`add`/`set`/`pop`, `info()` metadata reads, assignments, nested
+  `if/else if/else` blocks, bounded `while` blocks, loop flow with `break`/`continue`,
+  `pick` iteration with scoped item cleanup, function tables, function calls,
+  `return`, `secretup`, `out`, `stop`, and `fail`, and returns captured output
+  as a list of strings. This contract includes `out NONE`, which contributes
+  the string `"NONE"` instead of placing a raw `NONE` value in the output list.
+  Direct and derived `out` of `ASV`/`SASV` values is
+  denied by the APL
+  VM bootstrap for variable loads, `VTime` copies, binary expressions, list
+  literals, and `get` from secret-derived lists. The VM also rejects attempts
+  to write `ASV`/`SASV` values into lower-protection absolute variables, while
+  `VTime` and list values can continue carrying their own protection labels.
+  Duplicate runtime declarations are rejected in the APL VM instead of silently
+  shadowing absolute/list names; duplicate function names make the VM run return
+  an empty output list. Assignment and `secretup` against unknown names are
+  rejected by the VM instead of creating implicit variables. Compound assignment
+  in the VM is limited to `VTime` or public numeric absolute variables, matching
+  the Rust checker contract. `add`/`set`/`pop` only mutate existing `List` or
+  `VTime` targets; invalid list mutation returns `NONE` without changing VM state.
+  `info()` in the VM requires existing `AVStr` targets and rejects `VTime`
+  sources; `info(SASV)` remains allowed because it exposes metadata, not value.
+  The same external-channel rule is applied to `stop`/`fail` reasons: public
+  reasons are captured, secret reasons become `DENIED`. Expression evaluation
+  returns `[value, env, output, kind, flow]`. Non-`OK` flow stops evaluation of
+  the remaining operands, list elements, slice bounds, or call arguments and
+  propagates through each enclosing expression and instruction. Consequently
+  `stop` or `fail` inside a direct or nested function call terminates the whole
+  VM program, matching the Rust runtime, rather than becoming an ordinary
+  `NONE` function result. VM expressions can now evaluate variable loads,
+  literals, list literals, builtin calls, indexing, slicing, function calls,
+  unary `-`/`not`, arithmetic operators `+`, `-`, `*`, `/`, `%`, `**`, comparison
+  operators `==`, `!=`, `>`, `<`, `>=`, `<=`, grouped expressions, and logical
+  operators `and`/`or`.
+  `=self=` compares the current absolute-variable value against the initial
+  declaration value kept in the VM environment. Conversion calls `int`, `float`,
+  `bool`, `str`, `bytes`, and `json` are VM builtins and preserve the source
+  value protection label. String/list helpers `split`, `join`, `contains`,
+  `ord`, `char`, and `pow` are also available inside VM-executed code and
+  preserve the strongest argument protection label. `secretup(name)` raises
+  absolute-variable protection from `AV` to `ASV` and from `ASV` to `SASV`
+  while preserving initial values. Tagged values `value:ASV` and `value:SASV`
+  raise VM expression protection. VM list values keep a parallel per-element
+  protection label table for `get`, `pop`, slices, and `pick`. Each `pick`
+  binding receives the selected element's label rather than the strongest label
+  of the source list; whole-list external output still uses the strongest
+  aggregate list protection. `input` and
+  `secret input` in VM-executed code consume an explicit input stream through
+  `vm.run_source_with_input(source, inputs)` / `vm.run_ir_with_input(program, inputs)`.
+  Exhausted input becomes `NONE`; `secret input` carries `ASV`
+  protection. `vm.run_source(source)` still uses an empty stream. Absolute
+  declarations and `=` assignments in VM-executed code coerce values to their
+  declared type, so invalid typed input becomes `NONE`. The APL parser bootstrap
+  handles arithmetic, comparison, and logical expression precedence before lowering to IR. This proves
+  runtime behavior can be compiled and executed from APL code itself.
+  `vm.load_ir_report(program)` prepares a linked image
+  `["APLLOAD2", entry, functions]` by collecting the VM function table once,
+  removing top-level `FUNC` instructions from the executable entry program, and
+  asking the APL linker to retain the transitive entry-call closure and resolve
+  its user calls to numeric function slots in both entry code and function
+  bodies. `vm.run_loaded*` executes that image repeatedly
+  without re-collecting functions, searching user functions by name, or stepping
+  over function declarations as no-op runtime instructions. The legacy
+  `vm.run_ir*` facade also loads and links before execution. Every loaded image,
+  including an image decoded from untrusted portable text, must pass
+  `verifier.loaded_image_is_valid` before execution.
+- `std/bootstrap.apl`: the public APL-level facade over the bootstrap compiler
+  and VM pipeline. It exposes `bootstrap.tokens(source)`,
+  `bootstrap.ast(source)`, `bootstrap.ir(source)`,
+  `bootstrap.compile_report(source)`, `bootstrap.artifact_report(source)`,
+  `bootstrap.artifact(source)`, `bootstrap.artifact_image_report(source)`,
+  `bootstrap.artifact_image(source)`, `bootstrap.run_artifact_image(image)`,
+  `bootstrap.run_artifact_image_report(image)`,
+  `bootstrap.run_artifact_image_with_input(image, inputs)`,
+  `bootstrap.run_artifact_image_with_input_report(image, inputs)`,
+  `bootstrap.load_artifact_image_report(image)`,
+  `bootstrap.load_artifact_image(image)`, `bootstrap.loaded_image_report(source)`,
+  `bootstrap.loaded_image(source)`, `bootstrap.run_loaded_image(loaded)`,
+  `bootstrap.linked_artifact_report(source)`,
+  `bootstrap.linked_artifact(source)`,
+  `bootstrap.load_linked_artifact_report(encoded)`,
+  `bootstrap.load_linked_artifact(encoded)`,
+  `bootstrap.linked_artifact_manifest_report(encoded)`,
+  `bootstrap.linked_artifact_manifest(encoded)`,
+  `bootstrap.module_report(source)`, `bootstrap.module(source)`,
+  `bootstrap.modules_report(sources)`, `bootstrap.modules(sources)`,
+  `bootstrap.load_module_report(encoded)`, `bootstrap.load_module(encoded)`,
+  `bootstrap.extend_module_report(encoded, source)`,
+  `bootstrap.extend_module(encoded, source)`,
+  `bootstrap.linked_artifact_with_module_report(encoded, source)`,
+  `bootstrap.linked_artifact_with_module(encoded, source)`,
+  `bootstrap.run_linked_artifact(encoded)`,
+  `bootstrap.run_linked_artifact_report(encoded)`,
+  `bootstrap.run_linked_artifact_with_input(encoded, inputs)`,
+  `bootstrap.run_linked_artifact_with_input_report(encoded, inputs)`,
+  `bootstrap.run_loaded_image_report(loaded)`,
+  `bootstrap.run_loaded_image_with_input(loaded, inputs)`,
+  `bootstrap.run_loaded_image_with_input_report(loaded, inputs)`,
+  `bootstrap.run(source)`, and `bootstrap.run_with_input(source, inputs)`, so
+  compiled APL programs can drive the APL-written runtime without directly
+  stitching lexer/parser/IR/VM calls.
+  `bootstrap.modules_report` checks and lowers a sequence of source modules
+  against the exports accumulated so far, appends their still-unlinked IR in
+  memory, and encodes once. `bootstrap.extend_module_report` performs the same
+  symbol-aware check for one new source against an existing decoded module and
+  emits a new relocatable module. Neither path assigns `CALL_SLOT` before the
+  final program link.
+  Compile reports return `[OK, program]` or `[FAIL, message]` and prevent VM
+  execution when parser/IR lowering produced `ERROR`.
+  Artifact reports currently return `[OK, "APLIR1:..."]` or `[FAIL, message]`.
+  This is a portable text IR image produced from APL code; binary `.aplc` and
+  native output remain host-side/future stages.
+  Artifact image reports return `[OK, ["APLIR1", program]]` or
+  `[FAIL, message]`. These structured images can be run repeatedly through
+  `bootstrap.run_artifact_image*` without re-tokenizing, re-parsing, or
+  re-checking the original source text.
+  Loaded image reports return `[OK, ["APLLOAD2", entry, functions]]` or
+  `[FAIL, output]`. They also precompute the APL VM function table and store an
+  entry program without top-level `FUNC` declarations. The APL linker removes
+  functions outside the transitive entry-call closure and rewrites retained
+  user calls in the complete image to `CALL_SLOT`, so repeated
+  `bootstrap.run_loaded_image*` calls do not re-tokenize, re-parse, re-check,
+  re-collect or look up functions from the original source, or execute function
+  declarations as no-op instructions.
+  Portable linked artifact reports return `[OK, "APLLINK3:..."]` or
+  `[FAIL, message]`. Their payload is encoded and decoded entirely by APL code;
+  a decoded v3 artifact is
+  `["APLLOAD2", entry, functions, ["APLMAN1", libraries]]` and must pass the
+  same structural verifier before it can run. Each library entry is
+  `[name, exclusions]`; `base` is always first. The loader accepts an old
+  three-field `APLLINK2`, for which `bootstrap.linked_artifact_manifest*`
+  returns `NONE`. Encoding that loaded image produces v3 with a default base
+  manifest.
+  The Rust compiler facade and CLI now expose this path through
+  `compile_linked_artifact`, `emit_linked_artifact_file`,
+  `run_linked_artifact`, `emit-linked`, `inspect-linked`, and `run-linked`. The default file
+  extension is `.apllink`; this is a portable bootstrap wire format, not native
+  machine code and not the host-side binary `.aplc` format. The compiler bridge
+  prepends the small APL runtime module as a separate input and performs source
+  composition in APL before checking, IR lowering, function-slot linking, and
+  artifact encoding. This is the first standard-module composition step; image
+  merging after `CALL_SLOT` assignment remains intentionally unsupported.
+  The source-level `bootstrap.run_report(source)` and
+  `bootstrap.run_with_input_report(source, inputs)` facades now compile to a
+  loaded image and execute that loaded image instead of directly calling
+  `vm.run_ir*`.
+  Status-preserving variants `bootstrap.run_report(source)` and
+  `bootstrap.run_with_input_report(source, inputs)` return `[status, output]`,
+  where status is `OK`, `STOP`, or `FAIL`.
+  The current bootstrap gate is now closed at the portable VM level:
+  `emit-standard-module` produces one `APLMOD3` containing the APL-written
+  runtime and compiler, `emit-linked-module` links
+  `examples/bootstrap_runtime.apl` against it, and that `APLLINK3` successfully
+  runs the compiler pipeline again inside the APL-written VM. The nested run
+  produces the expected public values while static secret outputs are rejected
+  by the checker before lowering. Direct VM tests separately verify `DENIED`
+  for untrusted or dynamically protected output. A Rust
+  host still loads and executes this portable oracle. Separately, the native
+  toolchain closes the complete APL compiler through `APLASM1` inside a native
+  executable; it does not execute the portable VM during user compilation.
+  Generated programs and the compiler still depend on the bootstrap Rust native
+  runtime, so the freestanding/runtime bootstrap remains open. Use a release
+  host for the VM-in-VM smoke-test; debug mode is currently impractically slow.
+  A second gate builds that complete compiler/runtime module into a reusable
+  compiler `APLLINK3`. `emit-linked-bootstrap` runs the compiler artifact
+  inside the APL VM with user source and an optional named-library catalog as
+  input. The artifact invokes `bootstrap.linked_artifact_with_module_report` or
+  `bootstrap.linked_artifact_with_module_and_libraries_report` against its
+  embedded runtime `APLMOD3` and returns a fresh user `APLLINK3`. The verified
+  gate compiles and runs both a function-bearing source-only program and a
+  program using an included/excluded library surface to produce `42`, then
+  reuses the same compiler instance to return the exact parser diagnostic for
+  invalid source. This removes repeated compiler-source parsing and base-module
+  compilation from user compilation, but the outer artifact loader and VM are
+  still executed by the Rust bootstrap host.
+- `examples/test_vm.apl`, `examples/test_vm_if.apl`,
+  `examples/test_vm_else_if.apl`, and `examples/test_vm_else.apl`,
+  `examples/test_vm_while.apl`, and
+  `examples/test_vm_loop_flow.apl`, `examples/test_vm_func.apl`,
+  `examples/test_vm_list.apl`, `examples/test_vm_list_mutation_guards.apl`,
+  `examples/test_vm_index_slice.apl`, and
+  `examples/test_vm_pick.apl`, `examples/test_vm_security.apl`,
+  `examples/test_vm_duplicate_names.apl`, `examples/test_vm_unknown_targets.apl`,
+  `examples/test_vm_compound_guards.apl`, `examples/test_vm_info_guards.apl`,
+  `examples/test_vm_secret_flow.apl`, `examples/test_vm_secret_downgrade.apl`,
+  `examples/test_vm_stop_fail.apl`,
+  `examples/test_vm_logic.apl`, `examples/test_vm_precedence.apl`,
+  `examples/test_vm_float.apl`, `examples/test_vm_unary.apl`,
+  `examples/test_vm_pow.apl`, `examples/test_power.apl`,
+  `examples/test_remainder.apl`,
+  `examples/test_vm_self.apl`,
+  `examples/test_vm_conversions.apl`, `examples/test_vm_secretup.apl`,
+  `examples/test_vm_string_helpers.apl`, `examples/test_vm_tagged_list.apl`,
+  `examples/test_vm_input.apl`, `examples/test_vm_input_stream.apl`, and
+  `examples/test_vm_typed_input.apl` are the
+  current VM smoke-tests. `examples/test_bootstrap.apl`,
+  `examples/test_bootstrap_report.apl`, and
+  `examples/test_bootstrap_compile_report.apl`,
+  `examples/test_bootstrap_artifact.apl`, and
+  `examples/test_bootstrap_artifact_image.apl`, and
+  `examples/test_bootstrap_loaded_image.apl`, and
+  `examples/test_bootstrap_linked_artifact.apl` are smoke-tests for the
+  APL-level bootstrap facade.
+
+Bootstrap parity gates:
+
+- `apl_runtime` runs batches of source through both the Rust reference
+  parser/checker/runtime and the APL-written `bootstrap.compile_report` /
+  `bootstrap.run_report` path. The corpus covers accepted and rejected source,
+  arithmetic, control flow, functions, scopes, lists, indexing/slicing,
+  builtins, protection metadata, rendering, and explicit input streams.
+- The differential gate requires the same acceptance result, status, and
+  public output from both implementations. It also checks that invalid typed
+  and exhausted input become `NONE` on both paths.
+- Linked-run boundary tests separately require status and output to survive the
+  APL-to-Rust bridge through `APLRUN1`; malformed or trailing protocol data is
+  rejected instead of being accepted as program output.
+- `cargo test --workspace` runs the ordinary gate. The ignored release test
+  `bootstrap_compiler_artifact_compiles_inside_apl_vm` remains the final
+  compiler-in-VM regression gate because it executes the reusable compiler
+  artifact inside the APL VM and is intentionally expensive.
+- The ignored release test
+  `native_toolchain_compiles_and_runs_a_host_executable` builds the reusable
+  native compiler, asks it to compile source through assembly, invokes the host
+  linker, and runs the resulting executable. This is the native compiler
+  bootstrap gate; it is separate from the still-open APL/freestanding runtime
+  gate.
+
+Rust-hosted builtins that support the APL prelude:
+
+- `split(value, separator)`: splits `Str`/`VTime` string values into a `List`.
+- `len(value)`: returns length for `Str`, `Bytes`, `List`, or matching `VTime`.
+- `contains(value, needle)`: checks string containment.
+- `join(values, separator)`: joins a `List` of strings into a `Str`.
+- `ord(value)`: returns the Unicode code point of the first character in a
+  string.
+- `char(value)`: returns a one-character string from an integer Unicode code
+  point.
+- `pow(base, exponent)`: raises an `Int` or `Float` base to a non-negative
+  integer exponent and returns `NONE` for negative exponents or invalid inputs.
+- `split`, `contains`, and `pow` preserve the strongest protection level of their
+  inputs. Secret-derived pieces remain secret and cannot be sent to `out`.
+- Local `VTime` lists can be mutated with `add(vtime_list, value)` and
+  `pop(vtime_list)`, which lets APL runtime code build temporary buffers inside
+  functions.
+- Slice typing is shape-preserving in the checker: `Str[:] -> Str`,
+  `Bytes[:] -> Bytes`, `List[:] -> List`, and dynamic `VTime[:] -> VTime`.
+
+Legacy host-compiled runtime path:
+
+- `cargo run -p apl -- emit examples\compiled_runtime.apl build\compiled_runtime.aplc`
+  parses/checks APL plus the prelude and writes a binary `.aplc` artifact.
+- `cargo run -p apl -- run-ir build\compiled_runtime.aplc` decodes and executes
+  that artifact without parsing APL source text.
+- CLI `run`, `run-ir`, and `run-linked` commands, plus generated bootstrap
+  executables, inspect whether stdin is attached to a terminal. A direct launch
+  with no redirected input starts immediately instead of waiting for EOF;
+  redirected lines remain the portable paths' current input transport. The
+  native executable runtime additionally reads terminal input lazily when an
+  `input` operation executes.
+- `cargo run -p apl -- build-host examples\compiled_runtime.apl build\compiled_runtime`
+  validates the APL prelude plus user source and generates a separate Rust
+  package.
+- `cargo build --manifest-path build\compiled_runtime\Cargo.toml` compiles that
+  generated package.
+- `cargo run -p apl -- compile-host examples\compiled_runtime.apl build\compiled_runtime`
+  generates the package and invokes `cargo build` for it.
+- The generated executable embeds `.aplc` IR bytes and enters through
+  `apl_runtime::run_ir_bytes`.
+- `examples/bootstrap_runtime.apl` is the current self-host smoke-test: a
+  generated standalone executable embeds compiled APL IR, runs the APL-written
+  lexer/parser/IR/VM from the standard prelude through `bootstrap.run_with_input`,
+  and that VM executes a nested APL program with input, secret input, functions,
+  nested lists, typed input coercion, and checker-approved public output.
+- `apl_runtime::compile_ir_bytes` loads IR into `CompiledProgram`, splitting
+  executable entry code from the function table before execution.
+- `CompiledProgram` stores one linear statement opcode `code` segment. Blocks
+  are ranges inside that segment, and entry code/function bodies point at those
+  ranges by `BlockId`.
+- Expressions are lowered into runtime-owned stack opcodes in
+  `CompiledExpression`.
+- `apl_runtime::run_compiled_program` executes that loaded compiled object.
+- Generated executables do not depend on `apl_parser` and do not parse APL
+  source text at startup. Decode/execution is behind the runtime API so the
+  future VM can replace AST execution without changing compiled program entry.
+- The Rust host runtime now executes statement opcodes from the linear `code`
+  segment through `BlockFrame` values with an explicit program counter (`pc`)
+  and uses a small expression VM.
+
+Portable linked package path:
+
+- `cargo run -p apl -- build examples\compiled_runtime.apl build\compiled_runtime_linked`
+  asks the APL-written pipeline to compose `std/runtime.apl` with user source,
+  check and lower it, assign function slots, and encode `program.apllink`.
+- `cargo run -p apl -- compile examples\compiled_runtime.apl build\compiled_runtime_linked`
+  also invokes Cargo for the generated launcher package.
+- `build-linked` and `compile-linked` remain explicit aliases for the same
+  portable-artifact package path.
+- The generated launcher embeds `program.apllink` with `include_str!` and calls
+  `apl_compiler::run_linked_artifact`. Artifact decoding, structural
+  verification, and VM execution remain APL-owned.
+- The launcher and loader remain Rust-hosted bootstrap code; `.apllink` is not
+  native machine code.
+- Legacy `build-host`/`compile-host` remains available for self-host examples
+  that execute compiler modules from the complete standard prelude.
+  `compile_apl.bat` intentionally uses `compile-host`, while
+  `compile_linked_apl.bat` uses the portable path. The reusable artifact emitted
+  by `emit-bootstrap-compiler` is the preloaded compiler migration layer: it
+  avoids rebuilding and parsing compiler source for each user compilation.
+- `if/else if/else` is compiled into `JumpIfFalse`, `ExecScopedBlock`, and
+  `Jump` statement opcodes.
+- `while` is compiled into `LoopCheck`, `ExecLoopBody`, and `Jump` statement
+  opcodes. Loop iteration counts live in the current `BlockFrame`.
+- Direct machine-code generation is a later stage.
+- This is the first bootstrap-friendly step, not final native compilation.
+
+Runtime v0.1 covers:
+
+- absolute variables, typed assignment, `NONE`, `=self=`;
+- `VTime` scopes in functions/blocks/loops;
+- functions and return values;
+- `if/else if/else`;
+- `while(condition)(limit)`, `break`, `continue`;
+- `pick`;
+- list literals, nested lists, `add`, `set`, `get`, `pop`;
+- indexing and slicing;
+- string/list helper builtins: `split`, `len`, `contains`, `join`, `ord`,
+  `char`, `pow`;
+- `input`, `secret input`, `out`;
+- `info`, conversions, `secretup`, `stop`, `fail`;
+- recursive list protection checks before output/error text.
+- secret downgrade rejection for absolute variables.
+- duplicate declaration rejection in the APL VM.
+- unknown mutation target rejection in the APL VM.
+- compound assignment guards in the APL VM.
+- list mutation guards in the APL VM.
+- `info()` target/source guards in the APL VM.
+
+Useful commands:
+
+```powershell
+cd D:\veles\apl
+cargo test
+cargo run -p apl -- check examples\hello.apl
+cargo run -p apl -- run examples\hello.apl
+cargo run -p apl -- run examples\calculator.apl
+cargo run -p apl -- emit examples\compiled_runtime.apl build\compiled_runtime.aplc
+cargo run -p apl -- run-ir build\compiled_runtime.aplc
+cargo run -p apl -- build examples\compiled_runtime.apl build\compiled_runtime
+cargo build --manifest-path build\compiled_runtime\Cargo.toml
+cargo run -p apl -- compile examples\compiled_runtime.apl build\compiled_runtime
+build\compiled_runtime\target\debug\compiled_runtime_compiled.exe
+.\emit_aplc.bat examples\compiled_runtime.apl build\compiled_runtime.aplc
+.\run_aplc.bat build\compiled_runtime.aplc
+.\compile_apl.bat examples\compiled_runtime.apl build\compiled_runtime_bat
+.\emit_aplc.bat examples\bootstrap_runtime.apl build\bootstrap_runtime.aplc
+.\run_aplc.bat build\bootstrap_runtime.aplc
+.\compile_apl.bat examples\bootstrap_runtime.apl build\bat_bootstrap_runtime
+build\bat_bootstrap_runtime\target\debug\bootstrap_runtime_compiled.exe
+.\emit_aplc.bat examples\test_bootstrap.apl build\test_bootstrap.aplc
+.\run_aplc.bat build\test_bootstrap.aplc
+.\compile_apl.bat examples\test_bootstrap.apl build\bat_test_bootstrap
+build\bat_test_bootstrap\target\debug\test_bootstrap_compiled.exe
+.\emit_aplc.bat examples\test_bootstrap_report.apl build\test_bootstrap_report.aplc
+.\run_aplc.bat build\test_bootstrap_report.aplc
+.\compile_apl.bat examples\test_bootstrap_report.apl build\bat_test_bootstrap_report
+build\bat_test_bootstrap_report\target\debug\test_bootstrap_report_compiled.exe
+.\emit_aplc.bat examples\test_bootstrap_compile_report.apl build\test_bootstrap_compile_report.aplc
+.\run_aplc.bat build\test_bootstrap_compile_report.aplc
+.\compile_apl.bat examples\test_bootstrap_compile_report.apl build\bat_test_bootstrap_compile_report
+build\bat_test_bootstrap_compile_report\target\debug\test_bootstrap_compile_report_compiled.exe
+.\emit_aplc.bat examples\test_bootstrap_artifact.apl build\test_bootstrap_artifact.aplc
+.\run_aplc.bat build\test_bootstrap_artifact.aplc
+.\compile_apl.bat examples\test_bootstrap_artifact.apl build\bat_test_bootstrap_artifact
+build\bat_test_bootstrap_artifact\target\debug\test_bootstrap_artifact_compiled.exe
+.\emit_aplc.bat examples\test_bootstrap_artifact_image.apl build\test_bootstrap_artifact_image.aplc
+.\run_aplc.bat build\test_bootstrap_artifact_image.aplc
+.\compile_apl.bat examples\test_bootstrap_artifact_image.apl build\bat_test_bootstrap_artifact_image
+build\bat_test_bootstrap_artifact_image\target\debug\test_bootstrap_artifact_image_compiled.exe
+.\emit_aplc.bat examples\test_bootstrap_loaded_image.apl build\test_bootstrap_loaded_image.aplc
+.\run_aplc.bat build\test_bootstrap_loaded_image.aplc
+.\compile_apl.bat examples\test_bootstrap_loaded_image.apl build\bat_test_bootstrap_loaded_image
+build\bat_test_bootstrap_loaded_image\target\debug\test_bootstrap_loaded_image_compiled.exe
+.\emit_aplc.bat examples\test_bootstrap_linked_artifact.apl build\test_bootstrap_linked_artifact.aplc
+.\run_aplc.bat build\test_bootstrap_linked_artifact.aplc
+.\compile_apl.bat examples\test_bootstrap_linked_artifact.apl build\bat_test_bootstrap_linked_artifact
+build\bat_test_bootstrap_linked_artifact\target\debug\test_bootstrap_linked_artifact_compiled.exe
+.\emit_aplc.bat examples\test_lexer.apl build\test_lexer.aplc
+.\run_aplc.bat build\test_lexer.aplc
+.\compile_apl.bat examples\test_lexer.apl build\bat_test_lexer
+build\bat_test_lexer\target\debug\test_lexer_compiled.exe
+.\emit_aplc.bat examples\test_parser.apl build\test_parser.aplc
+.\run_aplc.bat build\test_parser.aplc
+.\compile_apl.bat examples\test_parser.apl build\bat_test_parser
+build\bat_test_parser\target\debug\test_parser_compiled.exe
+.\emit_aplc.bat examples\test_checker.apl build\test_checker.aplc
+.\run_aplc.bat build\test_checker.aplc
+.\compile_apl.bat examples\test_checker.apl build\bat_test_checker
+build\bat_test_checker\target\debug\test_checker_compiled.exe
+.\emit_aplc.bat examples\test_checker_targets.apl build\test_checker_targets.aplc
+.\run_aplc.bat build\test_checker_targets.aplc
+.\compile_apl.bat examples\test_checker_targets.apl build\bat_test_checker_targets
+build\bat_test_checker_targets\target\debug\test_checker_targets_compiled.exe
+.\emit_aplc.bat examples\test_checker_exprs.apl build\test_checker_exprs.aplc
+.\run_aplc.bat build\test_checker_exprs.aplc
+.\compile_apl.bat examples\test_checker_exprs.apl build\bat_test_checker_exprs
+build\bat_test_checker_exprs\target\debug\test_checker_exprs_compiled.exe
+.\emit_aplc.bat examples\test_checker_calls.apl build\test_checker_calls.aplc
+.\run_aplc.bat build\test_checker_calls.aplc
+.\compile_apl.bat examples\test_checker_calls.apl build\bat_test_checker_calls
+build\bat_test_checker_calls\target\debug\test_checker_calls_compiled.exe
+.\emit_aplc.bat examples\test_ir.apl build\test_ir.aplc
+.\run_aplc.bat build\test_ir.aplc
+.\compile_apl.bat examples\test_ir.apl build\bat_test_ir
+build\bat_test_ir\target\debug\test_ir_compiled.exe
+.\emit_aplc.bat examples\test_vm.apl build\test_vm.aplc
+.\run_aplc.bat build\test_vm.aplc
+.\compile_apl.bat examples\test_vm.apl build\bat_test_vm
+build\bat_test_vm\target\debug\test_vm_compiled.exe
+.\emit_aplc.bat examples\test_vm_if.apl build\test_vm_if.aplc
+.\run_aplc.bat build\test_vm_if.aplc
+.\compile_apl.bat examples\test_vm_if.apl build\bat_test_vm_if
+build\bat_test_vm_if\target\debug\test_vm_if_compiled.exe
+.\emit_aplc.bat examples\test_vm_else_if.apl build\test_vm_else_if.aplc
+.\run_aplc.bat build\test_vm_else_if.aplc
+.\compile_apl.bat examples\test_vm_else_if.apl build\bat_test_vm_else_if
+build\bat_test_vm_else_if\target\debug\test_vm_else_if_compiled.exe
+.\emit_aplc.bat examples\test_vm_else.apl build\test_vm_else.aplc
+.\run_aplc.bat build\test_vm_else.aplc
+.\compile_apl.bat examples\test_vm_else.apl build\bat_test_vm_else
+build\bat_test_vm_else\target\debug\test_vm_else_compiled.exe
+.\emit_aplc.bat examples\test_vm_while.apl build\test_vm_while.aplc
+.\run_aplc.bat build\test_vm_while.aplc
+.\compile_apl.bat examples\test_vm_while.apl build\bat_test_vm_while
+build\bat_test_vm_while\target\debug\test_vm_while_compiled.exe
+.\emit_aplc.bat examples\test_vm_loop_flow.apl build\test_vm_loop_flow.aplc
+.\run_aplc.bat build\test_vm_loop_flow.aplc
+.\compile_apl.bat examples\test_vm_loop_flow.apl build\bat_test_vm_loop_flow
+build\bat_test_vm_loop_flow\target\debug\test_vm_loop_flow_compiled.exe
+.\emit_aplc.bat examples\test_vm_func.apl build\test_vm_func.aplc
+.\run_aplc.bat build\test_vm_func.aplc
+.\compile_apl.bat examples\test_vm_func.apl build\bat_test_vm_func
+build\bat_test_vm_func\target\debug\test_vm_func_compiled.exe
+.\emit_aplc.bat examples\test_vm_list.apl build\test_vm_list.aplc
+.\run_aplc.bat build\test_vm_list.aplc
+.\compile_apl.bat examples\test_vm_list.apl build\bat_test_vm_list
+build\bat_test_vm_list\target\debug\test_vm_list_compiled.exe
+.\emit_aplc.bat examples\test_vm_list_mutation_guards.apl build\test_vm_list_mutation_guards.aplc
+.\run_aplc.bat build\test_vm_list_mutation_guards.aplc
+.\compile_apl.bat examples\test_vm_list_mutation_guards.apl build\bat_test_vm_list_mutation_guards
+build\bat_test_vm_list_mutation_guards\target\debug\test_vm_list_mutation_guards_compiled.exe
+.\emit_aplc.bat examples\test_vm_index_slice.apl build\test_vm_index_slice.aplc
+.\run_aplc.bat build\test_vm_index_slice.aplc
+.\compile_apl.bat examples\test_vm_index_slice.apl build\bat_test_vm_index_slice
+build\bat_test_vm_index_slice\target\debug\test_vm_index_slice_compiled.exe
+.\emit_aplc.bat examples\test_vm_pick.apl build\test_vm_pick.aplc
+.\run_aplc.bat build\test_vm_pick.aplc
+.\compile_apl.bat examples\test_vm_pick.apl build\bat_test_vm_pick
+build\bat_test_vm_pick\target\debug\test_vm_pick_compiled.exe
+.\emit_aplc.bat examples\test_vm_security.apl build\test_vm_security.aplc
+.\run_aplc.bat build\test_vm_security.aplc
+.\compile_apl.bat examples\test_vm_security.apl build\bat_test_vm_security
+build\bat_test_vm_security\target\debug\test_vm_security_compiled.exe
+.\emit_aplc.bat examples\test_vm_duplicate_names.apl build\test_vm_duplicate_names.aplc
+.\run_aplc.bat build\test_vm_duplicate_names.aplc
+.\compile_apl.bat examples\test_vm_duplicate_names.apl build\bat_test_vm_duplicate_names
+build\bat_test_vm_duplicate_names\target\debug\test_vm_duplicate_names_compiled.exe
+.\emit_aplc.bat examples\test_vm_unknown_targets.apl build\test_vm_unknown_targets.aplc
+.\run_aplc.bat build\test_vm_unknown_targets.aplc
+.\compile_apl.bat examples\test_vm_unknown_targets.apl build\bat_test_vm_unknown_targets
+build\bat_test_vm_unknown_targets\target\debug\test_vm_unknown_targets_compiled.exe
+.\emit_aplc.bat examples\test_vm_compound_guards.apl build\test_vm_compound_guards.aplc
+.\run_aplc.bat build\test_vm_compound_guards.aplc
+.\compile_apl.bat examples\test_vm_compound_guards.apl build\bat_test_vm_compound_guards
+build\bat_test_vm_compound_guards\target\debug\test_vm_compound_guards_compiled.exe
+.\emit_aplc.bat examples\test_vm_info_guards.apl build\test_vm_info_guards.aplc
+.\run_aplc.bat build\test_vm_info_guards.aplc
+.\compile_apl.bat examples\test_vm_info_guards.apl build\bat_test_vm_info_guards
+build\bat_test_vm_info_guards\target\debug\test_vm_info_guards_compiled.exe
+.\emit_aplc.bat examples\test_vm_secret_flow.apl build\test_vm_secret_flow.aplc
+.\run_aplc.bat build\test_vm_secret_flow.aplc
+.\compile_apl.bat examples\test_vm_secret_flow.apl build\bat_test_vm_secret_flow
+build\bat_test_vm_secret_flow\target\debug\test_vm_secret_flow_compiled.exe
+.\emit_aplc.bat examples\test_vm_secret_downgrade.apl build\test_vm_secret_downgrade.aplc
+.\run_aplc.bat build\test_vm_secret_downgrade.aplc
+.\compile_apl.bat examples\test_vm_secret_downgrade.apl build\bat_test_vm_secret_downgrade
+build\bat_test_vm_secret_downgrade\target\debug\test_vm_secret_downgrade_compiled.exe
+.\emit_aplc.bat examples\test_vm_stop_fail.apl build\test_vm_stop_fail.aplc
+.\run_aplc.bat build\test_vm_stop_fail.aplc
+.\compile_apl.bat examples\test_vm_stop_fail.apl build\bat_test_vm_stop_fail
+build\bat_test_vm_stop_fail\target\debug\test_vm_stop_fail_compiled.exe
+.\emit_aplc.bat examples\test_vm_logic.apl build\test_vm_logic.aplc
+.\run_aplc.bat build\test_vm_logic.aplc
+.\compile_apl.bat examples\test_vm_logic.apl build\bat_test_vm_logic
+build\bat_test_vm_logic\target\debug\test_vm_logic_compiled.exe
+.\emit_aplc.bat examples\test_vm_precedence.apl build\test_vm_precedence.aplc
+.\run_aplc.bat build\test_vm_precedence.aplc
+.\compile_apl.bat examples\test_vm_precedence.apl build\bat_test_vm_precedence
+build\bat_test_vm_precedence\target\debug\test_vm_precedence_compiled.exe
+.\emit_aplc.bat examples\test_vm_float.apl build\test_vm_float.aplc
+.\run_aplc.bat build\test_vm_float.aplc
+.\compile_apl.bat examples\test_vm_float.apl build\bat_test_vm_float
+build\bat_test_vm_float\target\debug\test_vm_float_compiled.exe
+.\emit_aplc.bat examples\test_vm_unary.apl build\test_vm_unary.aplc
+.\run_aplc.bat build\test_vm_unary.aplc
+.\compile_apl.bat examples\test_vm_unary.apl build\bat_test_vm_unary
+build\bat_test_vm_unary\target\debug\test_vm_unary_compiled.exe
+.\emit_aplc.bat examples\test_vm_pow.apl build\test_vm_pow.aplc
+.\run_aplc.bat build\test_vm_pow.aplc
+.\compile_apl.bat examples\test_vm_pow.apl build\bat_test_vm_pow
+build\bat_test_vm_pow\target\debug\test_vm_pow_compiled.exe
+.\emit_aplc.bat examples\test_vm_self.apl build\test_vm_self.aplc
+.\run_aplc.bat build\test_vm_self.aplc
+.\compile_apl.bat examples\test_vm_self.apl build\bat_test_vm_self
+build\bat_test_vm_self\target\debug\test_vm_self_compiled.exe
+.\emit_aplc.bat examples\test_vm_conversions.apl build\test_vm_conversions.aplc
+.\run_aplc.bat build\test_vm_conversions.aplc
+.\compile_apl.bat examples\test_vm_conversions.apl build\bat_test_vm_conversions
+build\bat_test_vm_conversions\target\debug\test_vm_conversions_compiled.exe
+.\emit_aplc.bat examples\test_vm_secretup.apl build\test_vm_secretup.aplc
+.\run_aplc.bat build\test_vm_secretup.aplc
+.\compile_apl.bat examples\test_vm_secretup.apl build\bat_test_vm_secretup
+build\bat_test_vm_secretup\target\debug\test_vm_secretup_compiled.exe
+.\emit_aplc.bat examples\test_vm_string_helpers.apl build\test_vm_string_helpers.aplc
+.\run_aplc.bat build\test_vm_string_helpers.aplc
+.\compile_apl.bat examples\test_vm_string_helpers.apl build\bat_test_vm_string_helpers
+build\bat_test_vm_string_helpers\target\debug\test_vm_string_helpers_compiled.exe
+.\emit_aplc.bat examples\test_vm_tagged_list.apl build\test_vm_tagged_list.aplc
+.\run_aplc.bat build\test_vm_tagged_list.aplc
+.\compile_apl.bat examples\test_vm_tagged_list.apl build\bat_test_vm_tagged_list
+build\bat_test_vm_tagged_list\target\debug\test_vm_tagged_list_compiled.exe
+.\emit_aplc.bat examples\test_vm_input.apl build\test_vm_input.aplc
+.\run_aplc.bat build\test_vm_input.aplc
+.\compile_apl.bat examples\test_vm_input.apl build\bat_test_vm_input
+build\bat_test_vm_input\target\debug\test_vm_input_compiled.exe
+.\emit_aplc.bat examples\test_vm_input_stream.apl build\test_vm_input_stream.aplc
+.\run_aplc.bat build\test_vm_input_stream.aplc
+.\compile_apl.bat examples\test_vm_input_stream.apl build\bat_test_vm_input_stream
+build\bat_test_vm_input_stream\target\debug\test_vm_input_stream_compiled.exe
+.\emit_aplc.bat examples\test_vm_typed_input.apl build\test_vm_typed_input.aplc
+.\run_aplc.bat build\test_vm_typed_input.aplc
+.\compile_apl.bat examples\test_vm_typed_input.apl build\bat_test_vm_typed_input
+build\bat_test_vm_typed_input\target\debug\test_vm_typed_input_compiled.exe
+powershell -ExecutionPolicy Bypass -File tools\apl_gui.ps1
+```
+
+The older minimal GUI is implemented in `tools/apl_gui.ps1`; it opens
+`examples/std_main.apl` as its current-syntax sample.
+Quick Windows compiler wrappers live at repository root:
+`compile_apl.bat`, `compile_linked_apl.bat`, `emit_aplc.bat`, and
+`run_aplc.bat`.

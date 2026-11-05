@@ -309,6 +309,10 @@ func bootstrap.linked_artifact_with_module_report(encoded_module, source) {
     return [vm.FLOW_FAIL, bootstrap.ir_error(user_program)]
   }
 
+  if checker.statements_have_main(ast) {
+    add(user_program, [ir.OP_EXPR, [ir.EXPR_CALL, "std::main", []]])
+  }
+
   VTime combined = artifact.module_program(module)[:]
 
   pick(user_program): instruction {
@@ -383,6 +387,98 @@ func bootstrap.decode_named_libraries_report(encoded_libraries) {
   return [vm.FLOW_OK, libraries, catalog]
 }
 
+func bootstrap.symbols_for_program_report(program, checked_symbols, local_class_symbols) {
+  VTime symbols = []
+  pick(artifact.program_symbols(program)): expected {
+    VTime found = NONE
+    pick(checked_symbols): symbol {
+      if get(symbol, 0) == get(expected, 0) {
+        found = symbol
+      }
+    }
+    if found == NONE {
+      return [vm.FLOW_FAIL, join(["missing checked module symbol `", get(expected, 0), "`"], "")]
+    }
+    add(symbols, found)
+  }
+  pick(local_class_symbols): symbol {
+    add(symbols, symbol)
+  }
+  return [vm.FLOW_OK, symbols]
+}
+
+func bootstrap.dependent_module_report(encoded_libraries, source) {
+  VTime decoded = bootstrap.decode_named_libraries_report(encoded_libraries)
+  if get(decoded, 0) != vm.FLOW_OK {
+    return decoded
+  }
+
+  VTime catalog = get(decoded, 2)
+  VTime ast = bootstrap.ast(source)
+  VTime checked = checker.validate_report_with_library_symbols(ast, [], catalog)
+  if get(checked, 0) != checker.STATUS_OK {
+    return [vm.FLOW_FAIL, bootstrap.located_check_error_with_libraries(source, checked, [], catalog)]
+  }
+
+  VTime extension = ir.compile_ast(get(checked, 1))
+  if bootstrap.ir_has_error(extension) {
+    return [vm.FLOW_FAIL, bootstrap.ir_error(extension)]
+  }
+
+  VTime symbols_report = bootstrap.symbols_for_program_report(extension, get(checked, 2), get(checked, 6))
+  if get(symbols_report, 0) != vm.FLOW_OK {
+    return symbols_report
+  }
+  return artifact.encode_module_with_symbols_report(extension, get(symbols_report, 1))
+}
+
+func bootstrap.is_class_dispatch_name(name) {
+  VTime prefix = "aplclass.dispatch."
+  if len(name) < len(prefix) {
+    return false
+  }
+  return name[:len(prefix)] == prefix
+}
+
+func bootstrap.dispatch_names(program) {
+  VTime names = []
+  pick(program): instruction {
+    if ir.opcode(instruction) == ir.OP_FUNC {
+      VTime name = get(instruction, 1)
+      if bootstrap.is_class_dispatch_name(name) {
+        add(names, name)
+      }
+    }
+  }
+  return names
+}
+
+func bootstrap.overlay_class_dispatch(combined, extension) {
+  VTime replacements = bootstrap.dispatch_names(extension)
+  if len(replacements) == 0 {
+    VTime unchanged = combined[:]
+    pick(extension): instruction {
+      add(unchanged, instruction)
+    }
+    return unchanged
+  }
+
+  VTime result = []
+  pick(combined): instruction {
+    VTime replaced = false
+    if ir.opcode(instruction) == ir.OP_FUNC {
+      replaced = checker.value_exists(replacements, get(instruction, 1))
+    }
+    if replaced != true {
+      add(result, instruction)
+    }
+  }
+  pick(extension): instruction {
+    add(result, instruction)
+  }
+  return result
+}
+
 func bootstrap.linked_artifact_from_library_catalog_report(base_program, base_symbols, libraries, catalog, source) {
   VTime ast = bootstrap.ast(source)
   VTime checked = checker.validate_report_with_library_symbols(ast, base_symbols, catalog)
@@ -397,21 +493,20 @@ func bootstrap.linked_artifact_from_library_catalog_report(base_program, base_sy
     return [vm.FLOW_FAIL, bootstrap.ir_error(user_program)]
   }
 
+  if checker.statements_have_main(ast) {
+    add(user_program, [ir.OP_EXPR, [ir.EXPR_CALL, "std::main", []]])
+  }
+
   VTime combined = base_program[:]
 
   pick(get(checked, 3)): library_name {
     if library_name != "base" {
       VTime library = get(libraries, bootstrap.named_library_index(libraries, library_name))
-
-      pick(artifact.module_program(get(library, 1))): instruction {
-        add(combined, instruction)
-      }
+      combined = bootstrap.overlay_class_dispatch(combined, artifact.module_program(get(library, 1)))
     }
   }
 
-  pick(user_program): instruction {
-    add(combined, instruction)
-  }
+  combined = bootstrap.overlay_class_dispatch(combined, user_program)
 
   VTime loaded = vm.load_ir_report(combined)
 
@@ -647,6 +742,10 @@ func bootstrap.run_loaded_image_with_input(loaded, inputs) {
 
 func bootstrap.run_loaded_image_with_input_report(loaded, inputs) {
   return vm.run_loaded_with_input_report(loaded, inputs)
+}
+
+func bootstrap.run_loaded_image_with_bound_input_report(loaded, inputs, input_arguments) {
+  return vm.run_loaded_with_bound_input_report(loaded, inputs, input_arguments)
 }
 
 func bootstrap.run(source) {

@@ -54,6 +54,166 @@ func verifier.unary_op_is_valid(op) {
 }
 
 func verifier.builtin_arity(name) {
+  if name == "raw_malloc" {
+    return 1
+  }
+  if name == "raw_load" {
+    return 4
+  }
+  if name == "raw_mark" {
+    return 1
+  }
+  if name == "raw_free" {
+    return 0
+  }
+  if name == "raw_where" {
+    return 2
+  }
+  if name == "raw_read" {
+    return 3
+  }
+  if name == "raw_write" {
+    return 3
+  }
+  if name == "raw_call" {
+    return 2
+  }
+  if name == "raw_scope_enter" {
+    return 1
+  }
+  if name == "raw_scope_exit" {
+    return 0
+  }
+  if name == "raw_scope_leave" {
+    return 1
+  }
+
+  if name == "timer_start" {
+    return 0
+  }
+
+  if name == "timer_stop" {
+    return 0
+  }
+
+  if name == "timer_elapsed" {
+    return 0
+  }
+  if name == "now_utc" {
+    return 0
+  }
+
+  if name == "sha1" {
+
+    return 1
+
+  }
+  if name == "sha256" {
+    return 1
+  }
+  if name == "sha512" {
+    return 1
+  }
+  if name == "sha3_384" {
+    return 1
+  }
+  if ((((name == "windows_available") or (name == "windows_last_error")) or (name == "windows_run_message_loop")) or (name == "windows_pump_messages")) or (name == "windows_next_event") {
+    return 0
+  }
+  if ((((name == "windows_load_library") or (name == "windows_close_library")) or (name == "windows_utf16")) or (name == "windows_show_window")) or (name == "windows_destroy_window") {
+    return 1
+  }
+  if name == "windows_call" {
+    return 2
+  }
+  if (name == "windows_message_box") or (name == "windows_create_window") {
+    return 3
+  }
+  if name == "windows_get_procedure" {
+    return 4
+  }
+  if name == "windows_create_control" {
+    return 10
+  }
+  if name == "windows_set_window_text" {
+    return 2
+  }
+  if name == "windows_window_text" {
+    return 1
+  }
+  if name == "windows_move_window" {
+    return 6
+  }
+  if (name == "windows_selection") or (name == "windows_line_count") {
+    return 1
+  }
+  if (name == "windows_set_selection") or (name == "windows_replace_selection") {
+    return 3
+  }
+  if name == "windows_set_text_color" {
+    return 4
+  }
+  if name == "windows_find_text" {
+    return 6
+  }
+  if ((name == "windows_set_background_color") or (name == "windows_set_text_bold")) {
+    return 4
+  }
+  if name == "windows_set_text_font" {
+    return 5
+  }
+  if name == "windows_run_process" {
+    return 4
+  }
+  if (name == "windows_open_file_dialog") or (name == "windows_save_file_dialog") {
+    return 7
+  }
+  if ((name == "windows_create_menu") or (name == "windows_append_menu_separator")) or (name == "windows_destroy_menu") {
+    return 1
+  }
+  if name == "windows_set_menu" {
+    return 2
+  }
+  if (((name == "windows_append_menu_item") or (name == "windows_append_submenu")) or (name == "windows_set_menu_item_enabled")) or (name == "windows_set_menu_item_checked") {
+    return 3
+  }
+  if name == "windows_wait_event" {
+    return 0
+  }
+  if name == "windows_destroy_icon" {
+    return 1
+  }
+  if name == "windows_set_window_icon" {
+    return 2
+  }
+  if name == "windows_load_icon" {
+    return 3
+  }
+  if name == "windows_set_deferred_close" {
+    return 2
+  }
+  if (name == "windows_create_accelerators") or (name == "windows_destroy_accelerators") {
+    return 1
+  }
+  if name == "windows_set_accelerators" {
+    return 2
+  }
+  if (name == "windows_can_undo") or (name == "windows_undo") {
+    return 1
+  }
+  if (name == "windows_can_redo") or (name == "windows_redo") {
+    return 1
+  }
+  if (name == "windows_clear_history") or (name == "windows_event_mask") {
+    return 1
+  }
+  if (name == "windows_first_visible_line") or (name == "windows_focus") {
+    return 1
+  }
+  if (name == "windows_set_event_mask") or (name == "windows_scroll_lines") {
+    return 2
+  }
+
   if name == "get" {
     return 2
   }
@@ -456,6 +616,16 @@ func verifier.instruction_is_valid(instruction, function_count) {
     return verifier.expr_is_valid(get(instruction, 1), function_count)
   }
 
+  if opcode == ir.OP_ERR_RETURN {
+    if len(instruction) != 3 {
+      return false
+    }
+    if verifier.expr_is_valid(get(instruction, 1), function_count) != true {
+      return false
+    }
+    return verifier.expr_is_valid(get(instruction, 2), function_count)
+  }
+
   if opcode == ir.OP_RETURN {
     if len(instruction) != 2 {
       return false
@@ -497,7 +667,7 @@ func verifier.instruction_is_valid(instruction, function_count) {
   }
 
   if opcode == ir.OP_WHILE {
-    if len(instruction) != 4 {
+    if len(instruction) != 6 {
       return false
     }
 
@@ -505,16 +675,50 @@ func verifier.instruction_is_valid(instruction, function_count) {
       return false
     }
 
-    VTime limit = get(instruction, 2)
-
-    if verifier.is_int(limit) != true {
+    if verifier.expr_is_valid(get(instruction, 2), function_count) != true {
       return false
     }
 
-    if limit < -1 {
+    if verifier.program_is_valid(get(instruction, 3), function_count) != true {
       return false
     }
+    if verifier.program_is_valid(get(instruction, 4), function_count) != true {
+      return false
+    }
+    return verifier.program_is_valid(get(instruction, 5), function_count)
+  }
 
+  if opcode == ir.OP_MATCH {
+    if len(instruction) != 4 {
+      return false
+    }
+    if verifier.expr_is_valid(get(instruction, 1), function_count) != true {
+      return false
+    }
+    pick(get(instruction, 2)): case_entry {
+      if len(case_entry) != 2 {
+        return false
+      }
+      pick(get(case_entry, 0)): pattern {
+        if get(pattern, 0) == parser.MATCH_VALUE {
+          if (len(pattern) != 2) or (verifier.expr_is_valid(get(pattern, 1), function_count) != true) {
+            return false
+          }
+        } else if get(pattern, 0) == parser.MATCH_RANGE {
+          if len(pattern) != 3 {
+            return false
+          }
+          if (verifier.expr_is_valid(get(pattern, 1), function_count) != true) or (verifier.expr_is_valid(get(pattern, 2), function_count) != true) {
+            return false
+          }
+        } else {
+          return false
+        }
+      }
+      if verifier.program_is_valid(get(case_entry, 1), function_count) != true {
+        return false
+      }
+    }
     return verifier.program_is_valid(get(instruction, 3), function_count)
   }
 
@@ -650,6 +854,10 @@ func verifier.instruction_contains_call_slot(instruction) {
     return verifier.expr_contains_call_slot(get(instruction, 1))
   }
 
+  if opcode == ir.OP_ERR_RETURN {
+    return (verifier.expr_contains_call_slot(get(instruction, 1))) or (verifier.expr_contains_call_slot(get(instruction, 2)))
+  }
+
   if opcode == ir.OP_RETURN {
     return verifier.expr_contains_call_slot(get(instruction, 1))
   }
@@ -671,6 +879,38 @@ func verifier.instruction_contains_call_slot(instruction) {
       return true
     }
 
+    if verifier.expr_contains_call_slot(get(instruction, 2)) {
+      return true
+    }
+
+    if verifier.program_contains_call_slot(get(instruction, 3)) {
+      return true
+    }
+    if verifier.program_contains_call_slot(get(instruction, 4)) {
+      return true
+    }
+    return verifier.program_contains_call_slot(get(instruction, 5))
+  }
+
+  if opcode == ir.OP_MATCH {
+    if verifier.expr_contains_call_slot(get(instruction, 1)) {
+      return true
+    }
+    pick(get(instruction, 2)): case_entry {
+      pick(get(case_entry, 0)): pattern {
+        if verifier.expr_contains_call_slot(get(pattern, 1)) {
+          return true
+        }
+        if get(pattern, 0) == parser.MATCH_RANGE {
+          if verifier.expr_contains_call_slot(get(pattern, 2)) {
+            return true
+          }
+        }
+      }
+      if verifier.program_contains_call_slot(get(case_entry, 1)) {
+        return true
+      }
+    }
     return verifier.program_contains_call_slot(get(instruction, 3))
   }
 

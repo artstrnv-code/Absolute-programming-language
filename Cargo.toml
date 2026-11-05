@@ -3,12 +3,15 @@ members = [
     "crates/apl_cli",
     "crates/apl_compiler",
     "crates/apl_core",
+    "crates/apl_crypto",
     "crates/apl_ir",
     "crates/apl_native_runtime",
     "crates/apl_parser",
+    "crates/apl_raw_memory",
     "crates/apl_runtime",
     "crates/apl_router",
     "crates/apl_studio",
+    "crates/apl_windows",
 ]
 resolver = "2"
 

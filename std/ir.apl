@@ -11,8 +11,10 @@ AVStr ir.OP_EXPR = "EXPR"
 AVStr ir.OP_OUT = "OUT"
 AVStr ir.OP_STOP = "STOP"
 AVStr ir.OP_FAIL = "FAIL"
+AVStr ir.OP_ERR_RETURN = "ERR_RETURN"
 AVStr ir.OP_IF = "IF"
 AVStr ir.OP_WHILE = "WHILE"
+AVStr ir.OP_MATCH = "MATCH"
 AVStr ir.OP_PICK = "PICK"
 AVStr ir.OP_BREAK = "BREAK"
 AVStr ir.OP_CONTINUE = "CONTINUE"
@@ -46,6 +48,24 @@ func ir.expr_opcode(expression) {
 
 func ir.expr_value(expression) {
   return get(expression, 2)
+}
+
+func ir.runtime_call_name(name) {
+  if name == "std::main" {
+    return name
+  }
+
+  VTime parts = split(name, "::")
+
+  if len(parts) != 2 {
+    return name
+  }
+
+  if get(parts, 0) == "std" {
+    return get(parts, 1)
+  }
+
+  return join([get(parts, 0), ".", get(parts, 1)], "")
 }
 
 func ir.compile_expr(expression) {
@@ -83,7 +103,7 @@ func ir.compile_expr(expression) {
       add(args, ir.compile_expr(arg))
     }
 
-    return [ir.EXPR_CALL, get(expression, 1), args]
+    return [ir.EXPR_CALL, ir.runtime_call_name(get(expression, 1)), args]
   }
 
   if kind == parser.EXPR_LIST {
@@ -126,7 +146,7 @@ func ir.compile_optional_expr(expression) {
 func ir.compile_node(node) {
   VTime kind = parser.node_kind(node)
 
-  if (kind == parser.NODE_INCLUDE) or (kind == parser.NODE_EXCLUDE) {
+  if (((kind == parser.NODE_INCLUDE) or (kind == parser.NODE_EXCLUDE)) or (kind == parser.NODE_USING)) or (kind == parser.NODE_NC) {
     return NONE
   }
 
@@ -166,6 +186,10 @@ func ir.compile_node(node) {
     return [ir.OP_FAIL, ir.compile_expr(get(node, 1))]
   }
 
+  if kind == parser.NODE_ERR {
+    return [ir.OP_ERR_RETURN, ir.compile_expr(get(node, 1)), ir.compile_expr(get(node, 2))]
+  }
+
   if kind == parser.NODE_BREAK {
     return [ir.OP_BREAK]
   }
@@ -191,7 +215,23 @@ func ir.compile_node(node) {
   }
 
   if kind == parser.NODE_WHILE {
-    return [ir.OP_WHILE, ir.compile_expr(get(node, 1)), get(node, 2), ir.compile_ast(get(node, 3))]
+    return [ir.OP_WHILE, ir.compile_expr(get(node, 1)), ir.compile_expr(get(node, 2)), ir.compile_ast(get(node, 3)), ir.compile_ast(get(node, 4)), ir.compile_ast(get(node, 5))]
+  }
+
+  if kind == parser.NODE_MATCH {
+    VTime cases = []
+    pick(get(node, 2)): case_entry {
+      VTime patterns = []
+      pick(get(case_entry, 0)): pattern {
+        if get(pattern, 0) == parser.MATCH_VALUE {
+          add(patterns, [parser.MATCH_VALUE, ir.compile_expr(get(pattern, 1))])
+        } else {
+          add(patterns, [parser.MATCH_RANGE, ir.compile_expr(get(pattern, 1)), ir.compile_expr(get(pattern, 2))])
+        }
+      }
+      add(cases, [patterns, ir.compile_ast(get(case_entry, 1))])
+    }
+    return [ir.OP_MATCH, ir.compile_expr(get(node, 1)), cases, ir.compile_ast(get(node, 3))]
   }
 
   if kind == parser.NODE_PICK {

@@ -323,6 +323,12 @@ func artifact.wrap_instruction(instruction) {
     return artifact.node_list(items)
   }
 
+  if opcode == ir.OP_ERR_RETURN {
+    add(items, artifact.wrap_expr(get(instruction, 1)))
+    add(items, artifact.wrap_expr(get(instruction, 2)))
+    return artifact.node_list(items)
+  }
+
   if opcode == ir.OP_RETURN {
     add(items, artifact.wrap_expr(get(instruction, 1)))
     return artifact.node_list(items)
@@ -342,7 +348,28 @@ func artifact.wrap_instruction(instruction) {
 
   if opcode == ir.OP_WHILE {
     add(items, artifact.wrap_expr(get(instruction, 1)))
-    add(items, artifact.node_int(get(instruction, 2)))
+    add(items, artifact.wrap_expr(get(instruction, 2)))
+    add(items, artifact.wrap_program(get(instruction, 3)))
+    add(items, artifact.wrap_program(get(instruction, 4)))
+    add(items, artifact.wrap_program(get(instruction, 5)))
+    return artifact.node_list(items)
+  }
+
+  if opcode == ir.OP_MATCH {
+    add(items, artifact.wrap_expr(get(instruction, 1)))
+    VTime wrapped_cases = []
+    pick(get(instruction, 2)): case_entry {
+      VTime wrapped_patterns = []
+      pick(get(case_entry, 0)): pattern {
+        VTime wrapped_pattern = [artifact.node_str(get(pattern, 0)), artifact.wrap_expr(get(pattern, 1))]
+        if get(pattern, 0) == parser.MATCH_RANGE {
+          add(wrapped_pattern, artifact.wrap_expr(get(pattern, 2)))
+        }
+        add(wrapped_patterns, artifact.node_list(wrapped_pattern))
+      }
+      add(wrapped_cases, artifact.node_list([artifact.node_list(wrapped_patterns), artifact.wrap_program(get(case_entry, 1))]))
+    }
+    add(items, artifact.node_list(wrapped_cases))
     add(items, artifact.wrap_program(get(instruction, 3)))
     return artifact.node_list(items)
   }
@@ -697,6 +724,8 @@ func artifact.wrap_symbol_table(symbols) {
 
     if get(symbol, 1) == "Func" {
       wrapped_type = artifact.node_int(typ)
+    } else if (get(symbol, 1) == "Class") or (get(symbol, 1) == "Struct") {
+      wrapped_type = artifact.wrap_value(typ)
     }
 
     VTime fields = [
@@ -884,6 +913,26 @@ func artifact.module_v3_symbols_are_valid(symbols) {
       if typ != "List" {
         return false
       }
+    } else if role == "Class" {
+      if protection != "AV" {
+        return false
+      }
+      if classlower.surface_is_valid(typ) != true {
+        return false
+      }
+      if classlower.class_name(typ) != name {
+        return false
+      }
+    } else if role == "Struct" {
+      if protection != "AV" {
+        return false
+      }
+      if structlower.surface_is_valid(typ) != true {
+        return false
+      }
+      if structlower.name(typ) != name {
+        return false
+      }
     } else {
       return false
     }
@@ -896,8 +945,15 @@ func artifact.module_v3_symbols_are_valid(symbols) {
 
 func artifact.module_v3_symbols_match_program(program, symbols) {
   VTime expected = artifact.program_symbols(program)
+  VTime runtime_symbol_count = 0
 
-  if len(expected) != len(symbols) {
+  pick(symbols): symbol {
+    if (get(symbol, 1) != "Class") and (get(symbol, 1) != "Struct") {
+      runtime_symbol_count += 1
+    }
+  }
+
+  if len(expected) != runtime_symbol_count {
     return false
   }
 
@@ -1102,7 +1158,12 @@ func artifact.encode_module_with_symbols_report(program, symbols) {
   }
 
   if artifact.module_v3_symbols_match_program(program, symbols) != true {
-    return [vm.FLOW_FAIL, "module symbol table does not match program"]
+    return [vm.FLOW_FAIL, join([
+      "module symbol table does not match program: expected ",
+      str(artifact.program_symbols(program)),
+      ", exported ",
+      str(symbols)
+    ], "")]
   }
 
   VTime wrapped = artifact.node_list([

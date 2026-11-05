@@ -19,6 +19,8 @@ pub enum Statement {
         symbol: String,
         library: String,
     },
+    UsingNamespace(String),
+    NoConflicts(Vec<String>),
     VariableDecl(VariableDecl),
     ListDecl(ListDecl),
     VTimeDecl(VTimeDecl),
@@ -39,8 +41,13 @@ pub enum Statement {
     Out(Expression),
     Stop(Option<Expression>),
     Fail(Expression),
+    ErrorReturn {
+        message: Expression,
+        code: Expression,
+    },
     Return(Expression),
     If(IfStatement),
+    Match(MatchStatement),
     While(WhileStatement),
     Pick(PickStatement),
     Break,
@@ -217,8 +224,29 @@ pub struct ElseIfBranch {
 #[derive(Debug, Clone, PartialEq)]
 pub struct WhileStatement {
     pub condition: Expression,
-    pub limit: i64,
+    pub limit: Expression,
     pub body: Vec<Statement>,
+    pub limit_body: Option<Vec<Statement>>,
+    pub else_body: Option<Vec<Statement>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchStatement {
+    pub value: Expression,
+    pub cases: Vec<MatchCase>,
+    pub default_body: Option<Vec<Statement>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchCase {
+    pub patterns: Vec<MatchPattern>,
+    pub body: Vec<Statement>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum MatchPattern {
+    Value(Expression),
+    InclusiveRange { start: Expression, end: Expression },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -375,6 +403,20 @@ pub enum CheckError {
         library: String,
         symbol: String,
     },
+    DuplicateNamespaceDirective,
+    NamespaceDirectiveConflict,
+    DuplicateNamespace(String),
+    NamespaceNotIncluded(String),
+    NamespaceConflict {
+        symbol: String,
+        namespaces: Vec<String>,
+    },
+    StandardPrefixRequired(String),
+    MissingMain,
+    DuplicateMain,
+    InvalidMainSignature,
+    TopLevelExecutableStatement,
+    MainMayNotReturn,
     UnknownLibrary(String),
     UnknownLibrarySymbol {
         library: String,
@@ -407,6 +449,8 @@ pub enum CheckError {
     InvalidAssignmentTarget(String),
     InvalidOperation(String),
     InvalidLoopLimit(i64),
+    InvalidMatchRange,
+    OverlappingMatchPattern,
     BreakOutsideLoop,
     ContinueOutsideLoop,
     ReturnOutsideFunction,
@@ -417,7 +461,45 @@ pub fn validate_program(program: &Program) -> Result<(), CheckError> {
     let mut checker = Checker::default();
     let statements = checker.collect_composition(&program.statements)?;
     checker.collect_functions(&statements)?;
+    checker.check_namespace_conflicts()?;
     checker.check_statements(&statements)
+}
+
+pub fn validate_executable_program(program: &Program) -> Result<(), CheckError> {
+    let mut checker = Checker {
+        require_std_prefix: true,
+        ..Checker::default()
+    };
+    let statements = checker.collect_composition(&program.statements)?;
+    checker.validate_executable_shape(&statements)?;
+    checker.collect_functions(&statements)?;
+    checker.check_namespace_conflicts()?;
+    checker.check_statements(&statements)
+}
+
+pub fn validate_executable_structure(program: &Program) -> Result<(), CheckError> {
+    let checker = Checker::default();
+    let std_open = program.statements.iter().any(|statement| match statement {
+        Statement::UsingNamespace(namespace) => namespace == "std",
+        Statement::NoConflicts(namespaces) => namespaces.iter().any(|name| name == "std"),
+        _ => false,
+    });
+    let statements = program
+        .statements
+        .iter()
+        .filter(|statement| {
+            !matches!(
+                statement,
+                Statement::Include(_)
+                    | Statement::Exclude { .. }
+                    | Statement::UsingNamespace(_)
+                    | Statement::NoConflicts(_)
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    checker.validate_executable_shape(&statements)?;
+    validate_standard_call_prefixes(&statements, std_open)
 }
 
 pub fn validate_program_with_prelude(
@@ -430,6 +512,23 @@ pub fn validate_program_with_prelude(
 
     let statements = checker.collect_composition(&program.statements)?;
     checker.collect_functions(&statements)?;
+    checker.check_namespace_conflicts()?;
+    checker.check_statements(&statements)
+}
+
+pub fn validate_executable_program_with_prelude(
+    prelude: &Program,
+    program: &Program,
+) -> Result<(), CheckError> {
+    let mut checker = Checker::default();
+    checker.collect_functions(&prelude.statements)?;
+    checker.check_statements(&prelude.statements)?;
+
+    checker.require_std_prefix = true;
+    let statements = checker.collect_composition(&program.statements)?;
+    checker.validate_executable_shape(&statements)?;
+    checker.collect_functions(&statements)?;
+    checker.check_namespace_conflicts()?;
     checker.check_statements(&statements)
 }
 
@@ -438,10 +537,16 @@ struct Checker {
     symbols: HashMap<String, Symbol>,
     functions: HashMap<String, usize>,
     vtime_scopes: Vec<HashMap<String, ProtectionLevel>>,
+    vtime_alias_scopes: Vec<HashMap<String, Option<String>>>,
     loop_depth: usize,
     function_depth: usize,
     included_libraries: HashSet<String>,
     excluded_base_symbols: HashSet<String>,
+    excluded_standard_libraries: HashMap<String, String>,
+    opened_namespaces: Vec<String>,
+    namespace_directive_seen: bool,
+    require_std_prefix: bool,
+    checking_main: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -463,7 +568,7 @@ impl Checker {
         for statement in statements {
             if let Statement::Include(library) = statement {
                 validate_composition_name(library)?;
-                if library != "base" {
+                if library != "std" && library != "base" {
                     return Err(CheckError::UnknownLibrary(library.clone()));
                 }
                 if !self.included_libraries.insert(library.clone()) {
@@ -476,7 +581,7 @@ impl Checker {
             if let Statement::Exclude { symbol, library } = statement {
                 validate_composition_name(library)?;
                 validate_composition_name(symbol)?;
-                if library != "base" {
+                if library != "std" && library != "base" {
                     return Err(CheckError::UnknownLibrary(library.clone()));
                 }
                 if !is_base_export(symbol) {
@@ -491,13 +596,66 @@ impl Checker {
                         symbol: symbol.clone(),
                     });
                 }
+                self.excluded_standard_libraries
+                    .insert(symbol.clone(), library.clone());
+            }
+        }
+
+        for statement in statements {
+            match statement {
+                Statement::UsingNamespace(namespace) => {
+                    validate_composition_name(namespace)?;
+                    if self.namespace_directive_seen {
+                        return Err(CheckError::DuplicateNamespaceDirective);
+                    }
+                    self.namespace_directive_seen = true;
+                    if namespace != "std"
+                        && namespace != "base"
+                        && !self.included_libraries.contains(namespace)
+                    {
+                        return Err(CheckError::NamespaceNotIncluded(namespace.clone()));
+                    }
+                    self.opened_namespaces.push(namespace.clone());
+                }
+                Statement::NoConflicts(namespaces) => {
+                    if self.namespace_directive_seen {
+                        return Err(CheckError::DuplicateNamespaceDirective);
+                    }
+                    self.namespace_directive_seen = true;
+                    if namespaces.len() < 2 {
+                        return Err(CheckError::InvalidOperation(
+                            "nc requires at least two namespaces".to_owned(),
+                        ));
+                    }
+                    let mut seen = HashSet::new();
+                    for namespace in namespaces {
+                        validate_composition_name(namespace)?;
+                        if !seen.insert(namespace.clone()) {
+                            return Err(CheckError::DuplicateNamespace(namespace.clone()));
+                        }
+                        if namespace != "std"
+                            && namespace != "base"
+                            && !self.included_libraries.contains(namespace)
+                        {
+                            return Err(CheckError::NamespaceNotIncluded(namespace.clone()));
+                        }
+                        self.opened_namespaces.push(namespace.clone());
+                    }
+                }
+                _ => {}
             }
         }
 
         Ok(statements
             .iter()
             .filter(|statement| {
-                !matches!(statement, Statement::Include(_) | Statement::Exclude { .. })
+                !matches!(
+                    statement,
+                    Statement::Include(_)
+                        | Statement::Exclude { .. }
+                        | Statement::UsingNamespace(_)
+                        | Statement::NoConflicts(_)
+                )
             })
             .cloned()
             .collect())
@@ -506,7 +664,11 @@ impl Checker {
     fn require_base_export(&self, symbol: &str) -> Result<(), CheckError> {
         if self.excluded_base_symbols.contains(symbol) {
             Err(CheckError::ExcludedSymbol {
-                library: "base".to_owned(),
+                library: self
+                    .excluded_standard_libraries
+                    .get(symbol)
+                    .cloned()
+                    .unwrap_or_else(|| "std".to_owned()),
                 symbol: symbol.to_owned(),
             })
         } else {
@@ -517,13 +679,82 @@ impl Checker {
     fn collect_functions(&mut self, statements: &[Statement]) -> Result<(), CheckError> {
         for statement in statements {
             if let Statement::FunctionDecl(function) = statement {
-                validate_variable_name(&function.name)?;
+                if function.name != "std::main" {
+                    validate_variable_name(&function.name)?;
+                }
                 if self.functions.contains_key(&function.name) {
                     return Err(CheckError::DuplicateFunction(function.name.clone()));
                 }
                 self.functions
                     .insert(function.name.clone(), function.params.len());
             }
+        }
+        Ok(())
+    }
+
+    fn validate_executable_shape(&self, statements: &[Statement]) -> Result<(), CheckError> {
+        let mains = statements
+            .iter()
+            .filter_map(|statement| match statement {
+                Statement::FunctionDecl(function) if function.name == "std::main" => Some(function),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        match mains.as_slice() {
+            [] => return Err(CheckError::MissingMain),
+            [_] => {}
+            _ => return Err(CheckError::DuplicateMain),
+        }
+        let main = mains[0];
+        if !main.params.is_empty() {
+            return Err(CheckError::InvalidMainSignature);
+        }
+        if !block_definitely_returns(&main.body) {
+            return Err(CheckError::MainMayNotReturn);
+        }
+        if statements.iter().any(|statement| {
+            !matches!(
+                statement,
+                Statement::VariableDecl(_)
+                    | Statement::ListDecl(_)
+                    | Statement::VTimeDecl(_)
+                    | Statement::FunctionDecl(_)
+            )
+        }) {
+            return Err(CheckError::TopLevelExecutableStatement);
+        }
+        Ok(())
+    }
+
+    fn check_namespace_conflicts(&self) -> Result<(), CheckError> {
+        if self.opened_namespaces.len() < 2 {
+            return Ok(());
+        }
+        let mut owners: HashMap<String, Vec<String>> = HashMap::new();
+        for namespace in &self.opened_namespaces {
+            if namespace == "std" {
+                for symbol in STANDARD_EXPORTS {
+                    if !self.excluded_base_symbols.contains(*symbol) {
+                        owners
+                            .entry((*symbol).to_owned())
+                            .or_default()
+                            .push(namespace.clone());
+                    }
+                }
+                continue;
+            }
+            for function in self.functions.keys() {
+                if let Some(symbol) = namespace_symbol(function, namespace) {
+                    owners
+                        .entry(symbol.to_owned())
+                        .or_default()
+                        .push(namespace.clone());
+                }
+            }
+        }
+        if let Some((symbol, namespaces)) = owners.into_iter().find(|(_, owners)| owners.len() > 1)
+        {
+            return Err(CheckError::NamespaceConflict { symbol, namespaces });
         }
         Ok(())
     }
@@ -537,9 +768,10 @@ impl Checker {
 
     fn check_statement(&mut self, statement: &Statement) -> Result<(), CheckError> {
         match statement {
-            Statement::Include(_) | Statement::Exclude { .. } => {
-                Err(CheckError::CompositionDirectiveNotTopLevel)
-            }
+            Statement::Include(_)
+            | Statement::Exclude { .. }
+            | Statement::UsingNamespace(_)
+            | Statement::NoConflicts(_) => Err(CheckError::CompositionDirectiveNotTopLevel),
             Statement::VariableDecl(decl) => self.check_variable_decl(decl),
             Statement::ListDecl(decl) => self.check_list_decl(decl),
             Statement::VTimeDecl(decl) => self.check_vtime_decl(decl),
@@ -574,14 +806,51 @@ impl Checker {
                 self.check_public_external(reason)?;
                 Ok(())
             }
+            Statement::ErrorReturn { message, code } => {
+                if self.function_depth == 0 {
+                    return Err(CheckError::ReturnOutsideFunction);
+                }
+                let message = self.check_expression(message)?;
+                if !matches!(
+                    message.value_type,
+                    DynamicType::Value(ValueType::Str) | DynamicType::VTime
+                ) || message.protection != ProtectionLevel::Av
+                {
+                    return Err(CheckError::TypeMismatch {
+                        name: "ERR message".to_owned(),
+                        expected: ValueType::Str,
+                        actual: message.reported_type(),
+                    });
+                }
+                let code = self.check_expression(code)?;
+                if !matches!(
+                    code.value_type,
+                    DynamicType::Value(ValueType::Int) | DynamicType::VTime
+                ) || code.protection != ProtectionLevel::Av
+                {
+                    return Err(CheckError::TypeMismatch {
+                        name: "ERR code".to_owned(),
+                        expected: ValueType::Int,
+                        actual: code.reported_type(),
+                    });
+                }
+                Ok(())
+            }
             Statement::Return(expression) => {
                 if self.function_depth == 0 {
                     return Err(CheckError::ReturnOutsideFunction);
                 }
-                self.check_expression(expression)?;
+                let info = self.check_expression(expression)?;
+                if self.checking_main
+                    && (!matches!(info.value_type, DynamicType::Value(ValueType::Int))
+                        || info.protection != ProtectionLevel::Av)
+                {
+                    return Err(CheckError::InvalidMainSignature);
+                }
                 Ok(())
             }
             Statement::If(if_statement) => self.check_if(if_statement),
+            Statement::Match(match_statement) => self.check_match(match_statement),
             Statement::While(while_statement) => self.check_while(while_statement),
             Statement::Pick(pick_statement) => self.check_pick(pick_statement),
             Statement::Break => {
@@ -668,7 +937,8 @@ impl Checker {
             return Err(CheckError::DuplicateVariable(decl.name.clone()));
         }
         let info = self.check_expression(&decl.initial_value)?;
-        self.declare_vtime(decl.name.clone(), info.protection);
+        let list_alias = self.expression_list_alias(&decl.initial_value);
+        self.declare_vtime_with_alias(decl.name.clone(), info.protection, list_alias);
         Ok(())
     }
 
@@ -682,7 +952,9 @@ impl Checker {
         }
 
         let enclosing_loop_depth = self.loop_depth;
+        let enclosing_main = self.checking_main;
         self.loop_depth = 0;
+        self.checking_main = function.name == "std::main";
         self.function_depth += 1;
         let result = self.with_scope(|checker| {
             for param in &function.params {
@@ -692,12 +964,18 @@ impl Checker {
         });
         self.function_depth -= 1;
         self.loop_depth = enclosing_loop_depth;
+        self.checking_main = enclosing_main;
         result
     }
 
     fn check_assignment(&mut self, assignment: &Assignment) -> Result<(), CheckError> {
         if self.is_vtime(&assignment.name) {
             let info = self.check_expression(&assignment.value)?;
+            let list_alias = if assignment.operator == AssignmentOperator::Assign {
+                self.expression_list_alias(&assignment.value)
+            } else {
+                None
+            };
             let protection = if assignment.operator == AssignmentOperator::Assign {
                 info.protection
             } else {
@@ -706,6 +984,7 @@ impl Checker {
                     .max(info.protection)
             };
             self.update_vtime(&assignment.name, protection);
+            self.update_vtime_alias(&assignment.name, list_alias);
             return Ok(());
         }
 
@@ -768,6 +1047,9 @@ impl Checker {
                 .unwrap_or(ProtectionLevel::Av)
                 .max(info.protection);
             self.update_vtime(list_name, protection);
+            if let Some(list_alias) = self.vtime_list_alias(list_name) {
+                self.raise_list_alias_protection(&list_alias, protection);
+            }
             return Ok(());
         }
 
@@ -775,9 +1057,7 @@ impl Checker {
             return Err(CheckError::InvalidAssignmentTarget(list_name.to_owned()));
         }
         let info = self.check_list_element(element)?;
-        if let Some(Symbol::List { protection }) = self.symbols.get_mut(list_name) {
-            *protection = (*protection).max(info.protection);
-        }
+        self.raise_list_alias_protection(list_name, info.protection);
         Ok(())
     }
 
@@ -804,6 +1084,9 @@ impl Checker {
                 .unwrap_or(ProtectionLevel::Av)
                 .max(info.protection);
             self.update_vtime(list_name, protection);
+            if let Some(list_alias) = self.vtime_list_alias(list_name) {
+                self.raise_list_alias_protection(&list_alias, protection);
+            }
             return Ok(());
         }
 
@@ -811,9 +1094,7 @@ impl Checker {
             return Err(CheckError::InvalidAssignmentTarget(list_name.to_owned()));
         }
         let info = self.check_list_element(element)?;
-        if let Some(Symbol::List { protection }) = self.symbols.get_mut(list_name) {
-            *protection = (*protection).max(info.protection);
-        }
+        self.raise_list_alias_protection(list_name, info.protection);
         Ok(())
     }
 
@@ -881,14 +1162,81 @@ impl Checker {
     }
 
     fn check_while(&mut self, while_statement: &WhileStatement) -> Result<(), CheckError> {
-        if while_statement.limit < -1 {
-            return Err(CheckError::InvalidLoopLimit(while_statement.limit));
+        let limit = self.check_expression(&while_statement.limit)?;
+        if !matches!(
+            limit.value_type,
+            DynamicType::Value(ValueType::Int) | DynamicType::VTime
+        ) {
+            return Err(CheckError::TypeMismatch {
+                name: "while limit".to_owned(),
+                expected: ValueType::Int,
+                actual: limit.reported_type(),
+            });
+        }
+        if let Some(limit) = integer_literal_value(&while_statement.limit) {
+            if limit < -1 {
+                return Err(CheckError::InvalidLoopLimit(limit));
+            }
         }
         self.require_bool(&while_statement.condition)?;
         self.loop_depth += 1;
         let result = self.with_scope(|checker| checker.check_statements(&while_statement.body));
         self.loop_depth -= 1;
-        result
+        result?;
+        if let Some(body) = &while_statement.limit_body {
+            self.with_scope(|checker| checker.check_statements(body))?;
+        }
+        if let Some(body) = &while_statement.else_body {
+            self.with_scope(|checker| checker.check_statements(body))?;
+        }
+        Ok(())
+    }
+
+    fn check_match(&mut self, match_statement: &MatchStatement) -> Result<(), CheckError> {
+        self.check_expression(&match_statement.value)?;
+        let mut previous_patterns: Vec<&MatchPattern> = Vec::new();
+        for case in &match_statement.cases {
+            for pattern in &case.patterns {
+                if let MatchPattern::InclusiveRange { start, end } = pattern {
+                    if static_range_is_empty(start, end) {
+                        return Err(CheckError::InvalidMatchRange);
+                    }
+                }
+                if previous_patterns
+                    .iter()
+                    .any(|previous| match_patterns_overlap(previous, pattern))
+                {
+                    return Err(CheckError::OverlappingMatchPattern);
+                }
+                previous_patterns.push(pattern);
+                match pattern {
+                    MatchPattern::Value(value) => {
+                        self.check_binary_expression(
+                            &match_statement.value,
+                            BinaryOperator::Equal,
+                            value,
+                        )?;
+                    }
+                    MatchPattern::InclusiveRange { start, end } => {
+                        self.check_binary_expression(
+                            &match_statement.value,
+                            BinaryOperator::GreaterEqual,
+                            start,
+                        )?;
+                        self.check_binary_expression(
+                            &match_statement.value,
+                            BinaryOperator::LessEqual,
+                            end,
+                        )?;
+                    }
+                }
+            }
+            self.with_scope(|checker| checker.check_statements(&case.body))?;
+        }
+        if let Some(body) = &match_statement.default_body {
+            self.with_scope(|checker| checker.check_statements(body))?;
+        }
+        Ok(())
     }
 
     fn check_pick(&mut self, pick_statement: &PickStatement) -> Result<(), CheckError> {
@@ -1033,11 +1381,272 @@ impl Checker {
         name: &str,
         args: &[Expression],
     ) -> Result<ExpressionInfo, CheckError> {
+        let resolved_name = self.resolve_call_name(name)?;
+        let name = resolved_name.as_str();
         if is_base_export(name) {
             self.require_base_export(name)?;
         }
 
         match name {
+            "raw_scope_leave" => {
+                if args.len() != 1 {
+                    return Err(CheckError::WrongArgumentCount {
+                        name: name.to_owned(),
+                        expected: 1,
+                        actual: args.len(),
+                    });
+                }
+                return self.check_expression(&args[0]);
+            }
+            "raw_malloc" | "raw_load" | "raw_mark" | "raw_free" | "raw_where" | "raw_read"
+            | "raw_write" | "raw_call" | "raw_scope_enter" | "raw_scope_exit" => {
+                let expected = match name {
+                    "raw_malloc" | "raw_mark" | "raw_scope_enter" => 1,
+                    "raw_free" | "raw_scope_exit" => 0,
+                    "raw_where" | "raw_call" => 2,
+                    "raw_read" | "raw_write" => 3,
+                    "raw_load" => 4,
+                    _ => unreachable!(),
+                };
+                if args.len() != expected {
+                    return Err(CheckError::WrongArgumentCount {
+                        name: name.to_owned(),
+                        expected,
+                        actual: args.len(),
+                    });
+                }
+                let mut protection = ProtectionLevel::Av;
+                for arg in args {
+                    protection = protection.max(self.check_expression(arg)?.protection);
+                }
+                let value_type = match name {
+                    "raw_malloc" | "raw_load" => DynamicType::Value(ValueType::List),
+                    "raw_mark" | "raw_write" | "raw_scope_enter" => {
+                        DynamicType::Value(ValueType::Bool)
+                    }
+                    "raw_free" | "raw_call" | "raw_scope_exit" => {
+                        DynamicType::Value(ValueType::Int)
+                    }
+                    "raw_read" => DynamicType::Value(ValueType::Bytes),
+                    "raw_where" => DynamicType::VTime,
+                    _ => unreachable!(),
+                };
+                return Ok(ExpressionInfo {
+                    value_type,
+                    protection,
+                });
+            }
+            "windows_available"
+            | "windows_load_library"
+            | "windows_get_procedure"
+            | "windows_call"
+            | "windows_close_library"
+            | "windows_last_error"
+            | "windows_utf16"
+            | "windows_message_box"
+            | "windows_create_window"
+            | "windows_show_window"
+            | "windows_destroy_window"
+            | "windows_run_message_loop"
+            | "windows_pump_messages"
+            | "windows_next_event"
+            | "windows_create_control"
+            | "windows_set_window_text"
+            | "windows_window_text"
+            | "windows_move_window"
+            | "windows_selection"
+            | "windows_set_selection"
+            | "windows_replace_selection"
+            | "windows_line_count"
+            | "windows_set_text_color"
+            | "windows_set_background_color"
+            | "windows_set_text_bold"
+            | "windows_set_text_font"
+            | "windows_run_process"
+            | "windows_open_file_dialog"
+            | "windows_save_file_dialog"
+            | "windows_create_menu"
+            | "windows_append_menu_item"
+            | "windows_append_submenu"
+            | "windows_append_menu_separator"
+            | "windows_set_menu"
+            | "windows_set_menu_item_enabled"
+            | "windows_set_menu_item_checked"
+            | "windows_destroy_menu"
+            | "windows_wait_event"
+            | "windows_load_icon"
+            | "windows_set_window_icon"
+            | "windows_destroy_icon"
+            | "windows_set_deferred_close"
+            | "windows_create_accelerators"
+            | "windows_set_accelerators"
+            | "windows_destroy_accelerators"
+            | "windows_can_undo"
+            | "windows_undo"
+            | "windows_can_redo"
+            | "windows_redo"
+            | "windows_clear_history"
+            | "windows_event_mask"
+            | "windows_set_event_mask"
+            | "windows_first_visible_line"
+            | "windows_scroll_lines"
+            | "windows_focus"
+            | "windows_find_text" => {
+                let expected = match name {
+                    "windows_available"
+                    | "windows_last_error"
+                    | "windows_run_message_loop"
+                    | "windows_pump_messages"
+                    | "windows_next_event" => 0,
+                    "windows_wait_event" => 0,
+                    "windows_load_library"
+                    | "windows_close_library"
+                    | "windows_utf16"
+                    | "windows_show_window"
+                    | "windows_destroy_window"
+                    | "windows_window_text"
+                    | "windows_selection"
+                    | "windows_line_count"
+                    | "windows_can_undo"
+                    | "windows_undo"
+                    | "windows_can_redo"
+                    | "windows_redo"
+                    | "windows_clear_history"
+                    | "windows_event_mask"
+                    | "windows_first_visible_line"
+                    | "windows_focus"
+                    | "windows_create_menu"
+                    | "windows_append_menu_separator"
+                    | "windows_destroy_menu" => 1,
+                    "windows_destroy_icon"
+                    | "windows_create_accelerators"
+                    | "windows_destroy_accelerators" => 1,
+                    "windows_call"
+                    | "windows_set_window_text"
+                    | "windows_set_event_mask"
+                    | "windows_scroll_lines"
+                    | "windows_set_menu" => 2,
+                    "windows_set_window_icon"
+                    | "windows_set_deferred_close"
+                    | "windows_set_accelerators" => 2,
+                    "windows_message_box"
+                    | "windows_create_window"
+                    | "windows_set_selection"
+                    | "windows_replace_selection"
+                    | "windows_append_menu_item"
+                    | "windows_append_submenu"
+                    | "windows_set_menu_item_enabled"
+                    | "windows_set_menu_item_checked" => 3,
+                    "windows_load_icon" => 3,
+                    "windows_get_procedure"
+                    | "windows_set_text_color"
+                    | "windows_set_background_color"
+                    | "windows_set_text_bold"
+                    | "windows_run_process" => 4,
+                    "windows_set_text_font" => 5,
+                    "windows_move_window" | "windows_find_text" => 6,
+                    "windows_open_file_dialog" | "windows_save_file_dialog" => 7,
+                    "windows_create_control" => 10,
+                    _ => unreachable!(),
+                };
+                if args.len() != expected {
+                    return Err(CheckError::WrongArgumentCount {
+                        name: name.to_owned(),
+                        expected,
+                        actual: args.len(),
+                    });
+                }
+                let mut protection = ProtectionLevel::Av;
+                for arg in args {
+                    protection = protection.max(self.check_expression(arg)?.protection);
+                }
+                if name == "windows_next_event"
+                    || name == "windows_find_text"
+                    || name == "windows_open_file_dialog"
+                    || name == "windows_save_file_dialog"
+                    || name == "windows_wait_event"
+                {
+                    return Ok(ExpressionInfo {
+                        value_type: DynamicType::VTime,
+                        protection,
+                    });
+                }
+                let value_type = match name {
+                    "windows_available"
+                    | "windows_close_library"
+                    | "windows_show_window"
+                    | "windows_destroy_window"
+                    | "windows_pump_messages"
+                    | "windows_set_window_text"
+                    | "windows_move_window"
+                    | "windows_set_selection"
+                    | "windows_replace_selection"
+                    | "windows_set_text_color"
+                    | "windows_set_background_color"
+                    | "windows_set_text_bold"
+                    | "windows_set_text_font"
+                    | "windows_can_undo"
+                    | "windows_undo"
+                    | "windows_can_redo"
+                    | "windows_redo"
+                    | "windows_clear_history"
+                    | "windows_scroll_lines"
+                    | "windows_focus"
+                    | "windows_append_menu_item"
+                    | "windows_append_submenu"
+                    | "windows_append_menu_separator"
+                    | "windows_set_menu"
+                    | "windows_set_menu_item_enabled"
+                    | "windows_set_menu_item_checked"
+                    | "windows_destroy_menu" => ValueType::Bool,
+                    "windows_set_window_icon"
+                    | "windows_destroy_icon"
+                    | "windows_set_deferred_close"
+                    | "windows_set_accelerators"
+                    | "windows_destroy_accelerators" => ValueType::Bool,
+                    "windows_get_procedure" | "windows_selection" | "windows_run_process" => {
+                        ValueType::List
+                    }
+                    "windows_utf16" => ValueType::Bytes,
+                    "windows_window_text" => ValueType::Str,
+                    _ => ValueType::Int,
+                };
+                return Ok(ExpressionInfo::value(value_type, protection));
+            }
+            "timer_start" | "timer_stop" | "timer_elapsed" | "now_utc" => {
+                if !args.is_empty() {
+                    return Err(CheckError::WrongArgumentCount {
+                        name: name.to_owned(),
+                        expected: 0,
+                        actual: args.len(),
+                    });
+                }
+                let value_type = match name {
+                    "timer_elapsed" => ValueType::Float,
+                    "now_utc" => ValueType::List,
+                    _ => ValueType::Bool,
+                };
+                return Ok(ExpressionInfo::value(value_type, ProtectionLevel::Av));
+            }
+            "sha1" | "sha256" | "sha512" | "sha3_384" => {
+                if args.len() != 1 {
+                    return Err(CheckError::WrongArgumentCount {
+                        name: name.to_owned(),
+                        expected: 1,
+                        actual: args.len(),
+                    });
+                }
+                let argument = self.check_expression(&args[0])?;
+                if !matches!(
+                    argument.value_type,
+                    DynamicType::Value(ValueType::Bytes) | DynamicType::VTime
+                ) {
+                    return Err(CheckError::InvalidOperation(format!(
+                        "{name}(value) requires Bytes"
+                    )));
+                }
+                return Ok(ExpressionInfo::value(ValueType::Bytes, argument.protection));
+            }
             "add" => {
                 return Err(CheckError::InvalidOperation(
                     "add(list, value) is only valid as a statement".to_owned(),
@@ -1304,6 +1913,55 @@ impl Checker {
         })
     }
 
+    fn resolve_call_name(&self, name: &str) -> Result<String, CheckError> {
+        if let Some(symbol) = name.strip_prefix("std::") {
+            if !is_base_export(symbol) {
+                return Err(CheckError::UnknownFunction(name.to_owned()));
+            }
+            return Ok(symbol.to_owned());
+        }
+
+        if self.functions.contains_key(name) {
+            return Ok(name.to_owned());
+        }
+
+        if is_base_export(name) {
+            if self.require_std_prefix && !self.opened_namespaces.iter().any(|item| item == "std") {
+                return Err(CheckError::StandardPrefixRequired(name.to_owned()));
+            }
+            return Ok(name.to_owned());
+        }
+
+        if name.contains("::") {
+            return Ok(name.replace("::", "."));
+        }
+
+        let matches = self
+            .opened_namespaces
+            .iter()
+            .filter(|namespace| namespace.as_str() != "std")
+            .filter_map(|namespace| {
+                let dotted = format!("{namespace}.{name}");
+                let qualified = format!("{namespace}::{name}");
+                if self.functions.contains_key(&dotted) {
+                    Some(dotted)
+                } else if self.functions.contains_key(&qualified) {
+                    Some(qualified)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [] => Ok(name.to_owned()),
+            [resolved] => Ok(resolved.clone()),
+            _ => Err(CheckError::NamespaceConflict {
+                symbol: name.to_owned(),
+                namespaces: self.opened_namespaces.clone(),
+            }),
+        }
+    }
+
     fn check_index(
         &mut self,
         target: &Expression,
@@ -1545,19 +2203,35 @@ impl Checker {
         body: impl FnOnce(&mut Self) -> Result<T, CheckError>,
     ) -> Result<T, CheckError> {
         self.vtime_scopes.push(HashMap::new());
+        self.vtime_alias_scopes.push(HashMap::new());
         let result = body(self);
         self.vtime_scopes.pop();
+        self.vtime_alias_scopes.pop();
         result
     }
 
     fn declare_vtime(&mut self, name: String, protection: ProtectionLevel) {
+        self.declare_vtime_with_alias(name, protection, None);
+    }
+
+    fn declare_vtime_with_alias(
+        &mut self,
+        name: String,
+        protection: ProtectionLevel,
+        list_alias: Option<String>,
+    ) {
         if self.vtime_scopes.is_empty() {
             self.vtime_scopes.push(HashMap::new());
+            self.vtime_alias_scopes.push(HashMap::new());
         }
         self.vtime_scopes
             .last_mut()
             .unwrap()
-            .insert(name, protection);
+            .insert(name.clone(), protection);
+        self.vtime_alias_scopes
+            .last_mut()
+            .unwrap()
+            .insert(name, list_alias);
     }
 
     fn update_vtime(&mut self, name: &str, protection: ProtectionLevel) {
@@ -1566,6 +2240,56 @@ impl Checker {
                 *value = protection;
                 return;
             }
+        }
+    }
+
+    fn update_vtime_alias(&mut self, name: &str, list_alias: Option<String>) {
+        for scope in self.vtime_alias_scopes.iter_mut().rev() {
+            if let Some(value) = scope.get_mut(name) {
+                *value = list_alias;
+                return;
+            }
+        }
+    }
+
+    fn vtime_list_alias(&self, name: &str) -> Option<String> {
+        self.vtime_alias_scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(name).cloned())
+            .flatten()
+    }
+
+    fn expression_list_alias(&self, expression: &Expression) -> Option<String> {
+        match expression {
+            Expression::Variable(name) => match self.symbols.get(name) {
+                Some(Symbol::List { .. }) => Some(name.clone()),
+                _ => self.vtime_list_alias(name),
+            },
+            Expression::Grouped(inner) => self.expression_list_alias(inner),
+            _ => None,
+        }
+    }
+
+    fn raise_list_alias_protection(&mut self, list_name: &str, protection: ProtectionLevel) {
+        if let Some(Symbol::List {
+            protection: current,
+        }) = self.symbols.get_mut(list_name)
+        {
+            *current = (*current).max(protection);
+        }
+
+        let aliases = self
+            .vtime_alias_scopes
+            .iter()
+            .flat_map(|scope| scope.iter())
+            .filter_map(|(name, alias)| {
+                (alias.as_deref() == Some(list_name)).then_some(name.clone())
+            })
+            .collect::<Vec<_>>();
+        for alias in aliases {
+            let current = self.vtime_protection(&alias).unwrap_or(ProtectionLevel::Av);
+            self.update_vtime(&alias, current.max(protection));
         }
     }
 
@@ -1646,28 +2370,396 @@ fn validate_composition_name(name: &str) -> Result<(), CheckError> {
     Ok(())
 }
 
+const STANDARD_EXPORTS: &[&str] = &[
+    "pick",
+    "add",
+    "set",
+    "get",
+    "pop",
+    "int",
+    "float",
+    "bool",
+    "str",
+    "bytes",
+    "json",
+    "split",
+    "join",
+    "len",
+    "contains",
+    "ord",
+    "char",
+    "pow",
+    "timer_start",
+    "timer_stop",
+    "timer_elapsed",
+    "now_utc",
+    "sha1",
+    "sha256",
+    "sha512",
+    "sha3_384",
+    "windows_available",
+    "windows_load_library",
+    "windows_get_procedure",
+    "windows_call",
+    "windows_close_library",
+    "windows_last_error",
+    "windows_utf16",
+    "windows_message_box",
+    "windows_create_window",
+    "windows_show_window",
+    "windows_destroy_window",
+    "windows_run_message_loop",
+    "windows_pump_messages",
+    "windows_next_event",
+    "windows_create_control",
+    "windows_set_window_text",
+    "windows_window_text",
+    "windows_move_window",
+    "windows_selection",
+    "windows_set_selection",
+    "windows_replace_selection",
+    "windows_line_count",
+    "windows_set_text_color",
+    "windows_set_background_color",
+    "windows_set_text_bold",
+    "windows_set_text_font",
+    "windows_run_process",
+    "windows_open_file_dialog",
+    "windows_save_file_dialog",
+    "windows_create_menu",
+    "windows_append_menu_item",
+    "windows_append_submenu",
+    "windows_append_menu_separator",
+    "windows_set_menu",
+    "windows_set_menu_item_enabled",
+    "windows_set_menu_item_checked",
+    "windows_destroy_menu",
+    "windows_wait_event",
+    "windows_load_icon",
+    "windows_set_window_icon",
+    "windows_destroy_icon",
+    "windows_set_deferred_close",
+    "windows_create_accelerators",
+    "windows_set_accelerators",
+    "windows_destroy_accelerators",
+    "windows_can_undo",
+    "windows_undo",
+    "windows_can_redo",
+    "windows_redo",
+    "windows_clear_history",
+    "windows_event_mask",
+    "windows_set_event_mask",
+    "windows_first_visible_line",
+    "windows_scroll_lines",
+    "windows_focus",
+    "windows_find_text",
+];
+
 fn is_base_export(name: &str) -> bool {
-    matches!(
-        name,
-        "pick"
-            | "add"
-            | "set"
-            | "get"
-            | "pop"
-            | "int"
-            | "float"
-            | "bool"
-            | "str"
-            | "bytes"
-            | "json"
-            | "split"
-            | "join"
-            | "len"
-            | "contains"
-            | "ord"
-            | "char"
-            | "pow"
-    )
+    STANDARD_EXPORTS.contains(&name)
+}
+
+fn namespace_symbol<'a>(function: &'a str, namespace: &str) -> Option<&'a str> {
+    function
+        .strip_prefix(namespace)
+        .and_then(|rest| rest.strip_prefix('.').or_else(|| rest.strip_prefix("::")))
+        .filter(|symbol| !symbol.contains('.') && !symbol.contains("::"))
+}
+
+fn integer_literal_value(expression: &Expression) -> Option<i64> {
+    match expression {
+        Expression::Literal(Value::Int(value)) => Some(*value),
+        Expression::Unary {
+            operator: UnaryOperator::Negate,
+            expression,
+        } => integer_literal_value(expression)?.checked_neg(),
+        Expression::Grouped(expression) => integer_literal_value(expression),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum StaticNumber {
+    Int(i64),
+    Float(f64),
+}
+
+fn static_number(expression: &Expression) -> Option<StaticNumber> {
+    match expression {
+        Expression::Literal(Value::Int(value)) => Some(StaticNumber::Int(*value)),
+        Expression::Literal(Value::Float(value)) => Some(StaticNumber::Float(*value)),
+        Expression::Unary {
+            operator: UnaryOperator::Negate,
+            expression,
+        } => match static_number(expression)? {
+            StaticNumber::Int(value) => value.checked_neg().map(StaticNumber::Int),
+            StaticNumber::Float(value) => Some(StaticNumber::Float(-value)),
+        },
+        Expression::Grouped(expression) => static_number(expression),
+        _ => None,
+    }
+}
+
+fn static_number_in_range(value: StaticNumber, start: StaticNumber, end: StaticNumber) -> bool {
+    match (value, start, end) {
+        (StaticNumber::Int(value), StaticNumber::Int(start), StaticNumber::Int(end)) => {
+            start <= value && value <= end
+        }
+        (StaticNumber::Float(value), StaticNumber::Float(start), StaticNumber::Float(end)) => {
+            start <= value && value <= end
+        }
+        _ => false,
+    }
+}
+
+fn static_ranges_overlap(
+    left_start: StaticNumber,
+    left_end: StaticNumber,
+    right_start: StaticNumber,
+    right_end: StaticNumber,
+) -> bool {
+    match (left_start, left_end, right_start, right_end) {
+        (
+            StaticNumber::Int(left_start),
+            StaticNumber::Int(left_end),
+            StaticNumber::Int(right_start),
+            StaticNumber::Int(right_end),
+        ) => left_start <= right_end && right_start <= left_end,
+        (
+            StaticNumber::Float(left_start),
+            StaticNumber::Float(left_end),
+            StaticNumber::Float(right_start),
+            StaticNumber::Float(right_end),
+        ) => left_start <= right_end && right_start <= left_end,
+        _ => false,
+    }
+}
+
+fn static_range_is_empty(start: &Expression, end: &Expression) -> bool {
+    match (static_number(start), static_number(end)) {
+        (Some(StaticNumber::Int(start)), Some(StaticNumber::Int(end))) => start > end,
+        (Some(StaticNumber::Float(start)), Some(StaticNumber::Float(end))) => start > end,
+        _ => false,
+    }
+}
+
+fn match_patterns_overlap(left: &MatchPattern, right: &MatchPattern) -> bool {
+    if left == right {
+        return true;
+    }
+
+    match (left, right) {
+        (MatchPattern::Value(left), MatchPattern::Value(right)) => left == right,
+        (MatchPattern::Value(value), MatchPattern::InclusiveRange { start, end })
+        | (MatchPattern::InclusiveRange { start, end }, MatchPattern::Value(value)) => match (
+            static_number(value),
+            static_number(start),
+            static_number(end),
+        ) {
+            (Some(value), Some(start), Some(end)) => static_number_in_range(value, start, end),
+            _ => false,
+        },
+        (
+            MatchPattern::InclusiveRange {
+                start: left_start,
+                end: left_end,
+            },
+            MatchPattern::InclusiveRange {
+                start: right_start,
+                end: right_end,
+            },
+        ) => match (
+            static_number(left_start),
+            static_number(left_end),
+            static_number(right_start),
+            static_number(right_end),
+        ) {
+            (Some(left_start), Some(left_end), Some(right_start), Some(right_end)) => {
+                static_ranges_overlap(left_start, left_end, right_start, right_end)
+            }
+            _ => false,
+        },
+    }
+}
+
+fn block_definitely_returns(statements: &[Statement]) -> bool {
+    statements.iter().any(|statement| match statement {
+        Statement::Return(_) | Statement::ErrorReturn { .. } => true,
+        Statement::If(if_statement) => {
+            block_definitely_returns(&if_statement.body)
+                && if_statement
+                    .else_if_branches
+                    .iter()
+                    .all(|branch| block_definitely_returns(&branch.body))
+                && if_statement
+                    .else_body
+                    .as_deref()
+                    .is_some_and(block_definitely_returns)
+        }
+        Statement::Match(match_statement) => {
+            !match_statement.cases.is_empty()
+                && match_statement
+                    .cases
+                    .iter()
+                    .all(|case| block_definitely_returns(&case.body))
+                && match_statement
+                    .default_body
+                    .as_deref()
+                    .is_some_and(block_definitely_returns)
+        }
+        _ => false,
+    })
+}
+
+fn validate_standard_call_prefixes(
+    statements: &[Statement],
+    std_open: bool,
+) -> Result<(), CheckError> {
+    for statement in statements {
+        match statement {
+            Statement::VariableDecl(decl) => {
+                validate_expression_prefixes(&decl.initial_value, std_open)?
+            }
+            Statement::ListDecl(decl) => {
+                for element in &decl.elements {
+                    validate_expression_prefixes(&element.value, std_open)?;
+                }
+            }
+            Statement::VTimeDecl(decl) => {
+                validate_expression_prefixes(&decl.initial_value, std_open)?
+            }
+            Statement::FunctionDecl(function) => {
+                validate_standard_call_prefixes(&function.body, std_open)?
+            }
+            Statement::Assignment(assignment) => {
+                validate_expression_prefixes(&assignment.value, std_open)?
+            }
+            Statement::AddToList { element, .. } => {
+                validate_expression_prefixes(&element.value, std_open)?
+            }
+            Statement::SetListElement { index, element, .. } => {
+                validate_expression_prefixes(index, std_open)?;
+                validate_expression_prefixes(&element.value, std_open)?;
+            }
+            Statement::Expression(expression)
+            | Statement::Out(expression)
+            | Statement::Fail(expression)
+            | Statement::Return(expression) => validate_expression_prefixes(expression, std_open)?,
+            Statement::ErrorReturn { message, code } => {
+                validate_expression_prefixes(message, std_open)?;
+                validate_expression_prefixes(code, std_open)?;
+            }
+            Statement::Stop(Some(expression)) => {
+                validate_expression_prefixes(expression, std_open)?
+            }
+            Statement::If(if_statement) => {
+                validate_expression_prefixes(&if_statement.condition, std_open)?;
+                validate_standard_call_prefixes(&if_statement.body, std_open)?;
+                for branch in &if_statement.else_if_branches {
+                    validate_expression_prefixes(&branch.condition, std_open)?;
+                    validate_standard_call_prefixes(&branch.body, std_open)?;
+                }
+                if let Some(body) = &if_statement.else_body {
+                    validate_standard_call_prefixes(body, std_open)?;
+                }
+            }
+            Statement::While(while_statement) => {
+                validate_expression_prefixes(&while_statement.condition, std_open)?;
+                validate_expression_prefixes(&while_statement.limit, std_open)?;
+                validate_standard_call_prefixes(&while_statement.body, std_open)?;
+                if let Some(body) = &while_statement.limit_body {
+                    validate_standard_call_prefixes(body, std_open)?;
+                }
+                if let Some(body) = &while_statement.else_body {
+                    validate_standard_call_prefixes(body, std_open)?;
+                }
+            }
+            Statement::Match(match_statement) => {
+                validate_expression_prefixes(&match_statement.value, std_open)?;
+                for case in &match_statement.cases {
+                    for pattern in &case.patterns {
+                        match pattern {
+                            MatchPattern::Value(value) => {
+                                validate_expression_prefixes(value, std_open)?
+                            }
+                            MatchPattern::InclusiveRange { start, end } => {
+                                validate_expression_prefixes(start, std_open)?;
+                                validate_expression_prefixes(end, std_open)?;
+                            }
+                        }
+                    }
+                    validate_standard_call_prefixes(&case.body, std_open)?;
+                }
+                if let Some(body) = &match_statement.default_body {
+                    validate_standard_call_prefixes(body, std_open)?;
+                }
+            }
+            Statement::Pick(pick_statement) => {
+                validate_expression_prefixes(&pick_statement.value, std_open)?;
+                validate_standard_call_prefixes(&pick_statement.body, std_open)?;
+            }
+            Statement::Include(_)
+            | Statement::Exclude { .. }
+            | Statement::UsingNamespace(_)
+            | Statement::NoConflicts(_)
+            | Statement::InfoAssignment(_)
+            | Statement::SecretUp(_)
+            | Statement::Stop(None)
+            | Statement::Break
+            | Statement::Continue => {}
+        }
+    }
+    Ok(())
+}
+
+fn validate_expression_prefixes(expression: &Expression, std_open: bool) -> Result<(), CheckError> {
+    match expression {
+        Expression::Call { name, args } => {
+            if is_base_export(name) && !std_open {
+                return Err(CheckError::StandardPrefixRequired(name.clone()));
+            }
+            for arg in args {
+                validate_expression_prefixes(arg, std_open)?;
+            }
+        }
+        Expression::ListLiteral(elements) => {
+            for element in elements {
+                validate_expression_prefixes(&element.value, std_open)?;
+            }
+        }
+        Expression::Index { target, index } => {
+            validate_expression_prefixes(target, std_open)?;
+            validate_expression_prefixes(index, std_open)?;
+        }
+        Expression::Slice {
+            target,
+            start,
+            end,
+            step,
+        } => {
+            validate_expression_prefixes(target, std_open)?;
+            for bound in [start, end, step].into_iter().flatten() {
+                validate_expression_prefixes(bound, std_open)?;
+            }
+        }
+        Expression::Grouped(inner)
+        | Expression::Unary {
+            expression: inner, ..
+        } => {
+            validate_expression_prefixes(inner, std_open)?;
+        }
+        Expression::Binary { left, right, .. } => {
+            validate_expression_prefixes(left, std_open)?;
+            validate_expression_prefixes(right, std_open)?;
+        }
+        Expression::Literal(_)
+        | Expression::None
+        | Expression::Input
+        | Expression::SecretInput
+        | Expression::Variable(_)
+        | Expression::SelfCheck(_) => {}
+    }
+    Ok(())
 }
 
 fn is_ident_start(ch: char) -> bool {
@@ -1956,8 +3048,10 @@ mod tests {
                     operator: BinaryOperator::Less,
                     right: Box::new(Expression::Literal(Value::Int(10))),
                 },
-                limit: -1,
+                limit: Expression::Literal(Value::Int(-1)),
                 body: vec![Statement::Break],
+                limit_body: None,
+                else_body: None,
             }),
         ]);
         assert_eq!(validate_program(&program), Ok(()));
@@ -1973,8 +3067,10 @@ mod tests {
                     operator: BinaryOperator::Less,
                     right: Box::new(Expression::Literal(Value::Int(10))),
                 },
-                limit: -2,
+                limit: Expression::Literal(Value::Int(-2)),
                 body: vec![],
+                limit_body: None,
+                else_body: None,
             }),
         ]);
         assert_eq!(
@@ -1995,12 +3091,14 @@ mod tests {
     fn function_declared_in_loop_cannot_break_the_enclosing_loop() {
         let program = Program::new(vec![Statement::While(WhileStatement {
             condition: Expression::Literal(Value::Bool(true)),
-            limit: 1,
+            limit: Expression::Literal(Value::Int(1)),
             body: vec![Statement::FunctionDecl(FunctionDecl {
                 name: "nested".to_owned(),
                 params: vec![],
                 body: vec![Statement::Break],
             })],
+            limit_body: None,
+            else_body: None,
         })]);
 
         assert_eq!(
@@ -2019,7 +3117,7 @@ mod tests {
                     operator: BinaryOperator::Less,
                     right: Box::new(Expression::Literal(Value::Int(10))),
                 },
-                limit: 3,
+                limit: Expression::Literal(Value::Int(3)),
                 body: vec![
                     Statement::VTimeDecl(VTimeDecl {
                         name: "tmp".to_owned(),
@@ -2031,6 +3129,8 @@ mod tests {
                         value: Expression::Literal(Value::Int(1)),
                     }),
                 ],
+                limit_body: None,
+                else_body: None,
             }),
         ]);
         assert_eq!(validate_program(&program), Ok(()));
@@ -2301,6 +3401,44 @@ mod tests {
             Err(CheckError::SecretExpressionDenied(_))
         ));
 
+        let protected_alias = Program::new(vec![
+            Statement::ListDecl(ListDecl {
+                name: "values".to_owned(),
+                elements: vec![ListElement {
+                    value: Expression::Literal(Value::Int(1)),
+                    protection: None,
+                }],
+            }),
+            Statement::VTimeDecl(VTimeDecl {
+                name: "alias".to_owned(),
+                initial_value: Expression::Variable("values".to_owned()),
+            }),
+            decl(
+                "hidden",
+                VariableKind::Asv,
+                ValueType::Int,
+                Expression::Literal(Value::Int(2)),
+            ),
+            Statement::AddToList {
+                list_name: "alias".to_owned(),
+                element: ListElement {
+                    value: Expression::Variable("hidden".to_owned()),
+                    protection: None,
+                },
+            },
+            Statement::Out(Expression::Call {
+                name: "get".to_owned(),
+                args: vec![
+                    Expression::Variable("values".to_owned()),
+                    Expression::Literal(Value::Int(1)),
+                ],
+            }),
+        ]);
+        assert!(matches!(
+            validate_program(&protected_alias),
+            Err(CheckError::SecretExpressionDenied(_))
+        ));
+
         let expression_set = Program::new(vec![Statement::VTimeDecl(VTimeDecl {
             name: "result".to_owned(),
             initial_value: Expression::Call {
@@ -2519,6 +3657,97 @@ mod tests {
                 library: "base".to_owned(),
                 symbol: "len".to_owned(),
             })
+        );
+    }
+
+    #[test]
+    fn executable_requires_std_main_and_qualified_standard_calls() {
+        let main = |call_name: &str| {
+            Program::new(vec![Statement::FunctionDecl(FunctionDecl {
+                name: "std::main".to_owned(),
+                params: Vec::new(),
+                body: vec![
+                    Statement::VTimeDecl(VTimeDecl {
+                        name: "value".to_owned(),
+                        initial_value: Expression::Call {
+                            name: call_name.to_owned(),
+                            args: vec![Expression::Literal(Value::Str("7".to_owned()))],
+                        },
+                    }),
+                    Statement::Return(Expression::Literal(Value::Int(0))),
+                ],
+            })])
+        };
+
+        assert_eq!(validate_executable_program(&main("std::int")), Ok(()));
+        assert_eq!(
+            validate_executable_program(&main("int")),
+            Err(CheckError::StandardPrefixRequired("int".to_owned()))
+        );
+        assert_eq!(
+            validate_executable_program(&Program::new(Vec::new())),
+            Err(CheckError::MissingMain)
+        );
+
+        let mut opened = main("int");
+        opened
+            .statements
+            .insert(0, Statement::UsingNamespace("std".to_owned()));
+        assert_eq!(validate_executable_program(&opened), Ok(()));
+    }
+
+    #[test]
+    fn rejects_empty_and_overlapping_match_patterns() {
+        let program_with = |patterns: Vec<MatchPattern>| {
+            Program::new(vec![Statement::Match(MatchStatement {
+                value: Expression::Literal(Value::Int(2)),
+                cases: patterns
+                    .into_iter()
+                    .map(|pattern| MatchCase {
+                        patterns: vec![pattern],
+                        body: Vec::new(),
+                    })
+                    .collect(),
+                default_body: None,
+            })])
+        };
+
+        assert_eq!(
+            validate_program(&program_with(vec![MatchPattern::InclusiveRange {
+                start: Expression::Literal(Value::Int(3)),
+                end: Expression::Literal(Value::Int(1)),
+            }])),
+            Err(CheckError::InvalidMatchRange)
+        );
+        assert_eq!(
+            validate_program(&program_with(vec![
+                MatchPattern::Value(Expression::Literal(Value::Int(2))),
+                MatchPattern::InclusiveRange {
+                    start: Expression::Literal(Value::Int(1)),
+                    end: Expression::Literal(Value::Int(3)),
+                },
+            ])),
+            Err(CheckError::OverlappingMatchPattern)
+        );
+        assert_eq!(
+            validate_program(&program_with(vec![
+                MatchPattern::InclusiveRange {
+                    start: Expression::Literal(Value::Int(1)),
+                    end: Expression::Literal(Value::Int(3)),
+                },
+                MatchPattern::InclusiveRange {
+                    start: Expression::Literal(Value::Int(3)),
+                    end: Expression::Literal(Value::Int(5)),
+                },
+            ])),
+            Err(CheckError::OverlappingMatchPattern)
+        );
+        assert_eq!(
+            validate_program(&program_with(vec![
+                MatchPattern::Value(Expression::Literal(Value::Int(2))),
+                MatchPattern::Value(Expression::Literal(Value::Int(2))),
+            ])),
+            Err(CheckError::OverlappingMatchPattern)
         );
     }
 }

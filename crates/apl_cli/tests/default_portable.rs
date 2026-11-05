@@ -17,11 +17,35 @@ struct TestProject {
 ))]
 fn compile_native_builds_and_runs_a_real_host_executable() {
     let project = TestProject::new();
+    let library_source = project.path("math.apl");
+    let library_artifact = project.path("libraries").join("math.aplmod");
     let main = project.path("native.apl");
     let package = project.path("native_package");
     fs::write(
+        &library_source,
+        "func math.internal(value) {\n  return value + 1\n}\nfunc math.answer() {\n  return math.internal(41)\n}",
+    )
+    .unwrap();
+    let emitted = apl()
+        .arg("emit-module")
+        .arg(&library_source)
+        .arg(&library_artifact)
+        .output()
+        .unwrap();
+    assert!(
+        emitted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&emitted.stderr)
+    );
+    fs::write(
         &main,
-        r#"func plus(left, right) { return left + right }
+        r#"include >> math
+exclude "internal" << math
+using namespace std
+func plus(left, right) {
+  return left + right
+}
+AVInt std::main() {
 AVInt value = input
 ASVStr hidden = secret input
 AVBool unchanged = value =self=
@@ -34,10 +58,42 @@ VTime last = pop(items)
 AVInt counter = 0
 while (counter < 3) (5) {
   counter += 1
-  if counter == 2 { continue }
+  if counter == 2 {
+    continue
+  }
 }
-if unchanged { out "ok:" } else { fail "self changed" }
-pick("AP"): ch { out ch }
+match counter {
+  case 1, 2 {
+    out "bad-match"
+  }
+  case 3..4 {
+    out ":match"
+  }
+  case default {
+    out "bad-default"
+  }
+}
+while (false) (1) {
+  out "bad-body"
+} limit {
+  out "bad-limit"
+} else {
+  out ":else"
+}
+while (true) (1) {
+} limit {
+  out ":limit"
+} else {
+  out "bad-else"
+}
+if unchanged {
+  out "ok:"
+} else {
+  fail "self changed"
+}
+pick("AP"): ch {
+  out ch
+}
 out ":"
 out counter
 out ":"
@@ -71,9 +127,13 @@ out str(9)
 out ":"
 out bytes("A")
 out ":"
-out json("raw")
+out json("42")
+out ":"
+out math::answer()
 secretup(value)
 stop
+return 0
+}
 "#,
     )
     .unwrap();
@@ -95,6 +155,7 @@ stop
         std::env::consts::EXE_SUFFIX
     ));
     assert!(executable.is_file(), "{}", executable.display());
+    fs::remove_file(&library_artifact).unwrap();
 
     let mut child = Command::new(executable)
         .stdin(Stdio::piped())
@@ -115,8 +176,51 @@ stop
     );
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
-        "ok:AP:3:7:[2, 1]:Int:AV:a|b:true:27:Z:1:2:8:2.5:true:9:[65]:raw"
+        ":match:else:limitok:AP:3:7:[2, 1]:Int:AV:a|b:true:27:Z:1:2:8:2.5:true:9:[65]:42:42"
     );
+}
+
+#[test]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn native_error_return_preserves_message_and_exit_code() {
+    let project = TestProject::new();
+    let main = project.path("native_error.apl");
+    let package = project.path("native_error_package");
+    fs::write(
+        &main,
+        r#"func abort() {
+  return(ERR=["boom"][7])
+}
+AVInt std::main() {
+  abort()
+  return 0
+}
+"#,
+    )
+    .unwrap();
+
+    let compiled = apl()
+        .arg("compile-native")
+        .arg(&main)
+        .arg(&package)
+        .output()
+        .unwrap();
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+
+    let executable = package.join("target").join("debug").join(format!(
+        "native_error_compiled_native{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    let output = Command::new(executable).output().unwrap();
+    assert_eq!(output.status.code(), Some(7));
+    assert_eq!(String::from_utf8(output.stderr).unwrap(), "boom\n");
 }
 
 impl TestProject {
@@ -153,7 +257,11 @@ fn apl() -> Command {
 fn default_check_and_run_use_the_portable_apl_pipeline() {
     let project = TestProject::new();
     let main = project.path("main.apl");
-    fs::write(&main, "func answer() { return 42 } out answer()").unwrap();
+    fs::write(
+        &main,
+        "func answer() {\n  return 42\n}\nAVInt std::main() {\n  out answer()\n  return 0\n}",
+    )
+    .unwrap();
 
     let checked = apl().arg("check").arg(&main).output().unwrap();
     assert!(checked.status.success());
@@ -166,24 +274,120 @@ fn default_check_and_run_use_the_portable_apl_pipeline() {
     assert!(run.status.success());
     assert_eq!(String::from_utf8(run.stdout).unwrap(), "42");
 
-    let invalid_source = "out \"\u{451}\u{436}\" AVInt value 1";
+    let invalid_source = "out \"\u{451}\u{436}\"\nAVInt value 1";
     let reference_error = apl_parser::parse_program(invalid_source).unwrap_err();
-    assert_eq!((reference_error.line, reference_error.column), (1, 22));
+    assert_eq!((reference_error.line, reference_error.column), (2, 13));
     fs::write(&main, invalid_source).unwrap();
     let invalid = apl().arg("check").arg(&main).output().unwrap();
     assert!(!invalid.status.success());
     assert_eq!(
         String::from_utf8(invalid.stderr).unwrap(),
-        "check error: parse error at 1:22: declaration expects =\n"
+        "check parse error at 2:13: expected `=`\n"
     );
 
-    fs::write(&main, "out \"ok\"\nif true {\n  out missing\n}").unwrap();
+    fs::write(
+        &main,
+        "AVInt std::main() {\n  out \"ok\"\n  if true {\n    out missing\n  }\n  return 0\n}",
+    )
+    .unwrap();
     let semantic = apl().arg("check").arg(&main).output().unwrap();
     assert!(!semantic.status.success());
     assert_eq!(
         String::from_utf8(semantic.stderr).unwrap(),
-        "check error: semantic error at 3:3: unknown variable `missing`\n"
+        "check error: semantic error at 4:5: unknown variable `missing`\n"
     );
+}
+
+#[test]
+fn portable_match_while_handlers_and_error_return_are_end_to_end() {
+    let project = TestProject::new();
+    let main = project.path("control.apl");
+    fs::write(
+        &main,
+        r#"AVInt std::main() {
+  AVInt count = 0
+  match 4 {
+    case 1, 2 {
+      out "small"
+    }
+    case 3..5 {
+      out "range"
+    }
+    case default {
+      out "default"
+    }
+  }
+  while (false) (2) {
+    out "bad"
+  } limit {
+    out "bad"
+  } else {
+    out ":else"
+  }
+  while (true) (2) {
+    count++
+  } limit {
+    out ":limit"
+  }
+  out ":"
+  out count
+  return 0
+}
+"#,
+    )
+    .unwrap();
+
+    let run = apl().arg("run").arg(&main).output().unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8(run.stdout).unwrap(), "range:else:limit:2");
+
+    for (cases, expected) in [
+        (
+            "case 2 {\n}\ncase 2 {\n}",
+            "overlapping or unreachable match pattern",
+        ),
+        (
+            "case 1..3 {\n}\ncase 3..5 {\n}",
+            "overlapping or unreachable match pattern",
+        ),
+        (
+            "case 3..1 {\n}",
+            "invalid match range: start is greater than end",
+        ),
+    ] {
+        fs::write(
+            &main,
+            format!("AVInt std::main() {{\n  match 2 {{\n{cases}\n  }}\n  return 0\n}}"),
+        )
+        .unwrap();
+        let invalid = apl().arg("check").arg(&main).output().unwrap();
+        assert!(!invalid.status.success(), "accepted `{cases}`");
+        assert!(
+            String::from_utf8_lossy(&invalid.stderr).contains(expected),
+            "{}",
+            String::from_utf8_lossy(&invalid.stderr)
+        );
+    }
+
+    fs::write(
+        &main,
+        r#"func abort() {
+  return(ERR=["boom"][7])
+}
+AVInt std::main() {
+  abort()
+  return 0
+}
+"#,
+    )
+    .unwrap();
+    let failed = apl().arg("run").arg(&main).output().unwrap();
+    assert_eq!(failed.status.code(), Some(7));
+    assert_eq!(String::from_utf8(failed.stderr).unwrap(), "boom\n");
 }
 
 #[test]
@@ -194,12 +398,12 @@ fn default_run_resolves_named_modules_for_the_apl_compiler() {
     let main = project.path("main.apl");
     fs::write(
         &library_source,
-        "func math.internal(value) { return value + 1 } func math.answer() { return math.internal(41) }",
+        "func math.internal(value) {\n  return value + 1\n}\nfunc math.answer() {\n  return math.internal(41)\n}",
     )
     .unwrap();
     fs::write(
         &main,
-        "include >> math exclude \"math.internal\" << math out math.answer()",
+        "include >> math\nexclude \"internal\" << math\nAVInt std::main() {\n  out math::answer()\n  return 0\n}",
     )
     .unwrap();
 
@@ -294,7 +498,7 @@ fn default_run_resolves_named_modules_for_the_apl_compiler() {
     );
     let assembly = fs::read_to_string(assembly_path).unwrap();
     assert!(assembly.starts_with(
-        "# APLASM1 runtime-abi=1 target=x86_64-pc-windows-msvc\n.intel_syntax noprefix\n"
+        "# APLASM1 runtime-abi=2 target=x86_64-pc-windows-msvc\n.intel_syntax noprefix\n"
     ));
     assert!(assembly.contains("call apl_fn_1"));
     assert!(assembly.contains("call apl_rt_out"));

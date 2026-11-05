@@ -25,7 +25,7 @@ AVInt abi.PROTECTION_AV = 0
 AVInt abi.PROTECTION_ASV = 1
 AVInt abi.PROTECTION_SASV = 2
 
-List abi.BUILTINS = ["get", "split", "join", "contains", "pow", "add", "len", "ord", "char", "pop", "int", "float", "bool", "str", "bytes", "json", "set"]
+List abi.BUILTINS = ["get", "split", "join", "contains", "pow", "add", "len", "ord", "char", "pop", "int", "float", "bool", "str", "bytes", "json", "set", "timer_start", "timer_stop", "timer_elapsed", "now_utc", "raw_malloc", "raw_load", "raw_mark", "raw_free", "raw_where", "raw_read", "raw_write", "raw_call", "raw_scope_enter", "raw_scope_exit", "raw_scope_leave", "windows_available", "windows_load_library", "windows_get_procedure", "windows_call", "windows_close_library", "windows_last_error", "windows_utf16", "windows_message_box", "windows_create_window", "windows_show_window", "windows_destroy_window", "windows_run_message_loop", "windows_pump_messages", "windows_next_event", "windows_create_control", "windows_set_window_text", "windows_window_text", "windows_move_window", "windows_selection", "windows_set_selection", "windows_replace_selection", "windows_line_count", "windows_set_text_color", "windows_find_text", "windows_set_background_color", "windows_set_text_bold", "windows_can_undo", "windows_undo", "windows_can_redo", "windows_clear_history", "windows_event_mask", "windows_set_event_mask", "windows_first_visible_line", "windows_scroll_lines", "windows_focus", "sha1", "sha256", "sha512", "sha3_384", "windows_set_text_font", "windows_redo", "windows_run_process", "windows_open_file_dialog", "windows_save_file_dialog", "windows_create_menu", "windows_append_menu_item", "windows_append_submenu", "windows_append_menu_separator", "windows_set_menu", "windows_set_menu_item_enabled", "windows_set_menu_item_checked", "windows_destroy_menu", "windows_wait_event", "windows_load_icon", "windows_set_window_icon", "windows_destroy_icon", "windows_set_deferred_close", "windows_create_accelerators", "windows_set_accelerators", "windows_destroy_accelerators"]
 List abi.UNARY_OPERATORS = ["-", "not"]
 List abi.BINARY_OPERATORS = ["==", "!=", ">", "<", ">=", "<=", "and", "or", "+", "-", "*", "/", "**", "%"]
 List abi.ASSIGN_OPERATORS = ["=", "+=", "-=", "*=", "/=", "%="]
@@ -67,6 +67,7 @@ AVInt abi.OP_LOOP_EXIT = 33
 AVInt abi.OP_PICK_ENTER = 34
 AVInt abi.OP_PICK_NEXT = 35
 AVInt abi.OP_PICK_EXIT = 36
+AVInt abi.OP_ERR_RETURN = 37
 
 List abi.OPCODE_NAMES = [
   "CONST", "NONE", "INPUT", "SECRET_INPUT", "LOAD", "UNARY", "BINARY",
@@ -74,7 +75,7 @@ List abi.OPCODE_NAMES = [
   "DECLARE", "DECLARE_LIST", "DECLARE_VTIME", "ASSIGN", "INFO_ASSIGN",
   "DROP", "SECRETUP", "OUT", "STOP", "FAIL", "RETURN", "LABEL", "JUMP",
   "JUMP_IF_FALSE", "SCOPE_ENTER", "SCOPE_EXIT", "UNWIND_JUMP", "LOOP_ENTER",
-  "LOOP_CHECK", "LOOP_EXIT", "PICK_ENTER", "PICK_NEXT", "PICK_EXIT"
+  "LOOP_CHECK", "LOOP_EXIT", "PICK_ENTER", "PICK_NEXT", "PICK_EXIT", "ERR_RETURN"
 ]
 
 func abi.index_of(values, value) {
@@ -288,7 +289,7 @@ func abi.lower_instruction(instruction, state) {
 
   VTime direct_no_arg = [
     [native.OP_DROP, abi.OP_DROP], [native.OP_OUT, abi.OP_OUT],
-    [native.OP_STOP, abi.OP_STOP], [native.OP_FAIL, abi.OP_FAIL],
+    [native.OP_STOP, abi.OP_STOP], [native.OP_FAIL, abi.OP_FAIL], [native.OP_ERR_RETURN, abi.OP_ERR_RETURN],
     [native.OP_SCOPE_ENTER, abi.OP_SCOPE_ENTER], [native.OP_SCOPE_EXIT, abi.OP_SCOPE_EXIT]
   ]
 
@@ -316,7 +317,7 @@ func abi.lower_instruction(instruction, state) {
   }
 
   if opcode == native.OP_LOOP_ENTER {
-    return abi.emit(state, [abi.OP_LOOP_ENTER, get(instruction, 1), get(instruction, 2)])
+    return abi.emit(state, [abi.OP_LOOP_ENTER, get(instruction, 1)])
   }
 
   if opcode == native.OP_LOOP_CHECK {
@@ -372,8 +373,28 @@ func abi.lower_image_report(low_image, target_name) {
   state = get(lowered_functions, 0)
   VTime image = [abi.IMAGE_MAGIC, target, get(state, 0), get(state, 1), get(lowered_functions, 1), get(low_image, 3)]
 
-  if abi.image_is_valid(image) != true {
-    return [vm.FLOW_FAIL, "invalid native ABI image"]
+  VTime pool = get(image, 2)
+  VTime functions = get(image, 4)
+  if abi.pool_is_valid(pool) != true {
+    return [vm.FLOW_FAIL, "invalid native ABI constant pool"]
+  }
+  if abi.functions_are_valid(functions, pool) != true {
+    VTime arities = abi.function_arities(functions)
+    pick(functions): function {
+      if abi.code_is_valid(get(function, 3), pool, arities) != true {
+        return [vm.FLOW_FAIL, join(["invalid native ABI function `", abi.pool_value(pool, get(function, 1)), "`"], "")]
+      }
+    }
+    return [vm.FLOW_FAIL, "invalid native ABI functions"]
+  }
+  if abi.code_is_valid(get(image, 3), pool, abi.function_arities(functions)) != true {
+    return [vm.FLOW_FAIL, "invalid native ABI entry code"]
+  }
+  if native.is_list(get(image, 5)) != true {
+    return [vm.FLOW_FAIL, "invalid native ABI library manifest"]
+  }
+  if verifier.library_manifest_is_valid(get(image, 5)) != true {
+    return [vm.FLOW_FAIL, "invalid native ABI library manifest"]
   }
 
   return [vm.FLOW_OK, image]
@@ -501,7 +522,7 @@ func abi.instruction_is_valid(instruction, pool, function_arities) {
     return get(get(pool, ref), 0) != abi.POOL_NAME
   }
 
-  VTime no_arg = [abi.OP_NONE, abi.OP_INPUT, abi.OP_SECRET_INPUT, abi.OP_INDEX, abi.OP_SLICE, abi.OP_DROP, abi.OP_OUT, abi.OP_STOP, abi.OP_FAIL, abi.OP_SCOPE_ENTER, abi.OP_SCOPE_EXIT]
+  VTime no_arg = [abi.OP_NONE, abi.OP_INPUT, abi.OP_SECRET_INPUT, abi.OP_INDEX, abi.OP_SLICE, abi.OP_DROP, abi.OP_OUT, abi.OP_STOP, abi.OP_FAIL, abi.OP_ERR_RETURN, abi.OP_SCOPE_ENTER, abi.OP_SCOPE_EXIT]
 
   if checker.value_exists(no_arg, opcode) {
     return len(instruction) == 1
@@ -614,7 +635,7 @@ func abi.instruction_is_valid(instruction, pool, function_arities) {
   }
 
   if opcode == abi.OP_LOOP_ENTER {
-    return (((len(instruction) == 3) and (abi.nonnegative_int(get(instruction, 1)))) and (verifier.is_int(get(instruction, 2)))) and (get(instruction, 2) >= -1)
+    return (len(instruction) == 2) and (abi.nonnegative_int(get(instruction, 1)))
   }
 
   if opcode == abi.OP_LOOP_CHECK {
@@ -661,6 +682,10 @@ func abi.stack_requirement(instruction) {
     return 4
   }
 
+  if opcode == abi.OP_ERR_RETURN {
+    return 2
+  }
+
   if (opcode == abi.OP_CALL_BUILTIN) or (opcode == abi.OP_CALL_SLOT) {
     return get(instruction, 2)
   }
@@ -669,7 +694,7 @@ func abi.stack_requirement(instruction) {
     return get(instruction, 1)
   }
 
-  VTime consumers = [abi.OP_DECLARE, abi.OP_DECLARE_LIST, abi.OP_DECLARE_VTIME, abi.OP_ASSIGN, abi.OP_DROP, abi.OP_OUT, abi.OP_STOP, abi.OP_FAIL, abi.OP_RETURN, abi.OP_JUMP_IF_FALSE, abi.OP_PICK_ENTER]
+  VTime consumers = [abi.OP_DECLARE, abi.OP_DECLARE_LIST, abi.OP_DECLARE_VTIME, abi.OP_ASSIGN, abi.OP_DROP, abi.OP_OUT, abi.OP_STOP, abi.OP_FAIL, abi.OP_RETURN, abi.OP_JUMP_IF_FALSE, abi.OP_LOOP_ENTER, abi.OP_PICK_ENTER]
 
   if checker.value_exists(consumers, opcode) {
     return 1
@@ -690,7 +715,7 @@ func abi.stack_production(instruction) {
 }
 
 func abi.ends_stack_expression(opcode) {
-  VTime boundaries = [abi.OP_DECLARE, abi.OP_DECLARE_LIST, abi.OP_DECLARE_VTIME, abi.OP_ASSIGN, abi.OP_INFO_ASSIGN, abi.OP_DROP, abi.OP_SECRETUP, abi.OP_OUT, abi.OP_STOP, abi.OP_FAIL, abi.OP_RETURN, abi.OP_LABEL, abi.OP_JUMP, abi.OP_JUMP_IF_FALSE, abi.OP_SCOPE_ENTER, abi.OP_SCOPE_EXIT, abi.OP_UNWIND_JUMP, abi.OP_LOOP_ENTER, abi.OP_LOOP_CHECK, abi.OP_LOOP_EXIT, abi.OP_PICK_ENTER, abi.OP_PICK_NEXT, abi.OP_PICK_EXIT]
+  VTime boundaries = [abi.OP_DECLARE, abi.OP_DECLARE_LIST, abi.OP_DECLARE_VTIME, abi.OP_ASSIGN, abi.OP_INFO_ASSIGN, abi.OP_DROP, abi.OP_SECRETUP, abi.OP_OUT, abi.OP_STOP, abi.OP_FAIL, abi.OP_ERR_RETURN, abi.OP_RETURN, abi.OP_LABEL, abi.OP_JUMP, abi.OP_JUMP_IF_FALSE, abi.OP_SCOPE_ENTER, abi.OP_SCOPE_EXIT, abi.OP_UNWIND_JUMP, abi.OP_LOOP_ENTER, abi.OP_LOOP_CHECK, abi.OP_LOOP_EXIT, abi.OP_PICK_ENTER, abi.OP_PICK_NEXT, abi.OP_PICK_EXIT]
   return checker.value_exists(boundaries, opcode)
 }
 

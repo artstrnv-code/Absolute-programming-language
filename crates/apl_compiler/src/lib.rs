@@ -1,5 +1,6 @@
 use std::{
-    fs,
+    collections::BTreeSet,
+    env, fs,
     io::Write,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -9,6 +10,9 @@ use std::{
 pub const RUNTIME_PRELUDE: &str = include_str!("../../../std/runtime.apl");
 pub const LEXER_PRELUDE: &str = include_str!("../../../std/lexer.apl");
 pub const PARSER_PRELUDE: &str = include_str!("../../../std/parser.apl");
+pub const RAW_MEMORY_PRELUDE: &str = include_str!("../../../std/raw_memory.apl");
+pub const STRUCTURES_PRELUDE: &str = include_str!("../../../std/structures.apl");
+pub const CLASSES_PRELUDE: &str = include_str!("../../../std/classes.apl");
 pub const CHECKER_PRELUDE: &str = include_str!("../../../std/checker.apl");
 pub const IR_PRELUDE: &str = include_str!("../../../std/ir.apl");
 pub const LINKER_PRELUDE: &str = include_str!("../../../std/linker.apl");
@@ -25,6 +29,12 @@ pub const STANDARD_PRELUDE: &str = concat!(
     include_str!("../../../std/lexer.apl"),
     "\n\n",
     include_str!("../../../std/parser.apl"),
+    "\n\n",
+    include_str!("../../../std/raw_memory.apl"),
+    "\n\n",
+    include_str!("../../../std/structures.apl"),
+    "\n\n",
+    include_str!("../../../std/classes.apl"),
     "\n\n",
     include_str!("../../../std/checker.apl"),
     "\n\n",
@@ -53,7 +63,7 @@ const NATIVE_COMPILER_PROTOCOL: &str = "APLNATIVE1:";
 const NATIVE_COMPILER_REQUEST: &str = "APLNREQ1:";
 const LEGACY_BOOTSTRAP_COMPILER_OK: &str = "APLCOMP1:O";
 const LEGACY_BOOTSTRAP_COMPILER_ERROR: &str = "APLCOMP1:E";
-const LINKED_RUN_PROTOCOL: &str = "APLRUN1:";
+const LINKED_RUN_PROTOCOL: &str = "APLRUN2:";
 const LINKED_ARTIFACT_PROTOCOL: &str = "APLLINK3:";
 pub const NATIVE_IR_PROTOCOL: &str = "APLLOW1:";
 pub const NATIVE_ABI_PROTOCOL: &str = "APLABI1:";
@@ -104,6 +114,7 @@ pub enum LinkedRunStatus {
 pub struct LinkedRunReport {
     pub status: LinkedRunStatus,
     pub output: Vec<String>,
+    pub exit_code: Option<i32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,7 +131,10 @@ pub enum CompileError {
     Check(apl_core::CheckError),
     Runtime(apl_runtime::RuntimeError),
     Bootstrap(String),
-    LibraryNotFound { name: String, path: PathBuf },
+    LibraryNotFound {
+        name: String,
+        searched: Vec<PathBuf>,
+    },
 }
 
 impl From<std::io::Error> for CompileError {
@@ -170,6 +184,21 @@ pub fn compile_linked_artifact_with_module(
 
 pub fn compile_module_artifact(source: &str) -> Result<String, CompileError> {
     let output = run_bootstrap_bridge(MODULE_COMPILE_BRIDGE, vec![source.to_owned()])?;
+    bootstrap_stdout_artifact(output, "module artifact")
+}
+
+pub fn compile_module_artifact_with_libraries(
+    source: &str,
+    libraries: &[NamedLibrary],
+) -> Result<String, CompileError> {
+    let mut input = Vec::with_capacity(libraries.len() * 2 + 2);
+    input.push(libraries.len().to_string());
+    for library in libraries {
+        input.push(library.name.clone());
+        input.push(library.artifact.clone());
+    }
+    input.push(source.to_owned());
+    let output = run_bootstrap_bridge(DEPENDENT_MODULE_COMPILE_BRIDGE, input)?;
     bootstrap_stdout_artifact(output, "module artifact")
 }
 
@@ -325,6 +354,7 @@ pub fn emit_linked_artifact_with_native_compiler_file(
 ) -> Result<(), CompileError> {
     let source = fs::read_to_string(source_path)?;
     let libraries = resolve_named_libraries(source_path, &source)?;
+    let source = source_with_resolved_library_includes(&source, &libraries)?;
     let artifact = compile_linked_artifact_with_native_compiler_and_libraries(
         compiler_executable,
         &source,
@@ -342,6 +372,7 @@ pub fn emit_assembly_with_native_toolchain_file(
 ) -> Result<(), CompileError> {
     let source = fs::read_to_string(source_path)?;
     let libraries = resolve_named_libraries(source_path, &source)?;
+    let source = source_with_resolved_library_includes(&source, &libraries)?;
     let assembly = compile_assembly_with_native_toolchain_and_libraries(
         compiler_executable,
         &source,
@@ -360,6 +391,7 @@ pub fn emit_linked_artifact_with_bootstrap_compiler_file(
     let compiler = fs::read_to_string(compiler_path)?;
     let source = fs::read_to_string(source_path)?;
     let libraries = resolve_named_libraries(source_path, &source)?;
+    let source = source_with_resolved_library_includes(&source, &libraries)?;
     let artifact = compile_linked_artifact_with_bootstrap_compiler_and_libraries(
         &compiler, &source, &libraries,
     )?;
@@ -372,7 +404,12 @@ pub fn emit_module_artifact_file(
     output_path: &Path,
 ) -> Result<(), CompileError> {
     let source = fs::read_to_string(source_path)?;
-    let artifact = compile_module_artifact(&source)?;
+    let libraries = resolve_named_libraries(source_path, &source)?;
+    let artifact = if libraries.is_empty() {
+        compile_module_artifact(&source)?
+    } else {
+        compile_module_artifact_with_libraries(&source, &libraries)?
+    };
     fs::write(output_path, artifact)?;
     Ok(())
 }
@@ -434,34 +471,242 @@ pub fn resolve_named_libraries(
     source_path: &Path,
     source: &str,
 ) -> Result<Vec<NamedLibrary>, CompileError> {
-    let source_directory = source_path.parent().unwrap_or_else(|| Path::new("."));
-    let library_directory = source_directory.join(LIBRARY_DIRECTORY);
+    let executable = env::current_exe().ok();
+    let library_directories = library_search_directories(source_path, executable.as_deref());
     let mut libraries = Vec::new();
-
+    let mut visiting = Vec::new();
+    let mut resolved = BTreeSet::new();
     for name in requested_external_libraries(source)? {
-        let path = library_directory.join(format!("{name}.{LIBRARY_EXTENSION}"));
-        let artifact = match fs::read_to_string(&path) {
-            Ok(artifact) => artifact,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Err(CompileError::LibraryNotFound { name, path });
-            }
-            Err(error) => return Err(CompileError::Io(error)),
-        };
-        libraries.push(NamedLibrary { name, artifact });
+        resolve_named_library(
+            &name,
+            &library_directories,
+            &mut visiting,
+            &mut resolved,
+            &mut libraries,
+        )?;
+    }
+    Ok(libraries)
+}
+
+fn resolve_named_library(
+    name: &str,
+    library_directories: &[PathBuf],
+    visiting: &mut Vec<String>,
+    resolved: &mut BTreeSet<String>,
+    libraries: &mut Vec<NamedLibrary>,
+) -> Result<(), CompileError> {
+    if resolved.contains(name) {
+        return Ok(());
+    }
+    if let Some(index) = visiting.iter().position(|candidate| candidate == name) {
+        let mut cycle = visiting[index..].to_vec();
+        cycle.push(name.to_owned());
+        return Err(CompileError::Bootstrap(format!(
+            "library dependency cycle: {}",
+            cycle.join(" -> ")
+        )));
     }
 
-    Ok(libraries)
+    let mut found = None;
+    let mut searched = Vec::new();
+    for directory in library_directories {
+        let path = directory.join(format!("{name}.{LIBRARY_EXTENSION}"));
+        searched.push(path.clone());
+        match fs::read_to_string(&path) {
+            Ok(artifact) => {
+                found = Some((path, artifact));
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(CompileError::Io(error)),
+        }
+    }
+    let Some((artifact_path, artifact)) = found else {
+        return Err(CompileError::LibraryNotFound {
+            name: name.to_owned(),
+            searched,
+        });
+    };
+
+    visiting.push(name.to_owned());
+    for dependency in library_dependencies(&artifact_path, name)? {
+        resolve_named_library(
+            &dependency,
+            library_directories,
+            visiting,
+            resolved,
+            libraries,
+        )?;
+    }
+    visiting.pop();
+    resolved.insert(name.to_owned());
+    libraries.push(NamedLibrary {
+        name: name.to_owned(),
+        artifact,
+    });
+    Ok(())
+}
+
+fn library_dependencies(
+    artifact_path: &Path,
+    expected_name: &str,
+) -> Result<Vec<String>, CompileError> {
+    let metadata_path = artifact_path.with_file_name(format!("{expected_name}.metadata.toml"));
+    let source = match fs::read_to_string(&metadata_path) {
+        Ok(source) => source,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(CompileError::Io(error)),
+    };
+    let metadata = source.parse::<toml::Table>().map_err(|error| {
+        CompileError::Bootstrap(format!(
+            "invalid library metadata `{}`: {error}",
+            metadata_path.display()
+        ))
+    })?;
+    if metadata.get("format").and_then(toml::Value::as_integer) != Some(1) {
+        return Err(CompileError::Bootstrap(format!(
+            "library metadata `{}` requires format = 1",
+            metadata_path.display()
+        )));
+    }
+    if metadata.get("name").and_then(toml::Value::as_str) != Some(expected_name) {
+        return Err(CompileError::Bootstrap(format!(
+            "library metadata `{}` does not describe `{expected_name}`",
+            metadata_path.display()
+        )));
+    }
+    let namespace = metadata
+        .get("namespace")
+        .and_then(toml::Value::as_str)
+        .ok_or_else(|| {
+            CompileError::Bootstrap(format!(
+                "library metadata `{}` requires a namespace",
+                metadata_path.display()
+            ))
+        })?;
+    if !library_name_is_safe(namespace) {
+        return Err(CompileError::Bootstrap(format!(
+            "library metadata `{}` contains invalid namespace `{namespace}`",
+            metadata_path.display()
+        )));
+    }
+    let dependencies = metadata
+        .get("dependencies")
+        .and_then(toml::Value::as_array)
+        .ok_or_else(|| {
+            CompileError::Bootstrap(format!(
+                "library metadata `{}` requires a dependencies array",
+                metadata_path.display()
+            ))
+        })?;
+    let mut output = Vec::with_capacity(dependencies.len());
+    for dependency in dependencies {
+        let dependency = dependency.as_str().ok_or_else(|| {
+            CompileError::Bootstrap(format!(
+                "library metadata `{}` contains a non-string dependency",
+                metadata_path.display()
+            ))
+        })?;
+        if !library_name_is_safe(dependency) {
+            return Err(CompileError::Bootstrap(format!(
+                "library metadata `{}` contains invalid dependency `{dependency}`",
+                metadata_path.display()
+            )));
+        }
+        if output.iter().any(|existing| existing == dependency) {
+            return Err(CompileError::Bootstrap(format!(
+                "library metadata `{}` repeats dependency `{dependency}`",
+                metadata_path.display()
+            )));
+        }
+        output.push(dependency.to_owned());
+    }
+    Ok(output)
+}
+
+fn library_name_is_safe(name: &str) -> bool {
+    !name.is_empty()
+        && name.split('.').all(|part| {
+            let mut characters = part.chars();
+            characters
+                .next()
+                .is_some_and(|character| character == '_' || character.is_ascii_alphabetic())
+                && characters.all(|character| character == '_' || character.is_ascii_alphanumeric())
+        })
+}
+
+fn source_with_resolved_library_includes(
+    source: &str,
+    libraries: &[NamedLibrary],
+) -> Result<String, CompileError> {
+    let requested = requested_external_libraries(source)?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let mut prefix = String::new();
+    for library in libraries {
+        if !requested.contains(&library.name) {
+            prefix.push_str("include >> ");
+            prefix.push_str(&library.name);
+            prefix.push('\n');
+        }
+    }
+    if prefix.is_empty() {
+        return Ok(source.to_owned());
+    }
+    prefix.push_str(source);
+    Ok(prefix)
+}
+
+fn library_search_directories(source_path: &Path, executable_path: Option<&Path>) -> Vec<PathBuf> {
+    let source_directory = source_path.parent().unwrap_or_else(|| Path::new("."));
+    let local = source_directory.join(LIBRARY_DIRECTORY);
+    let mut directories = vec![local.clone()];
+
+    if let Some(installed) = executable_path
+        .and_then(Path::parent)
+        .map(|directory| directory.join(LIBRARY_DIRECTORY))
+    {
+        if installed != local {
+            directories.push(installed);
+        }
+    }
+
+    if let Some(workspace) = executable_path.and_then(|path| {
+        path.ancestors()
+            .find(|ancestor| {
+                ancestor.join("Cargo.toml").is_file()
+                    && ancestor.join("crates/apl_runtime").is_dir()
+            })
+            .map(|ancestor| ancestor.join(LIBRARY_DIRECTORY))
+    }) {
+        let generated = workspace
+            .parent()
+            .expect("workspace library directory has a parent")
+            .join("build")
+            .join(LIBRARY_DIRECTORY);
+        if !directories.contains(&generated) {
+            directories.push(generated);
+        }
+        if !directories.contains(&workspace) {
+            directories.push(workspace);
+        }
+    }
+
+    directories
 }
 
 pub fn compile_linked_artifact_for_source(
     source_path: &Path,
     source: &str,
 ) -> Result<String, CompileError> {
+    let program = apl_parser::parse_program(source)?;
+    apl_core::validate_executable_structure(&program)?;
     let libraries = resolve_named_libraries(source_path, source)?;
+    let source = source_with_resolved_library_includes(source, &libraries)?;
     if libraries.is_empty() {
-        compile_linked_artifact(source)
+        compile_linked_artifact(&source)
     } else {
-        compile_linked_artifact_with_libraries(source, &libraries)
+        compile_linked_artifact_with_libraries(&source, &libraries)
     }
 }
 
@@ -491,16 +736,30 @@ pub fn run_linked_artifact(
     artifact: &str,
     input: Vec<String>,
 ) -> Result<apl_runtime::RunOutput, CompileError> {
-    let report = run_linked_artifact_report(artifact, input)?;
+    run_linked_artifact_with_arguments(artifact, input, &[])
+}
+
+pub fn run_linked_artifact_with_arguments(
+    artifact: &str,
+    input: Vec<String>,
+    arguments: &[String],
+) -> Result<apl_runtime::RunOutput, CompileError> {
+    let report = run_linked_artifact_report_with_arguments(artifact, input, arguments)?;
     if report.status == LinkedRunStatus::Fail {
         let reason = report
             .output
             .last()
             .cloned()
             .unwrap_or_else(|| "linked artifact failed".to_owned());
-        return Err(CompileError::Runtime(apl_runtime::RuntimeError::Failed(
-            reason,
-        )));
+        let error = if let Some(code) = report.exit_code {
+            apl_runtime::RuntimeError::FailedWithCode {
+                message: reason,
+                code,
+            }
+        } else {
+            apl_runtime::RuntimeError::Failed(reason)
+        };
+        return Err(CompileError::Runtime(error));
     }
 
     Ok(apl_runtime::RunOutput {
@@ -512,10 +771,28 @@ pub fn run_linked_artifact_report(
     artifact: &str,
     input: Vec<String>,
 ) -> Result<LinkedRunReport, CompileError> {
-    let mut bridge_input = Vec::with_capacity(input.len() + 2);
+    run_linked_artifact_report_with_arguments(artifact, input, &[])
+}
+
+pub fn run_linked_artifact_report_with_arguments(
+    artifact: &str,
+    input: Vec<String>,
+    arguments: &[String],
+) -> Result<LinkedRunReport, CompileError> {
+    let arguments = apl_runtime::parse_numbered_input_arguments(arguments).map_err(|message| {
+        CompileError::Runtime(apl_runtime::RuntimeError::Message(format!(
+            "input argument error: {message}"
+        )))
+    })?;
+    let mut bridge_input = Vec::with_capacity(input.len() + arguments.iter().count() * 2 + 3);
     bridge_input.push(artifact.to_owned());
     bridge_input.push(input.len().to_string());
     bridge_input.extend(input);
+    bridge_input.push(arguments.iter().count().to_string());
+    for (index, value) in arguments.iter() {
+        bridge_input.push(index.to_string());
+        bridge_input.push(value.to_owned());
+    }
     let output = run_bootstrap_bridge(LINKED_RUN_BRIDGE, bridge_input)?;
     parse_linked_run_report(&output.stdout)
 }
@@ -684,6 +961,7 @@ pub fn build_native_executable_with_native_toolchain(
 ) -> Result<NativeBuildOutput, CompileError> {
     let source = fs::read_to_string(source_path)?;
     let libraries = resolve_named_libraries(source_path, &source)?;
+    let source = source_with_resolved_library_includes(&source, &libraries)?;
     let assembly = compile_assembly_with_native_toolchain_and_libraries(
         compiler_executable,
         &source,
@@ -706,7 +984,7 @@ fn build_native_package(
     let manifest_path = package_dir.join("Cargo.toml");
     let generated_source_path = src_dir.join("main.rs");
     let assembly_path = package_dir.join("program.s");
-    let workspace_root = workspace_root_from_source(identity_path);
+    let runtime_root = native_runtime_root(identity_path)?;
     let package_name = format!(
         "{}_native",
         compiled_package_name(identity_path.file_stem().and_then(|name| name.to_str()))
@@ -714,8 +992,9 @@ fn build_native_package(
 
     fs::write(
         &manifest_path,
-        render_native_manifest(&workspace_root, &package_name),
+        render_native_manifest(&runtime_root, &package_name),
     )?;
+    write_native_cargo_config(&package_dir, &runtime_root)?;
     fs::write(&assembly_path, assembly)?;
     fs::write(&generated_source_path, render_native_main())?;
 
@@ -1133,6 +1412,15 @@ fn parse_linked_run_report(output: &str) -> Result<LinkedRunReport, CompileError
         Some("FAIL") => LinkedRunStatus::Fail,
         _ => return Err(invalid_linked_run_response()),
     };
+    let exit_code = match take_protocol_field(&mut payload) {
+        Some("") => None,
+        Some(value) => Some(
+            value
+                .parse::<i32>()
+                .map_err(|_| invalid_linked_run_response())?,
+        ),
+        None => return Err(invalid_linked_run_response()),
+    };
     let Some(output_count) = take_protocol_usize(&mut payload) else {
         return Err(invalid_linked_run_response());
     };
@@ -1155,6 +1443,7 @@ fn parse_linked_run_report(output: &str) -> Result<LinkedRunReport, CompileError
     Ok(LinkedRunReport {
         status,
         output: values,
+        exit_code,
     })
 }
 
@@ -1237,6 +1526,22 @@ if get(aplhost.module_report, 0) != vm.FLOW_OK {
 }
 out get(aplhost.module_report, 1)"#;
 
+const DEPENDENT_MODULE_COMPILE_BRIDGE: &str = r#"VTime aplhost.library_count = int(input)
+VTime aplhost.libraries = []
+VTime aplhost.library_index = 0
+while (aplhost.library_index < aplhost.library_count) (-1) {
+  VTime aplhost.library_name = input
+  VTime aplhost.library_artifact = input
+  add(aplhost.libraries, [aplhost.library_name, aplhost.library_artifact])
+  aplhost.library_index += 1
+}
+VTime aplhost.source = input
+VTime aplhost.module_report = bootstrap.dependent_module_report(aplhost.libraries, aplhost.source)
+if get(aplhost.module_report, 0) != vm.FLOW_OK {
+  fail get(aplhost.module_report, 1)
+}
+out get(aplhost.module_report, 1)"#;
+
 const MODULE_EXTEND_BRIDGE: &str = r#"VTime aplhost.module = input
 VTime aplhost.source = input
 VTime aplhost.module_report = bootstrap.extend_module_report(aplhost.module, aplhost.source)
@@ -1283,9 +1588,13 @@ if get(aplhost.compile_report, 0) != vm.FLOW_OK {
 }
 out get(aplhost.compile_report, 1)"#;
 
-const LINKED_RUN_BRIDGE: &str = r#"func aplhost.emit_run_report(status, output) {
-  out "APLRUN1:"
+const LINKED_RUN_BRIDGE: &str = r#"func aplhost.emit_run_report(status, code, output) {
+  out "APLRUN2:"
   out status
+  out ":"
+  if code != NONE {
+    out code
+  }
   out ":"
   out len(output)
   out ":"
@@ -1303,7 +1612,7 @@ VTime aplhost.encoded = input
 VTime aplhost.loaded_report = bootstrap.load_linked_artifact_report(aplhost.encoded)
 
 if get(aplhost.loaded_report, 0) != vm.FLOW_OK {
-  VTime aplhost.invalid_emitted = aplhost.emit_run_report(vm.FLOW_FAIL, [get(aplhost.loaded_report, 1)])
+  VTime aplhost.invalid_emitted = aplhost.emit_run_report(vm.FLOW_FAIL, NONE, [get(aplhost.loaded_report, 1)])
 }
 
 VTime aplhost.inputs = []
@@ -1315,9 +1624,26 @@ while (aplhost.input_index < aplhost.input_count) (-1) {
   aplhost.input_index += 1
 }
 
-VTime aplhost.run_report = bootstrap.run_loaded_image_with_input_report(get(aplhost.loaded_report, 1), aplhost.inputs)
+VTime aplhost.input_arguments = []
+VTime aplhost.argument_count = int(input)
+VTime aplhost.argument_index = 0
+
+while (aplhost.argument_index < aplhost.argument_count) (-1) {
+  VTime aplhost.slot = int(input)
+  VTime aplhost.value = input
+  add(aplhost.input_arguments, [aplhost.slot, aplhost.value])
+  aplhost.argument_index += 1
+}
+
+VTime aplhost.run_report = bootstrap.run_loaded_image_with_bound_input_report(get(aplhost.loaded_report, 1), aplhost.inputs, aplhost.input_arguments)
 VTime aplhost.output = get(aplhost.run_report, 1)
-VTime aplhost.report_emitted = aplhost.emit_run_report(get(aplhost.run_report, 0), aplhost.output)"#;
+VTime aplhost.status = get(aplhost.run_report, 0)
+VTime aplhost.code = NONE
+if aplhost.status[0:4] == "ERR:" {
+  aplhost.code = int(aplhost.status[4:])
+  aplhost.status = vm.FLOW_FAIL
+}
+VTime aplhost.report_emitted = aplhost.emit_run_report(aplhost.status, aplhost.code, aplhost.output)"#;
 
 const LINKED_MANIFEST_BRIDGE: &str = r#"VTime aplhost.encoded = input
 VTime aplhost.manifest_report = bootstrap.linked_artifact_manifest_report(aplhost.encoded)
@@ -1461,8 +1787,8 @@ apl_compiler = {{ path = "{compiler_path}" }}
     )
 }
 
-fn render_native_manifest(workspace_root: &Path, package_name: &str) -> String {
-    let runtime_path = toml_path(&workspace_root.join("crates/apl_native_runtime"));
+fn render_native_manifest(runtime_root: &Path, package_name: &str) -> String {
+    let runtime_path = toml_path(runtime_root);
 
     format!(
         r#"[package]
@@ -1476,6 +1802,32 @@ edition = "2021"
 apl_native_runtime = {{ path = "{runtime_path}" }}
 "#
     )
+}
+
+fn write_native_cargo_config(package_dir: &Path, runtime_root: &Path) -> Result<(), CompileError> {
+    let vendor = runtime_root.join("vendor");
+    if !vendor.is_dir() {
+        return Ok(());
+    }
+
+    let cargo_dir = package_dir.join(".cargo");
+    fs::create_dir_all(&cargo_dir)?;
+    fs::write(
+        cargo_dir.join("config.toml"),
+        format!(
+            r#"[net]
+offline = true
+
+[source.crates-io]
+replace-with = "apl-vendored-sources"
+
+[source.apl-vendored-sources]
+directory = "{}"
+"#,
+            toml_path(&vendor)
+        ),
+    )?;
+    Ok(())
 }
 
 fn render_native_main() -> String {
@@ -1492,7 +1844,7 @@ extern "C" {
 }
 
 fn main() {
-    let mut context = NativeContext::from_stdin().unwrap_or_else(|error| {
+    let mut context = NativeContext::from_process().unwrap_or_else(|error| {
         eprintln!("APL input error: {error}");
         process::exit(1);
     });
@@ -1505,7 +1857,7 @@ fn main() {
 
 fn render_main(ir: &[u8]) -> String {
     format!(
-        r#"use std::{{io::{{IsTerminal, Read}}, process}};
+        r#"use std::{{env, io::{{IsTerminal, Read}}, process}};
 
 fn read_input() -> Vec<String> {{
     let mut stdin = std::io::stdin();
@@ -1520,12 +1872,17 @@ fn read_input() -> Vec<String> {{
 
 fn main() {{
     let input = read_input();
+    let arguments = env::args().skip(1).collect::<Vec<_>>();
 
-    match apl_runtime::run_ir_bytes(COMPILED_APL_IR, input) {{
+    match apl_runtime::run_ir_bytes_with_arguments(COMPILED_APL_IR, input, &arguments) {{
         Ok(output) => print!("{{}}", output.stdout),
         Err(apl_runtime::RuntimeError::Failed(message)) => {{
             eprintln!("APL fail: {{message}}");
             process::exit(1);
+        }}
+        Err(apl_runtime::RuntimeError::FailedWithCode {{ message, code }}) => {{
+            eprintln!("{{message}}");
+            process::exit(code);
         }}
         Err(error) => {{
             eprintln!("APL runtime error: {{error:?}}");
@@ -1543,7 +1900,7 @@ const COMPILED_APL_IR: &[u8] = &[
 }
 
 fn render_linked_main() -> String {
-    r#"use std::{io::{IsTerminal, Read}, process};
+    r#"use std::{env, io::{IsTerminal, Read}, process};
 
 fn read_input() -> Vec<String> {
     let mut stdin = std::io::stdin();
@@ -1558,8 +1915,9 @@ fn read_input() -> Vec<String> {
 
 fn main() {
     let input = read_input();
+    let arguments = env::args().skip(1).collect::<Vec<_>>();
 
-    match apl_compiler::run_linked_artifact(APL_LINKED_ARTIFACT, input) {
+    match apl_compiler::run_linked_artifact_with_arguments(APL_LINKED_ARTIFACT, input, &arguments) {
         Ok(output) => print!("{}", output.stdout),
         Err(error) => {
             eprintln!("APL linked artifact error: {error:?}");
@@ -1607,6 +1965,42 @@ fn workspace_root_from_source(source_path: &Path) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+fn native_runtime_root(source_path: &Path) -> Result<PathBuf, CompileError> {
+    let is_runtime =
+        |path: &Path| path.join("Cargo.toml").is_file() && path.join("src/lib.rs").is_file();
+
+    if let Some(path) = env::var_os("APL_NATIVE_RUNTIME_DIR").map(PathBuf::from) {
+        if is_runtime(&path) {
+            return Ok(path);
+        }
+        return Err(CompileError::Bootstrap(format!(
+            "APL_NATIVE_RUNTIME_DIR does not contain an APL native runtime: {}",
+            path.display()
+        )));
+    }
+
+    if let Some(path) = env::current_exe()
+        .ok()
+        .and_then(|path| {
+            path.parent()
+                .map(|parent| parent.join("compiler/native-runtime"))
+        })
+        .filter(|path| is_runtime(path))
+    {
+        return Ok(path);
+    }
+
+    let workspace = workspace_root_from_source(source_path);
+    let path = workspace.join("crates/apl_native_runtime");
+    if is_runtime(&path) {
+        return Ok(path);
+    }
+
+    Err(CompileError::Bootstrap(
+        "APL native runtime was not found; reinstall APL or set APL_NATIVE_RUNTIME_DIR".to_owned(),
+    ))
+}
+
 fn toml_path(path: &Path) -> String {
     path.to_string_lossy()
         .trim_start_matches(r"\\?\")
@@ -1629,11 +2023,42 @@ fn sanitize_package_name(raw: &str) -> String {
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    unsafe extern "system" fn raw_memory_test_add(left: i64, right: i64) -> i64 {
+        left + right
+    }
+
+    #[cfg(not(windows))]
+    unsafe extern "C" fn raw_memory_test_add(left: i64, right: i64) -> i64 {
+        left + right
+    }
+
     #[test]
     fn compose_program_puts_prelude_first() {
-        let combined = compose_program("func apl.ok() { return true }", "out apl.ok()");
+        let combined = compose_program("func apl.ok() {\n  return true\n}", "out apl.ok()");
         assert!(combined.starts_with("func apl.ok()"));
         assert!(combined.contains("out apl.ok()"));
+    }
+
+    #[test]
+    fn self_hosted_executable_uses_std_main_and_std_prefixes() {
+        let source = r#"
+            AVInt std::main() {
+              AVInt answer = std::int("42")
+              out answer
+              return 0
+            }
+        "#;
+        let artifact = compile_linked_artifact(source).unwrap();
+        assert_eq!(run_linked_artifact(&artifact, vec![]).unwrap().stdout, "42");
+
+        let bare = r#"
+            AVInt std::main() {
+              AVInt answer = int("42")
+              return 0
+            }
+        "#;
+        assert!(compile_linked_artifact(bare).is_err());
     }
 
     #[test]
@@ -1654,7 +2079,7 @@ mod tests {
             },
         ];
         assert_eq!(
-            bootstrap_compiler_input("include >> math out math.answer()", &libraries),
+            bootstrap_compiler_input("include >> math\nout math.answer()", &libraries),
             vec![
                 BOOTSTRAP_COMPILER_LIBRARY_REQUEST.to_owned(),
                 "2".to_owned(),
@@ -1662,7 +2087,7 @@ mod tests {
                 "APLMOD3:math".to_owned(),
                 "unsafe.memory".to_owned(),
                 "APLMOD3:memory\n\0".to_owned(),
-                "include >> math out math.answer()".to_owned(),
+                "include >> math\nout math.answer()".to_owned(),
             ]
         );
     }
@@ -1682,7 +2107,7 @@ mod tests {
 
     #[test]
     fn source_library_resolution_is_local_and_preserves_dotted_names() {
-        let source = "include >> unsafe.memory include >> base include >> unsafe.memory out 1";
+        let source = "include >> unsafe.memory\ninclude >> base\ninclude >> unsafe.memory\nout 1";
         assert_eq!(
             requested_external_libraries(source).unwrap(),
             vec!["unsafe.memory"]
@@ -1692,11 +2117,11 @@ mod tests {
         let error = resolve_named_libraries(&source_path, source).unwrap_err();
         assert!(matches!(
             error,
-            CompileError::LibraryNotFound { name, path }
+            CompileError::LibraryNotFound { name, searched }
                 if name == "unsafe.memory"
-                    && path == Path::new("missing_project")
-                        .join("libraries")
-                        .join("unsafe.memory.aplmod")
+                    && searched.first() == Some(&Path::new("missing_project")
+                            .join("libraries")
+                            .join("unsafe.memory.aplmod"))
         ));
 
         let CompileError::Bootstrap(message) =
@@ -1705,6 +2130,53 @@ mod tests {
             panic!("expected APL parser diagnostic from library discovery");
         };
         assert_eq!(message, "parse error at 1:13: declaration expects =");
+    }
+
+    #[test]
+    fn installed_library_directory_follows_the_compiler_executable() {
+        assert_eq!(
+            library_search_directories(
+                Path::new("project").join("program.apl").as_path(),
+                Some(Path::new("installation").join("apl.exe").as_path()),
+            ),
+            vec![
+                Path::new("project").join("libraries"),
+                Path::new("installation").join("libraries"),
+            ]
+        );
+        assert_eq!(
+            library_search_directories(
+                Path::new("installation").join("program.apl").as_path(),
+                Some(Path::new("installation").join("apl.exe").as_path()),
+            ),
+            vec![Path::new("installation").join("libraries")]
+        );
+    }
+
+    #[test]
+    fn developer_binary_discovers_workspace_libraries() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "apl_library_workspace_{}_{}",
+            std::process::id(),
+            unique
+        ));
+        fs::create_dir_all(root.join("crates/apl_runtime")).unwrap();
+        fs::write(root.join("Cargo.toml"), "[workspace]\n").unwrap();
+
+        let source = root.join("outside/project.apl");
+        let executable = root.join("target/release/apl_studio.exe");
+        let directories = library_search_directories(&source, Some(&executable));
+        assert_eq!(
+            directories.get(directories.len() - 2),
+            Some(&root.join("build/libraries"))
+        );
+        assert_eq!(directories.last(), Some(&root.join("libraries")));
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1751,8 +2223,10 @@ mod tests {
         assert!(STANDARD_PRELUDE.contains("func parser.parse_source"));
         assert!(STANDARD_PRELUDE.contains("func parser.parse_source_with_positions"));
         assert!(STANDARD_PRELUDE.contains("func parser.node_token_index"));
+        assert!(STANDARD_PRELUDE.contains("func rawlower.lower"));
         assert!(STANDARD_PRELUDE.contains("func parser.diagnostic"));
         assert!(STANDARD_PRELUDE.contains("func parser.source_diagnostic"));
+        assert!(STANDARD_PRELUDE.contains("func classlower.lower"));
         assert!(STANDARD_PRELUDE.contains("func checker.validate_report"));
         assert!(STANDARD_PRELUDE.contains("func ir.compile_source"));
         assert!(STANDARD_PRELUDE.contains("func linker.link_image"));
@@ -1812,7 +2286,7 @@ mod tests {
     #[test]
     fn apl_bootstrap_compiles_and_runs_portable_artifact() {
         let artifact = compile_linked_artifact(
-            "func inc(x) { return x + 1 } AVInt value = input out inc(value)",
+            "func inc(x) {\n  return x + 1\n}\nAVInt value = input\nout inc(value)",
         )
         .unwrap();
 
@@ -1824,7 +2298,7 @@ mod tests {
     #[test]
     fn linked_artifact_honors_base_composition_directives() {
         let artifact = compile_linked_artifact(
-            r#"include >> base exclude "pick" << base exclude "len" << base out 42"#,
+            "include >> base\nexclude \"pick\" << base\nexclude \"len\" << base\nout 42",
         )
         .unwrap();
 
@@ -1838,20 +2312,20 @@ mod tests {
         );
 
         let CompileError::Runtime(apl_runtime::RuntimeError::Failed(message)) =
-            compile_linked_artifact(r#"exclude "len" << base out len([1])"#).unwrap_err()
+            compile_linked_artifact("exclude \"len\" << base\nout len([1])").unwrap_err()
         else {
             panic!("expected excluded base symbol to fail before artifact emission");
         };
         assert_eq!(
             message,
-            "semantic error at 1:23: excluded symbol `len` from library `base`"
+            "semantic error at 2:1: excluded symbol `len` from library `base`"
         );
     }
 
     #[test]
     fn linked_artifact_lowers_to_inspectable_native_ir() {
         let linked = compile_linked_artifact(
-            "func double(value) { return value * 2 } AVInt answer = double(21) out answer",
+            "func double(value) {\n  return value * 2\n}\nAVInt answer = double(21)\nout answer",
         )
         .unwrap();
         let lowered = lower_linked_artifact_to_native_ir(&linked).unwrap();
@@ -1875,7 +2349,7 @@ mod tests {
     #[test]
     fn native_ir_lowers_to_inspectable_platform_abi() {
         let linked = compile_linked_artifact(
-            "func double(value) { return value * 2 } AVInt answer = double(21) out answer",
+            "func double(value) {\n  return value * 2\n}\nAVInt answer = double(21)\nout answer",
         )
         .unwrap();
         let low_ir = lower_linked_artifact_to_native_ir(&linked).unwrap();
@@ -1908,7 +2382,7 @@ mod tests {
     #[test]
     fn native_abi_emits_platform_assembly() {
         let linked = compile_linked_artifact(
-            "func double(value) { return value * 2 } AVInt answer = double(21) out answer",
+            "func double(value) {\n  return value * 2\n}\nAVInt answer = double(21)\nout answer",
         )
         .unwrap();
         let low_ir = lower_linked_artifact_to_native_ir(&linked).unwrap();
@@ -1916,7 +2390,7 @@ mod tests {
         let assembly = emit_assembly_from_native_abi(&native_abi).unwrap();
 
         assert!(assembly.starts_with(
-            "# APLASM1 runtime-abi=1 target=x86_64-pc-windows-msvc\n.intel_syntax noprefix\n.text\n"
+            "# APLASM1 runtime-abi=2 target=x86_64-pc-windows-msvc\n.intel_syntax noprefix\n.text\n"
         ));
         assert!(assembly.contains(".globl apl_program_entry"));
         assert!(assembly.contains("sub rsp, 40"));
@@ -1943,7 +2417,21 @@ mod tests {
         } else {
             LINUX_X64_TARGET
         };
-        let source = "func inc(value) { return value + 1 } AVInt x = 0 while (x < 2) (3) { x += 1 } List values = [x] pick(values): item { out inc(item) }";
+        let source = r#"using namespace std
+func inc(value) {
+  return value + 1
+}
+AVInt std::main() {
+  AVInt x = 0
+  while (x < 2) (3) {
+    x += 1
+  }
+  List values = [x]
+  pick(values): item {
+    out inc(item)
+  }
+  return 0
+}"#;
         let assembly =
             compile_assembly_for_source(Path::new("assembly_smoke.apl"), source, target).unwrap();
         let unique = std::time::SystemTime::now()
@@ -2007,6 +2495,7 @@ mod tests {
             "apl_rt_scope_exit",
             "apl_rt_unwind",
             "apl_rt_loop_enter",
+            "apl_rt_loop_enter_dynamic",
             "apl_rt_loop_check",
             "apl_rt_loop_exit",
             "apl_rt_pick_enter",
@@ -2046,7 +2535,7 @@ mod tests {
     #[test]
     fn linked_artifact_bridge_preserves_empty_input_lines() {
         let artifact = compile_linked_artifact(
-            "AVStr first = input AVStr second = input out len(first) out second",
+            "AVStr first = input\nAVStr second = input\nout len(first)\nout second",
         )
         .unwrap();
 
@@ -2057,23 +2546,27 @@ mod tests {
 
     #[test]
     fn linked_artifact_bridge_preserves_stop_and_fail_outcomes() {
-        let stopped = compile_linked_artifact(r#"out "before" stop "done" out "after""#).unwrap();
+        let stopped =
+            compile_linked_artifact("out \"before\"\nstop \"done\"\nout \"after\"").unwrap();
         assert_eq!(
             run_linked_artifact_report(&stopped, vec![]).unwrap(),
             LinkedRunReport {
                 status: LinkedRunStatus::Stop,
                 output: vec!["before".to_owned(), "done".to_owned()],
+                exit_code: None,
             }
         );
         let stopped_output = run_linked_artifact(&stopped, vec![]).unwrap();
         assert_eq!(stopped_output.stdout, "beforedone");
 
-        let failed = compile_linked_artifact(r#"out "before" fail "bad" out "after""#).unwrap();
+        let failed =
+            compile_linked_artifact("out \"before\"\nfail \"bad\"\nout \"after\"").unwrap();
         assert_eq!(
             run_linked_artifact_report(&failed, vec![]).unwrap(),
             LinkedRunReport {
                 status: LinkedRunStatus::Fail,
                 output: vec!["before".to_owned(), "bad".to_owned()],
+                exit_code: None,
             }
         );
         let CompileError::Runtime(apl_runtime::RuntimeError::Failed(reason)) =
@@ -2085,21 +2578,47 @@ mod tests {
     }
 
     #[test]
+    fn linked_artifact_preserves_explicit_error_code() {
+        let source = r#"using namespace std
+func failer() {
+  return(ERR=["boom"][7])
+}
+AVInt std::main() {
+  failer()
+  return 0
+}"#;
+        let artifact = compile_linked_artifact_for_source(Path::new("error.apl"), source).unwrap();
+        let report = run_linked_artifact_report(&artifact, vec![]).unwrap();
+        assert_eq!(report.status, LinkedRunStatus::Fail);
+        assert_eq!(report.output, vec!["boom".to_owned()]);
+        assert_eq!(report.exit_code, Some(7));
+
+        let CompileError::Runtime(apl_runtime::RuntimeError::FailedWithCode { message, code }) =
+            run_linked_artifact(&artifact, vec![]).unwrap_err()
+        else {
+            panic!("expected explicit APL error code");
+        };
+        assert_eq!(message, "boom");
+        assert_eq!(code, 7);
+    }
+
+    #[test]
     fn linked_run_protocol_is_length_framed_and_validated() {
         assert_eq!(
-            parse_linked_run_report("APLRUN1:STOP:3:0:6:Привет4:a\0:b").unwrap(),
+            parse_linked_run_report("APLRUN2:STOP::3:0:6:Привет4:a\0:b").unwrap(),
             LinkedRunReport {
                 status: LinkedRunStatus::Stop,
                 output: vec![String::new(), "Привет".to_owned(), "a\0:b".to_owned()],
+                exit_code: None,
             }
         );
 
         for malformed in [
             "unknown",
-            "APLRUN1:BAD:0:",
-            "APLRUN1:OK:x:",
-            "APLRUN1:OK:1:4:abc",
-            "APLRUN1:OK:0:trailing",
+            "APLRUN2:BAD::0:",
+            "APLRUN2:OK::x:",
+            "APLRUN2:OK::1:4:abc",
+            "APLRUN2:OK::0:trailing",
         ] {
             assert!(matches!(
                 parse_linked_run_report(malformed),
@@ -2110,7 +2629,12 @@ mod tests {
 
     #[test]
     fn linked_artifact_report_preserves_arbitrary_output_fragments() {
-        let artifact = compile_linked_artifact(r#"out "" out "Привет" out "a\0:b""#).unwrap();
+        let artifact = compile_linked_artifact(
+            r#"out ""
+out "Привет"
+out "a\0:b""#,
+        )
+        .unwrap();
         let report = run_linked_artifact_report(&artifact, vec![]).unwrap();
 
         assert_eq!(
@@ -2118,6 +2642,7 @@ mod tests {
             LinkedRunReport {
                 status: LinkedRunStatus::Ok,
                 output: vec![String::new(), "Привет".to_owned(), "a\0:b".to_owned()],
+                exit_code: None,
             }
         );
         assert_eq!(
@@ -2130,6 +2655,7 @@ mod tests {
             LinkedRunReport {
                 status: LinkedRunStatus::Fail,
                 output: vec!["invalid linked artifact header".to_owned()],
+                exit_code: None,
             }
         );
     }
@@ -2137,7 +2663,7 @@ mod tests {
     #[test]
     fn linked_artifact_includes_apl_runtime_module() {
         let artifact =
-            compile_linked_artifact("AVInt value = apl.pow_int(3, 4) out value").unwrap();
+            compile_linked_artifact("AVInt value = apl.pow_int(3, 4)\nout value").unwrap();
 
         let output = run_linked_artifact(&artifact, vec![]).unwrap();
         assert_eq!(output.stdout, "81");
@@ -2146,7 +2672,7 @@ mod tests {
     #[test]
     fn linked_artifact_accepts_an_explicit_apl_module() {
         let artifact = compile_linked_artifact_with_module(
-            "func module.double(value) { return value * 2 }",
+            "func module.double(value) {\n  return value * 2\n}",
             "out module.double(21)",
         )
         .unwrap();
@@ -2158,7 +2684,7 @@ mod tests {
     #[test]
     fn precompiled_apl_module_links_without_module_source() {
         let module = compile_module_artifact(
-            "func module.add_one(value) { return value + 1 } func module.twice(value) { return module.add_one(module.add_one(value)) }",
+            "func module.add_one(value) {\n  return value + 1\n}\nfunc module.twice(value) {\n  return module.add_one(module.add_one(value))\n}",
         )
         .unwrap();
         assert!(module.starts_with("APLMOD3:"));
@@ -2173,7 +2699,7 @@ mod tests {
     #[test]
     fn named_library_include_and_exclude_control_exports() {
         let math = compile_module_artifact(
-            "func math.internal(value) { return value + 1 } func math.answer() { return math.internal(41) }",
+            "func math.internal(value) {\n  return value + 1\n}\nfunc math.answer() {\n  return math.internal(41)\n}",
         )
         .unwrap();
         let libraries = vec![NamedLibrary {
@@ -2182,7 +2708,7 @@ mod tests {
         }];
 
         let artifact = compile_linked_artifact_with_libraries(
-            r#"include >> math exclude "math.internal" << math out math.answer()"#,
+            "include >> math\nexclude \"internal\" << math\nout math.answer()",
             &libraries,
         )
         .unwrap();
@@ -2193,14 +2719,25 @@ mod tests {
         );
 
         let excluded = compile_linked_artifact_with_libraries(
-            r#"include >> math exclude "math.internal" << math out math.internal(1)"#,
+            "include >> math\nexclude \"internal\" << math\nout math.internal(1)",
             &libraries,
         )
         .unwrap_err();
         assert!(matches!(
             excluded,
             CompileError::Runtime(apl_runtime::RuntimeError::Failed(message))
-                if message == "semantic error at 1:49: excluded symbol `math.internal` from library `math`"
+                if message == "semantic error at 3:1: excluded symbol `math.internal` from library `math`"
+        ));
+
+        let qualified = compile_linked_artifact_with_libraries(
+            "include >> math\nexclude \"math.internal\" << math\nout math.answer()",
+            &libraries,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            qualified,
+            CompileError::Runtime(apl_runtime::RuntimeError::Failed(message))
+                if message.contains("invalid public symbol `math.internal`")
         ));
 
         let missing_include =
@@ -2213,14 +2750,499 @@ mod tests {
     }
 
     #[test]
+    fn exclude_rejects_ambiguous_public_library_names() {
+        let library = compile_module_artifact(
+            "func math.left.hidden() {\n  return 1\n}\nfunc math.right.hidden() {\n  return 2\n}",
+        )
+        .unwrap();
+        let libraries = vec![NamedLibrary {
+            name: "math".to_owned(),
+            artifact: library,
+        }];
+
+        let error = compile_linked_artifact_with_libraries(
+            "include >> math\nexclude \"hidden\" << math\nout 1",
+            &libraries,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            CompileError::Runtime(apl_runtime::RuntimeError::Failed(message))
+                if message.contains("ambiguous symbol `hidden` in library `math`")
+        ));
+    }
+
+    #[test]
+    fn nc_accepts_identifier_namespaces_with_multiple_libraries() {
+        let math = compile_module_artifact("func math.sqrt(value) {\n  return value\n}").unwrap();
+        let random = compile_module_artifact(
+            "func random.integer(seed, minimum, maximum) {\n  return seed\n}",
+        )
+        .unwrap();
+        let libraries = vec![
+            NamedLibrary {
+                name: "math".to_owned(),
+                artifact: math,
+            },
+            NamedLibrary {
+                name: "random".to_owned(),
+                artifact: random,
+            },
+        ];
+        let source = r#"include >> math
+include >> random
+nc math, std
+
+AVInt main() {
+  out sqrt(random::integer(input, 1, 1001))
+  return 0
+}
+"#;
+
+        let artifact = compile_linked_artifact_with_libraries(source, &libraries).unwrap();
+        let output = run_linked_artifact(&artifact, vec!["81".to_owned()]).unwrap();
+        assert_eq!(output.stdout, "81");
+    }
+
+    #[test]
+    fn classes_have_stable_identity_fields_methods_and_output_hooks() {
+        let classes = compile_module_artifact(include_str!("../../../libraries/classes.apl"))
+            .expect("classes module");
+        let libraries = vec![NamedLibrary {
+            name: "classes".to_owned(),
+            artifact: classes,
+        }];
+        let source = r#"include >> classes
+class Machine {
+  AVStr color = "unknown"
+  func __init__(color) {
+    self.color = color
+  }
+  func recolor(color) {
+    self.color = color
+  }
+  func __out__() {
+    out self.color
+  }
+}
+AVInt std::main() {
+  Machine red = Machine("red")
+  Machine green = Machine("green")
+  VTime alias = red
+  alias.recolor("blue")
+  out red
+  out ":"
+  out classes::id(red) == classes::id(alias)
+  out ":"
+  out classes::id(red) != classes::id(green)
+  return 0
+}"#;
+
+        let artifact = compile_linked_artifact_with_libraries(source, &libraries).unwrap();
+        let output = run_linked_artifact(&artifact, vec![]).unwrap();
+        assert_eq!(output.stdout, "blue:true:true");
+    }
+
+    #[test]
+    fn classes_dispatch_overrides_polymorphically_and_exclude_inherited_methods() {
+        let classes = compile_module_artifact(include_str!("../../../libraries/classes.apl"))
+            .expect("classes module");
+        let libraries = vec![NamedLibrary {
+            name: "classes".to_owned(),
+            artifact: classes,
+        }];
+        let source = r#"include >> classes
+class Operation {
+  AVStr name = ""
+  func __init__(name) {
+    self.name = name
+  }
+  func label() {
+    return self.name
+  }
+  func removed() {
+    return "base"
+  }
+  func __out__() {
+    out self.label()
+  }
+}
+class Special {
+  class::inheritance "Operation"
+  class::exclude "removed" method >> Operation
+  AVStr suffix = "!"
+  func __init__(name, suffix) {
+    self.name = name
+    self.suffix = suffix
+  }
+  override func label() {
+    return self.name + self.suffix
+  }
+  override func __out__() {
+    out self.label()
+  }
+}
+AVInt std::main() {
+  Operation value = Special("APL", "!")
+  out value.label()
+  out ":"
+  out value
+  out ":"
+  out classes::type(value)
+  out ":"
+  out classes::is_a(value, "Operation")
+  return 0
+}"#;
+
+        let artifact = compile_linked_artifact_with_libraries(source, &libraries).unwrap();
+        let output = run_linked_artifact(&artifact, vec![]).unwrap();
+        assert_eq!(output.stdout, "APL!:APL!:Special:true");
+
+        let missing_override = r#"include >> classes
+class Base {
+  func __init__() {
+  }
+  func work() {
+    return 1
+  }
+}
+class Child {
+  class::inheritance "Base"
+  func __init__() {
+  }
+  func work() {
+    return 2
+  }
+}
+AVInt std::main() {
+  return 0
+}"#;
+        let error =
+            compile_linked_artifact_with_libraries(missing_override, &libraries).unwrap_err();
+        assert!(format!("{error:?}").contains("method `work` requires override"));
+
+        let missing_init = r#"include >> classes
+class Empty {
+  AVInt value = 0
+}
+AVInt std::main() {
+  return 0
+}"#;
+        let error = compile_linked_artifact_with_libraries(missing_init, &libraries).unwrap_err();
+        assert!(format!("{error:?}").contains("requires exactly one __init__"));
+
+        let excluded_call = r#"include >> classes
+class Base {
+  func __init__() {
+  }
+  func removed() {
+    return 1
+  }
+}
+class Child {
+  class::inheritance "Base"
+  class::exclude "removed" method >> Base
+  func __init__() {
+  }
+}
+AVInt std::main() {
+  Child value = Child()
+  out value.removed()
+  return 0
+}"#;
+        let error = compile_linked_artifact_with_libraries(excluded_call, &libraries).unwrap_err();
+        assert!(format!("{error:?}").contains("unknown function `value.removed`"));
+    }
+
+    #[test]
+    fn class_fields_preserve_secret_protection_through_output_hooks() {
+        let classes = compile_module_artifact(include_str!("../../../libraries/classes.apl"))
+            .expect("classes module");
+        let libraries = vec![NamedLibrary {
+            name: "classes".to_owned(),
+            artifact: classes,
+        }];
+        let source = r#"include >> classes
+class Vault {
+  ASVStr token = ""
+  func __init__(token) {
+    self.token = token
+  }
+  func __out__() {
+    out self.token
+  }
+}
+AVInt std::main() {
+  ASVStr hidden = "secret"
+  Vault vault = Vault(hidden)
+  out vault
+  return 0
+}"#;
+
+        let artifact = compile_linked_artifact_with_libraries(source, &libraries).unwrap();
+        let output = run_linked_artifact(&artifact, vec![]).unwrap();
+        assert_eq!(output.stdout, "DENIED");
+    }
+
+    #[test]
+    fn raw_memory_tracks_identity_bytes_and_two_phase_release() {
+        let raw_memory = compile_module_artifact(include_str!("../../../libraries/raw_memory.apl"))
+            .expect("raw-memory module");
+        let libraries = vec![NamedLibrary {
+            name: "raw_memory".to_owned(),
+            artifact: raw_memory,
+        }];
+        let source = r#"include >> raw_memory
+AVInt std::main() {
+  VTime pointer = memory::malloc(4)
+  out memory::where(pointer, 1) > 0
+  out ":"
+  out memory::where(pointer, 2)
+  out ":"
+  memory::write(pointer, 1, std::bytes("AB"))
+  out std::str(memory::read(pointer, 0, 4))
+  out ":"
+  memory::mark(pointer)
+  out memory::free()
+  out ":"
+  out memory::where(pointer, 1) > 0
+  VTime next = memory::malloc(1)
+  out ":"
+  out memory::where(next, 1) > memory::where(pointer, 1)
+  memory::mark(next)
+  memory::free()
+  return 0
+}"#;
+
+        let artifact = compile_linked_artifact_with_libraries(source, &libraries).unwrap();
+        let output = run_linked_artifact(&artifact, vec![]).unwrap();
+        assert_eq!(output.stdout, "true:pointer:[0, 65, 66, 0]:1:true:true");
+
+        let missing_include = r#"AVInt std::main() {
+  VTime pointer = memory::malloc(1)
+  return 0
+}"#;
+        let error =
+            compile_linked_artifact_with_libraries(missing_include, &libraries).unwrap_err();
+        assert!(format!("{error:?}").contains("include >> raw_memory"));
+
+        let internal_bypass = r#"AVInt std::main() {
+  VTime pointer = raw_malloc(1)
+  return 0
+}"#;
+        let error =
+            compile_linked_artifact_with_libraries(internal_bypass, &libraries).unwrap_err();
+        assert!(format!("{error:?}").contains("intrinsics are not source-callable"));
+
+        let qualified_internal_bypass = r#"AVInt std::main() {
+  VTime pointer = std::raw_malloc(1)
+  return 0
+}"#;
+        let error = compile_linked_artifact_with_libraries(qualified_internal_bypass, &libraries)
+            .unwrap_err();
+        assert!(format!("{error:?}").contains("intrinsics are not source-callable"));
+
+        let invalid_abi = r#"include >> raw_memory
+AVInt std::main() {
+  VTime pointer = memory::load(1, 1, "r", "not-an-abi")
+  return 0
+}"#;
+        let error = compile_linked_artifact_with_libraries(invalid_abi, &libraries).unwrap_err();
+        assert!(format!("{error:?}").contains("List/NONE"));
+
+        let excluded = r#"include >> raw_memory
+exclude "malloc" << raw_memory
+AVInt std::main() {
+  VTime pointer = memory::malloc(1)
+  return 0
+}"#;
+        assert!(compile_linked_artifact_with_libraries(excluded, &libraries).is_err());
+    }
+
+    #[test]
+    fn raw_memory_attributes_close_scopes_in_the_agreed_order() {
+        let raw_memory = compile_module_artifact(include_str!("../../../libraries/raw_memory.apl"))
+            .expect("raw-memory module");
+        let libraries = vec![NamedLibrary {
+            name: "raw_memory".to_owned(),
+            artifact: raw_memory,
+        }];
+        let source = r#"include >> raw_memory
+@marked
+@flee
+func temporary() {
+  VTime pointer = memory::malloc(2)
+  memory::write(pointer, 0, std::bytes("OK"))
+  return 7
+}
+@collector
+func retained() {
+  VTime pointer = memory::malloc(1)
+  return pointer
+}
+AVInt std::main() {
+  out temporary()
+  out ":"
+  out memory::free()
+  out ":"
+  VTime pointer = retained()
+  memory::write(pointer, 0, std::bytes("A"))
+  out std::str(memory::read(pointer, 0, 1))
+  memory::mark(pointer)
+  memory::free()
+  return 0
+}"#;
+
+        let artifact = compile_linked_artifact_with_libraries(source, &libraries).unwrap();
+        let output = run_linked_artifact(&artifact, vec![]).unwrap();
+        assert_eq!(output.stdout, "7:0:[65]");
+
+        let leak = r#"include >> raw_memory
+@marked
+func forbidden_escape() {
+  return memory::malloc(1)
+}
+AVInt std::main() {
+  VTime pointer = forbidden_escape()
+  return 0
+}"#;
+        let error = compile_linked_artifact_with_libraries(leak, &libraries).unwrap_err();
+        assert!(format!("{error:?}").contains("cannot escape through return"));
+
+        let missing_include = r#"@marked
+func scoped() {
+  return 0
+}
+AVInt std::main() {
+  return scoped()
+}
+"#;
+        let error =
+            compile_linked_artifact_with_libraries(missing_include, &libraries).unwrap_err();
+        assert!(format!("{error:?}").contains("include >> raw_memory"));
+
+        let reserved_name = r#"include >> raw_memory
+func aplraw.scope.n0() {
+  return 0
+}
+AVInt std::main() {
+  return 0
+}
+"#;
+        let error = compile_linked_artifact_with_libraries(reserved_name, &libraries).unwrap_err();
+        assert!(format!("{error:?}").contains("aplraw.* are reserved"));
+
+        let invalid_attributed_main = r#"include >> raw_memory
+@marked
+AVInt std::main() {
+  return "not-an-int"
+}
+"#;
+        let error = compile_linked_artifact_with_libraries(invalid_attributed_main, &libraries)
+            .unwrap_err();
+        assert!(format!("{error:?}").contains("std::main must return AVInt"));
+
+        let indirect_leak = r#"include >> raw_memory
+func allocate() {
+  return memory::malloc(1)
+}
+@marked
+func forbidden_escape() {
+  return allocate()
+}
+AVInt std::main() {
+  VTime pointer = forbidden_escape()
+  out memory::read(pointer, 0, 1)
+  return 0
+}"#;
+        let artifact = compile_linked_artifact_with_libraries(indirect_leak, &libraries).unwrap();
+        let error = run_linked_artifact(&artifact, vec![]).unwrap_err();
+        assert!(format!("{error:?}").contains("is marked"));
+    }
+
+    #[test]
+    fn raw_memory_loop_scope_spans_iterations_and_closes_on_flow_exit() {
+        let raw_memory = compile_module_artifact(include_str!("../../../libraries/raw_memory.apl"))
+            .expect("raw-memory module");
+        let libraries = vec![NamedLibrary {
+            name: "raw_memory".to_owned(),
+            artifact: raw_memory,
+        }];
+        let source = r#"include >> raw_memory
+func early() {
+  @marked
+  @flee
+  while (true) (1) {
+    VTime temporary = memory::malloc(1)
+    return 9
+  }
+  return 0
+}
+AVInt std::main() {
+  AVInt count = 0
+  @marked
+  @flee
+  while (count < 3) (5) {
+    VTime temporary = memory::malloc(1)
+    count += 1
+    if count == 1 {
+      continue
+    }
+    if count == 2 {
+      break
+    }
+  }
+  out count
+  out ":"
+  out early()
+  out ":"
+  out memory::free()
+  @collector
+  while (true) (1) {
+    return 0
+  }
+  return 0
+}"#;
+
+        let artifact = compile_linked_artifact_with_libraries(source, &libraries).unwrap();
+        let output = run_linked_artifact(&artifact, vec![]).unwrap();
+        assert_eq!(output.stdout, "2:9:0");
+    }
+
+    #[test]
+    fn raw_memory_call_uses_registered_address_and_explicit_signature() {
+        let raw_memory = compile_module_artifact(include_str!("../../../libraries/raw_memory.apl"))
+            .expect("raw-memory module");
+        let libraries = vec![NamedLibrary {
+            name: "raw_memory".to_owned(),
+            artifact: raw_memory,
+        }];
+        let convention = if cfg!(windows) { "win64" } else { "sysv64" };
+        let source = format!(
+            r#"include >> raw_memory
+AVInt std::main() {{
+  VTime target = memory::load({}, 1, "rx", ["{}", ["Int", "Int"], "Int"])
+  out memory::call(target, [20, 22])
+  memory::mark(target)
+  return 0
+}}"#,
+            raw_memory_test_add as *const () as usize as i64, convention
+        );
+
+        let artifact = compile_linked_artifact_with_libraries(&source, &libraries).unwrap();
+        let output = run_linked_artifact(&artifact, vec![]).unwrap();
+        assert_eq!(output.stdout, "42");
+    }
+
+    #[test]
     fn precompiled_apl_module_extends_in_stages() {
         let base = compile_module_artifact(
-            "AVInt module.base = 40 func module.add_one(value) { return value + 1 }",
+            "AVInt module.base = 40\nfunc module.add_one(value) {\n  return value + 1\n}",
         )
         .unwrap();
         let extended = extend_module_artifact(
             &base,
-            "List module.extra = [1] func module.total() { return module.add_one(module.base) + get(module.extra, 0) }",
+            "List module.extra = [1]\nfunc module.total() {\n  return module.add_one(module.base) + get(module.extra, 0)\n}",
         )
         .unwrap();
         assert!(extended.starts_with("APLMOD3:"));
@@ -2367,7 +3389,7 @@ mod tests {
 
         let artifact = compile_linked_artifact_with_bootstrap_compiler(
             &compiler,
-            "func double(value) { return value * 2 } out double(21)",
+            "func double(value) {\n  return value * 2\n}\nout double(21)",
         )
         .unwrap();
         let output = run_linked_artifact(&artifact, vec![]).unwrap();
@@ -2378,7 +3400,7 @@ mod tests {
         );
 
         let math = compile_module_artifact(
-            "func math.hidden(value) { return value + 1 } func math.answer() { return math.hidden(41) }",
+            "func math.hidden(value) {\n  return value + 1\n}\nfunc math.answer() {\n  return math.hidden(41)\n}",
         )
         .unwrap();
         let libraries = vec![NamedLibrary {
@@ -2387,7 +3409,7 @@ mod tests {
         }];
         let artifact = compile_linked_artifact_with_bootstrap_compiler_and_libraries(
             &compiler,
-            r#"include >> math exclude "math.hidden" << math out math.answer()"#,
+            "include >> math\nexclude \"hidden\" << math\nout math.answer()",
             &libraries,
         )
         .unwrap();
@@ -2456,13 +3478,13 @@ mod tests {
         let source_path = directory.join("answer.apl");
         fs::create_dir_all(directory.join("libraries")).unwrap();
         let math = compile_module_artifact(
-            "func math.hidden(value) { return value + 1 } func math.answer() { return math.hidden(41) }",
+            "func math.hidden(value) {\n  return value + 1\n}\nfunc math.answer() {\n  return math.hidden(41)\n}",
         )
         .unwrap();
         fs::write(directory.join("libraries").join("math.aplmod"), math).unwrap();
         fs::write(
             &source_path,
-            "include >> math\nexclude \"math.hidden\" << math\nAVInt cycle = 17\ncycle %= 5\nout 2 ** 3 ** 2\nout \":\"\nout cycle\nout \"\\n\"\nout math.answer()\nstop\n",
+            "include >> math\nexclude \"hidden\" << math\nAVInt cycle = 17\ncycle %= 5\nout 2 ** 3 ** 2\nout \":\"\nout cycle\nout \"\\n\"\nout math.answer()\nstop\n",
         )
         .unwrap();
         let program = build_native_executable_with_native_toolchain(

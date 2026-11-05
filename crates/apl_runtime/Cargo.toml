@@ -6,7 +6,11 @@ version.workspace = true
 
 [dependencies]
 apl_core = { path = "../apl_core" }
+apl_crypto = { path = "../apl_crypto" }
 apl_ir = { path = "../apl_ir" }
+apl_raw_memory = { path = "../apl_raw_memory" }
+apl_windows = { path = "../apl_windows" }
+serde_json = "1"
 
 [dev-dependencies]
 apl_parser = { path = "../apl_parser" }

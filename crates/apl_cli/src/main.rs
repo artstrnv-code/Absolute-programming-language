@@ -18,6 +18,11 @@ fn main() {
                 eprintln!("missing source path");
                 process::exit(2);
             };
+            let input_arguments = if command == "run" {
+                read_input_arguments(&mut args)
+            } else {
+                Vec::new()
+            };
 
             let source = fs::read_to_string(&path).unwrap_or_else(|error| {
                 eprintln!("failed to read `{path}`: {error}");
@@ -42,7 +47,11 @@ fn main() {
             } else {
                 let input = read_input();
 
-                match apl_compiler::run_linked_artifact(&artifact, input) {
+                match apl_compiler::run_linked_artifact_with_arguments(
+                    &artifact,
+                    input,
+                    &input_arguments,
+                ) {
                     Ok(output) => print!("{}", output.stdout),
                     Err(error) => exit_compile_error(&command, error),
                 }
@@ -76,13 +85,18 @@ fn main() {
                 eprintln!("failed to read `{path}`: {error}");
                 process::exit(1);
             });
+            let input_arguments = read_input_arguments(&mut args);
             let input = read_input();
 
-            match apl_runtime::run_ir_bytes(&bytes, input) {
+            match apl_runtime::run_ir_bytes_with_arguments(&bytes, input, &input_arguments) {
                 Ok(output) => print!("{}", output.stdout),
                 Err(apl_runtime::RuntimeError::Failed(message)) => {
                     eprintln!("APL fail: {message}");
                     process::exit(1);
+                }
+                Err(apl_runtime::RuntimeError::FailedWithCode { message, code }) => {
+                    eprintln!("{message}");
+                    process::exit(code);
                 }
                 Err(error) => {
                     eprintln!("runtime error: {error:?}");
@@ -249,9 +263,14 @@ fn main() {
                 eprintln!("failed to read `{path}`: {error}");
                 process::exit(1);
             });
+            let input_arguments = read_input_arguments(&mut args);
             let input = read_input();
 
-            match apl_compiler::run_linked_artifact(&artifact, input) {
+            match apl_compiler::run_linked_artifact_with_arguments(
+                &artifact,
+                input,
+                &input_arguments,
+            ) {
                 Ok(output) => print!("{}", output.stdout),
                 Err(error) => exit_compile_error("run-linked", error),
             }
@@ -576,9 +595,25 @@ fn read_input() -> Vec<String> {
     input.lines().map(str::to_owned).collect()
 }
 
+fn read_input_arguments(args: &mut impl Iterator<Item = String>) -> Vec<String> {
+    let Some(separator) = args.next() else {
+        return Vec::new();
+    };
+    if separator != "--" {
+        eprintln!("expected `--` before numbered input arguments, got `{separator}`");
+        process::exit(2);
+    }
+    let arguments = args.collect::<Vec<_>>();
+    if let Err(message) = apl_runtime::parse_numbered_input_arguments(&arguments) {
+        eprintln!("input argument error: {message}");
+        process::exit(2);
+    }
+    arguments
+}
+
 fn print_usage() {
     eprintln!(
-        "usage: apl <check|run|emit|run-ir|emit-module|emit-standard-module|emit-bootstrap-compiler|extend-module|emit-linked|emit-linked-module|emit-linked-bootstrap|emit-linked-native-bootstrap|run-linked|inspect-linked|emit-native-ir|inspect-native-ir|emit-native-abi|inspect-native-abi|emit-assembly|emit-assembly-native|build-native|compile-native|build-native-linked|compile-native-linked|build-native-bootstrap|compile-native-bootstrap|build-native-toolchain|compile-native-toolchain|build-native-selfhost|compile-native-selfhost|build|compile|build-linked|compile-linked|build-host|compile-host> <file> [args]"
+        "usage: apl <check|run|emit|run-ir|emit-module|emit-standard-module|emit-bootstrap-compiler|extend-module|emit-linked|emit-linked-module|emit-linked-bootstrap|emit-linked-native-bootstrap|run-linked|inspect-linked|emit-native-ir|inspect-native-ir|emit-assembly|emit-assembly-native|build-native|compile-native|build-native-linked|compile-native-linked|build-native-bootstrap|compile-native-bootstrap|build-native-toolchain|compile-native-toolchain|build-native-selfhost|compile-native-selfhost|build|compile|build-linked|compile-linked|build-host|compile-host> <file> [-- -1 value -2 value ...]"
     );
 }
 
@@ -660,14 +695,26 @@ fn exit_compile_error(verb: &str, error: apl_compiler::CompileError) -> ! {
         apl_compiler::CompileError::Runtime(apl_runtime::RuntimeError::Failed(message)) => {
             eprintln!("{verb} APL fail: {message}")
         }
+        apl_compiler::CompileError::Runtime(apl_runtime::RuntimeError::FailedWithCode {
+            message,
+            code,
+        }) => {
+            eprintln!("{message}");
+            process::exit(code);
+        }
         apl_compiler::CompileError::Runtime(error) => {
             eprintln!("{verb} runtime error: {error:?}")
         }
         apl_compiler::CompileError::Bootstrap(message) => {
             eprintln!("{verb} bootstrap error: {message}")
         }
-        apl_compiler::CompileError::LibraryNotFound { name, path } => {
-            eprintln!("{verb} library `{name}` not found at `{}`", path.display())
+        apl_compiler::CompileError::LibraryNotFound { name, searched } => {
+            let searched = searched
+                .iter()
+                .map(|path| format!("`{}`", path.display()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            eprintln!("{verb} library `{name}` not found; searched {searched}")
         }
     }
     process::exit(1);
@@ -708,10 +755,15 @@ fn finish_native_build(output: apl_compiler::NativeBuildOutput, compile: bool) {
 }
 
 fn compile_generated_package(package_name: &str, package_dir: &Path, manifest_path: &Path) {
+    let manifest_path = manifest_path
+        .canonicalize()
+        .unwrap_or_else(|_| manifest_path.to_path_buf());
     let status = process::Command::new("cargo")
         .arg("build")
+        .arg("--offline")
         .arg("--manifest-path")
-        .arg(manifest_path)
+        .arg(&manifest_path)
+        .current_dir(package_dir)
         .status()
         .unwrap_or_else(|error| {
             eprintln!("failed to invoke cargo build: {error}");

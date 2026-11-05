@@ -3,7 +3,7 @@
 
 AVStr assembly.MAGIC = "APLASM1"
 AVStr assembly.ENTRY_SYMBOL = "apl_program_entry"
-AVInt assembly.RUNTIME_ABI_VERSION = 1
+AVInt assembly.RUNTIME_ABI_VERSION = 2
 
 AVInt assembly.ARG_IMMEDIATE = 0
 AVInt assembly.ARG_POINTER = 1
@@ -361,6 +361,11 @@ func assembly.emit_instruction(instruction, index, tag, target, epilogue, state)
     return assembly.emit(state, join(["  jmp ", epilogue, "\n"], ""))
   }
 
+  if opcode == abi.OP_ERR_RETURN {
+    state = assembly.emit(state, assembly.call_prefix(target, "apl_rt_error_return", []))
+    return assembly.emit(state, join(["  jmp ", epilogue, "\n"], ""))
+  }
+
   if opcode == abi.OP_RETURN {
     state = assembly.emit(state, assembly.call_prefix(target, "apl_rt_return", [assembly.arg_immediate(get(instruction, 1))]))
     return assembly.emit(state, join(["  jmp ", epilogue, "\n"], ""))
@@ -392,7 +397,7 @@ func assembly.emit_instruction(instruction, index, tag, target, epilogue, state)
   }
 
   if opcode == abi.OP_LOOP_ENTER {
-    return assembly.emit_checked(state, target, "apl_rt_loop_enter", [assembly.arg_immediate(get(instruction, 1)), assembly.arg_immediate(get(instruction, 2))], epilogue)
+    return assembly.emit_checked(state, target, "apl_rt_loop_enter_dynamic", [assembly.arg_immediate(get(instruction, 1))], epilogue)
   }
 
   if opcode == abi.OP_LOOP_CHECK {

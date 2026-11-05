@@ -1,7 +1,8 @@
 use apl_core::{
     Assignment, AssignmentOperator, BinaryOperator, ElseIfBranch, Expression, FunctionDecl,
-    IfStatement, ListDecl, ListElement, PickStatement, Program, ProtectionLevel, Statement,
-    UnaryOperator, VTimeDecl, Value, ValueType, VariableDecl, VariableKind, WhileStatement,
+    IfStatement, ListDecl, ListElement, MatchCase, MatchPattern, MatchStatement, PickStatement,
+    Program, ProtectionLevel, Statement, UnaryOperator, VTimeDecl, Value, ValueType, VariableDecl,
+    VariableKind, WhileStatement,
 };
 
 const MAGIC: &[u8; 8] = b"APLIR001";
@@ -33,6 +34,18 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, IrError> {
         return Err(IrError::TrailingBytes);
     }
     Ok(Program::new(statements))
+}
+
+fn expression_int_literal(expression: &Expression) -> Option<i64> {
+    match expression {
+        Expression::Literal(Value::Int(value)) => Some(*value),
+        Expression::Unary {
+            operator: UnaryOperator::Negate,
+            expression,
+        } => expression_int_literal(expression)?.checked_neg(),
+        Expression::Grouped(expression) => expression_int_literal(expression),
+        _ => None,
+    }
 }
 
 struct Writer {
@@ -90,6 +103,18 @@ impl Writer {
                 self.u8(18);
                 self.string(symbol)?;
                 self.string(library)
+            }
+            Statement::UsingNamespace(namespace) => {
+                self.u8(21);
+                self.string(namespace)
+            }
+            Statement::NoConflicts(namespaces) => {
+                self.u8(22);
+                self.len(namespaces.len())?;
+                for namespace in namespaces {
+                    self.string(namespace)?;
+                }
+                Ok(())
             }
             Statement::VariableDecl(decl) => {
                 self.u8(0);
@@ -161,6 +186,11 @@ impl Writer {
                 self.u8(10);
                 self.expression(reason)
             }
+            Statement::ErrorReturn { message, code } => {
+                self.u8(26);
+                self.expression(message)?;
+                self.expression(code)
+            }
             Statement::Return(expression) => {
                 self.u8(11);
                 self.expression(expression)
@@ -170,10 +200,28 @@ impl Writer {
                 self.if_statement(if_statement)
             }
             Statement::While(while_statement) => {
-                self.u8(13);
-                self.expression(&while_statement.condition)?;
-                self.i64(while_statement.limit);
-                self.statements(&while_statement.body)
+                if while_statement.limit_body.is_some() || while_statement.else_body.is_some() {
+                    self.u8(24);
+                    self.expression(&while_statement.condition)?;
+                    self.expression(&while_statement.limit)?;
+                    self.statements(&while_statement.body)?;
+                    self.option_statements(while_statement.limit_body.as_deref())?;
+                    self.option_statements(while_statement.else_body.as_deref())
+                } else if let Some(limit) = expression_int_literal(&while_statement.limit) {
+                    self.u8(13);
+                    self.expression(&while_statement.condition)?;
+                    self.i64(limit);
+                    self.statements(&while_statement.body)
+                } else {
+                    self.u8(23);
+                    self.expression(&while_statement.condition)?;
+                    self.expression(&while_statement.limit)?;
+                    self.statements(&while_statement.body)
+                }
+            }
+            Statement::Match(match_statement) => {
+                self.u8(25);
+                self.match_statement(match_statement)
             }
             Statement::Pick(pick_statement) => {
                 self.u8(14);
@@ -208,6 +256,29 @@ impl Writer {
             self.statements(&branch.body)?;
         }
         self.option_statements(if_statement.else_body.as_deref())
+    }
+
+    fn match_statement(&mut self, match_statement: &MatchStatement) -> Result<(), IrError> {
+        self.expression(&match_statement.value)?;
+        self.len(match_statement.cases.len())?;
+        for case in &match_statement.cases {
+            self.len(case.patterns.len())?;
+            for pattern in &case.patterns {
+                match pattern {
+                    MatchPattern::Value(value) => {
+                        self.u8(0);
+                        self.expression(value)?;
+                    }
+                    MatchPattern::InclusiveRange { start, end } => {
+                        self.u8(1);
+                        self.expression(start)?;
+                        self.expression(end)?;
+                    }
+                }
+            }
+            self.statements(&case.body)?;
+        }
+        self.option_statements(match_statement.default_body.as_deref())
     }
 
     fn list_elements(&mut self, elements: &[ListElement]) -> Result<(), IrError> {
@@ -543,8 +614,10 @@ impl<'a> Reader<'a> {
             12 => Ok(Statement::If(self.if_statement()?)),
             13 => Ok(Statement::While(WhileStatement {
                 condition: self.expression()?,
-                limit: self.i64()?,
+                limit: Expression::Literal(Value::Int(self.i64()?)),
                 body: self.statements()?,
+                limit_body: None,
+                else_body: None,
             })),
             14 => Ok(Statement::Pick(PickStatement {
                 value: self.expression()?,
@@ -563,6 +636,34 @@ impl<'a> Reader<'a> {
                 list_name: self.string()?,
                 index: self.expression()?,
                 element: self.list_element()?,
+            }),
+            21 => Ok(Statement::UsingNamespace(self.string()?)),
+            22 => {
+                let len = self.len()?;
+                let mut namespaces = Vec::with_capacity(len);
+                for _ in 0..len {
+                    namespaces.push(self.string()?);
+                }
+                Ok(Statement::NoConflicts(namespaces))
+            }
+            23 => Ok(Statement::While(WhileStatement {
+                condition: self.expression()?,
+                limit: self.expression()?,
+                body: self.statements()?,
+                limit_body: None,
+                else_body: None,
+            })),
+            24 => Ok(Statement::While(WhileStatement {
+                condition: self.expression()?,
+                limit: self.expression()?,
+                body: self.statements()?,
+                limit_body: self.option_statements()?,
+                else_body: self.option_statements()?,
+            })),
+            25 => Ok(Statement::Match(self.match_statement()?)),
+            26 => Ok(Statement::ErrorReturn {
+                message: self.expression()?,
+                code: self.expression()?,
             }),
             tag => Err(IrError::InvalidTag {
                 kind: "Statement",
@@ -610,6 +711,40 @@ impl<'a> Reader<'a> {
             body,
             else_if_branches,
             else_body: self.option_statements()?,
+        })
+    }
+
+    fn match_statement(&mut self) -> Result<MatchStatement, IrError> {
+        let value = self.expression()?;
+        let case_count = self.len()?;
+        let mut cases = Vec::with_capacity(case_count);
+        for _ in 0..case_count {
+            let pattern_count = self.len()?;
+            let mut patterns = Vec::with_capacity(pattern_count);
+            for _ in 0..pattern_count {
+                patterns.push(match self.u8()? {
+                    0 => MatchPattern::Value(self.expression()?),
+                    1 => MatchPattern::InclusiveRange {
+                        start: self.expression()?,
+                        end: self.expression()?,
+                    },
+                    tag => {
+                        return Err(IrError::InvalidTag {
+                            kind: "MatchPattern",
+                            tag,
+                        })
+                    }
+                });
+            }
+            cases.push(MatchCase {
+                patterns,
+                body: self.statements()?,
+            });
+        }
+        Ok(MatchStatement {
+            value,
+            cases,
+            default_body: self.option_statements()?,
         })
     }
 
@@ -825,6 +960,8 @@ mod tests {
                 symbol: "pick".to_owned(),
                 library: "base".to_owned(),
             },
+            Statement::UsingNamespace("std".to_owned()),
+            Statement::NoConflicts(vec!["std".to_owned(), "math".to_owned()]),
             Statement::FunctionDecl(FunctionDecl {
                 name: "apl.id".to_owned(),
                 params: vec!["value".to_owned()],
@@ -893,6 +1030,52 @@ mod tests {
                 operator: BinaryOperator::Rem,
                 right: Box::new(Expression::Literal(Value::Int(2))),
             }),
+        ]);
+
+        assert_eq!(
+            decode_program(&encode_program(&program).unwrap()).unwrap(),
+            program
+        );
+    }
+
+    #[test]
+    fn round_trips_match_while_handlers_and_error_return() {
+        let program = Program::new(vec![
+            Statement::While(WhileStatement {
+                condition: Expression::Literal(Value::Bool(true)),
+                limit: Expression::Literal(Value::Int(2)),
+                body: vec![Statement::Out(Expression::Literal(Value::Str(
+                    "body".to_owned(),
+                )))],
+                limit_body: Some(vec![Statement::Out(Expression::Literal(Value::Str(
+                    "limit".to_owned(),
+                )))]),
+                else_body: Some(vec![Statement::Out(Expression::Literal(Value::Str(
+                    "else".to_owned(),
+                )))]),
+            }),
+            Statement::Match(MatchStatement {
+                value: Expression::Literal(Value::Int(4)),
+                cases: vec![MatchCase {
+                    patterns: vec![
+                        MatchPattern::Value(Expression::Literal(Value::Int(1))),
+                        MatchPattern::InclusiveRange {
+                            start: Expression::Literal(Value::Int(3)),
+                            end: Expression::Literal(Value::Int(5)),
+                        },
+                    ],
+                    body: vec![Statement::Out(Expression::Literal(Value::Str(
+                        "matched".to_owned(),
+                    )))],
+                }],
+                default_body: Some(vec![Statement::Out(Expression::Literal(Value::Str(
+                    "default".to_owned(),
+                )))]),
+            }),
+            Statement::ErrorReturn {
+                message: Expression::Literal(Value::Str("boom".to_owned())),
+                code: Expression::Literal(Value::Int(7)),
+            },
         ]);
 
         assert_eq!(

@@ -8,11 +8,12 @@ AVStr lexer.TOKEN_INT = "Int"
 AVStr lexer.TOKEN_FLOAT = "Float"
 AVStr lexer.TOKEN_STR = "Str"
 AVStr lexer.TOKEN_SYM = "Symbol"
+AVStr lexer.TOKEN_NEWLINE = "Newline"
 AVStr lexer.TOKEN_ERROR = "Error"
 AVStr lexer.TOKEN_EOF = "Eof"
 
-List lexer.KEYWORDS = ["include", "exclude", "if", "else", "while", "pick", "break", "continue",
-    "func", "return", "true", "false", "and", "or", "not",
+List lexer.KEYWORDS = ["include", "exclude", "using", "namespace", "nc", "if", "else", "while", "match", "case", "default", "pick", "break", "continue",
+    "class", "struct", "override", "func", "return", "ERR", "true", "false", "and", "or", "not",
     "out", "input", "secret", "secretup", "info", "stop", "fail", "NONE",
     "VTime", "List", "AV", "ASV", "SASV",
     "AVInt", "AVFloat", "AVBool", "AVStr", "AVBytes", "AVJson",
@@ -20,8 +21,8 @@ List lexer.KEYWORDS = ["include", "exclude", "if", "else", "while", "pick", "bre
     "SASVInt", "SASVFloat", "SASVBool", "SASVStr", "SASVBytes", "SASVJson"]
 
 List lexer.DIGITS = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
-List lexer.SINGLE_SYMBOLS = ["(", ")", "{", "}", "[", "]", ",", ":", "+", "-", "*", "/", "%", "=", "!", ">", "<"]
-List lexer.DOUBLE_SYMBOLS = ["==", "!=", ">=", "<=", ">>", "<<", "+=", "-=", "*=", "/=", "%=", "**"]
+List lexer.SINGLE_SYMBOLS = ["(", ")", "{", "}", "[", "]", ",", ":", "+", "-", "*", "/", "%", "=", "!", ">", "<", "@"]
+List lexer.DOUBLE_SYMBOLS = ["==", "!=", ">=", "<=", ">>", "<<", "+=", "-=", "*=", "/=", "%=", "**", "++", "--", ".."]
 
 func lexer.is_space(value) {
   if value == " " {
@@ -29,14 +30,6 @@ func lexer.is_space(value) {
   }
 
   if ord(value) == 9 {
-    return true
-  }
-
-  if ord(value) == 10 {
-    return true
-  }
-
-  if ord(value) == 13 {
     return true
   }
 
@@ -97,7 +90,13 @@ func lexer.position_at(source, offset) {
   VTime index = 0
 
   while ((index < offset) and (index < len(source))) (-1) {
-    if ord(source[index]) == 10 {
+    if ord(source[index]) == 13 {
+      if (index + 1 < offset) and (ord(source[index + 1]) == 10) {
+        index += 1
+      }
+      line += 1
+      column = 1
+    } else if ord(source[index]) == 10 {
       line += 1
       column = 1
     } else {
@@ -208,6 +207,7 @@ func lexer.tokenize_core(source, include_offsets) {
   VTime chars = []
   VTime index = 0
   VTime chars_index = 0
+  VTime continuation_depth = 0
 
   while (index < len(source)) (-1) {
     VTime ch = source[index]
@@ -224,6 +224,41 @@ func lexer.tokenize_core(source, include_offsets) {
 
       while ((index < len(source)) and (lexer.is_line_end(source[index]) == false)) (-1) {
         index += 1
+      }
+
+      continue
+    }
+
+    if lexer.is_line_end(ch) {
+      if len(chars) > 0 {
+        VTime text = join(chars, "")
+        add(tokens, lexer.make_token(lexer.token_type(text), text))
+        if include_offsets {
+          add(offsets, chars_index)
+        }
+        chars = []
+      }
+
+      index += 1
+      if (ord(ch) == 13) and (index < len(source)) {
+        if ord(source[index]) == 10 {
+          index += 1
+        }
+      }
+
+      if continuation_depth == 0 {
+        VTime add_newline = true
+        if len(tokens) > 0 {
+          if lexer.token_kind(get(tokens, len(tokens) - 1)) == lexer.TOKEN_NEWLINE {
+            add_newline = false
+          }
+        }
+        if add_newline {
+          add(tokens, lexer.make_token(lexer.TOKEN_NEWLINE, "\n"))
+          if include_offsets {
+            add(offsets, index)
+          }
+        }
       }
 
       continue
@@ -368,6 +403,14 @@ func lexer.tokenize_core(source, include_offsets) {
       add(tokens, lexer.make_token(lexer.TOKEN_SYM, ch))
       if include_offsets {
         add(offsets, index)
+      }
+
+      if (ch == "(") or (ch == "[") {
+        continuation_depth += 1
+      } else if (ch == ")") or (ch == "]") {
+        if continuation_depth > 0 {
+          continuation_depth -= 1
+        }
       }
       index += 1
       continue

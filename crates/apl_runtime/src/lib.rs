@@ -2,20 +2,175 @@ use apl_core::{
     AssignmentOperator, BinaryOperator, Expression, FunctionDecl, InfoAssignment, Program,
     ProtectionLevel, Statement, UnaryOperator, Value as AstValue, ValueType, VariableKind,
 };
-use std::{
-    collections::{HashMap, VecDeque},
-    rc::Rc,
+use apl_crypto::{sha1, sha256, sha3_384, sha512};
+use apl_raw_memory::{
+    AbiSignature, Descriptor, RawMemoryTable, ScopePolicy, State as RawMemoryState,
+    DESCRIPTOR_MAGIC,
 };
+use apl_windows::WindowsHost;
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
+    rc::Rc,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
+fn utc_datetime_fields() -> Result<[i64; 7], &'static str> {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| "system clock is before the Unix epoch")?;
+    let seconds = i64::try_from(elapsed.as_secs()).map_err(|_| "system time is out of range")?;
+    let days = seconds / 86_400;
+    let second_of_day = seconds % 86_400;
+
+    let shifted_days = days
+        .checked_add(719_468)
+        .ok_or("system time is out of range")?;
+    let era = if shifted_days >= 0 {
+        shifted_days / 146_097
+    } else {
+        (shifted_days - 146_096) / 146_097
+    };
+    let day_of_era = shifted_days - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_part = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_part + 2) / 5 + 1;
+    let month = month_part + if month_part < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+
+    Ok([
+        year,
+        month,
+        day,
+        second_of_day / 3_600,
+        second_of_day / 60 % 60,
+        second_of_day % 60,
+        i64::from(elapsed.subsec_millis()),
+    ])
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RunOutput {
     pub stdout: String,
 }
 
+#[derive(Debug, Default)]
+struct TimerState {
+    accumulated: Duration,
+    started_at: Option<Instant>,
+}
+
+impl TimerState {
+    fn start(&mut self) -> Result<(), &'static str> {
+        if self.started_at.is_some() {
+            return Err("timer is already running");
+        }
+        self.started_at = Some(Instant::now());
+        Ok(())
+    }
+
+    fn stop(&mut self) -> Result<(), &'static str> {
+        let Some(started_at) = self.started_at else {
+            return Err("timer is not running");
+        };
+        let accumulated = self
+            .accumulated
+            .checked_add(started_at.elapsed())
+            .ok_or("timer duration overflow")?;
+        self.accumulated = accumulated;
+        self.started_at = None;
+        Ok(())
+    }
+
+    fn elapsed(&self) -> Result<Duration, &'static str> {
+        match self.started_at {
+            Some(started_at) => self
+                .accumulated
+                .checked_add(started_at.elapsed())
+                .ok_or("timer duration overflow"),
+            None => Ok(self.accumulated),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct NumberedInputArguments {
+    values: BTreeMap<usize, String>,
+}
+
+impl NumberedInputArguments {
+    pub fn iter(&self) -> impl Iterator<Item = (usize, &str)> {
+        self.values
+            .iter()
+            .map(|(index, value)| (*index, value.as_str()))
+    }
+}
+
+pub fn parse_numbered_input_arguments(
+    arguments: &[String],
+) -> Result<NumberedInputArguments, String> {
+    let mut values = BTreeMap::new();
+    let mut cursor = 0;
+
+    while cursor < arguments.len() {
+        let flag = &arguments[cursor];
+        let Some(index) = flag
+            .strip_prefix('-')
+            .filter(|value| !value.is_empty() && value.chars().all(|ch| ch.is_ascii_digit()))
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|index| *index > 0)
+        else {
+            return Err(format!(
+                "expected a numbered input flag such as `-1`, got `{flag}`"
+            ));
+        };
+        let Some(value) = arguments.get(cursor + 1) else {
+            return Err(format!("input flag `-{index}` requires a value"));
+        };
+        if values.insert(index, value.clone()).is_some() {
+            return Err(format!("duplicate input flag `-{index}`"));
+        }
+        cursor += 2;
+    }
+
+    Ok(NumberedInputArguments { values })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DebugSourceLocation {
+    pub path: Vec<usize>,
+    pub line: usize,
+    pub column: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DebugVariable {
+    pub name: String,
+    pub value: String,
+    pub protection: ProtectionLevel,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DebugSnapshot {
+    pub location: DebugSourceLocation,
+    pub call_stack: Vec<String>,
+    pub variables: Vec<DebugVariable>,
+    pub stdout: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DebugAction {
+    Continue,
+    Stop,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum RuntimeError {
     Message(String),
     Failed(String),
+    FailedWithCode { message: String, code: i32 },
 }
 
 impl RuntimeError {
@@ -23,6 +178,7 @@ impl RuntimeError {
         match self {
             Self::Message(message) => Self::Message(format!("{message}\n  in `{name}`")),
             Self::Failed(message) => Self::Failed(message),
+            Self::FailedWithCode { message, code } => Self::FailedWithCode { message, code },
         }
     }
 }
@@ -33,6 +189,7 @@ pub struct CompiledProgram {
     functions: HashMap<String, CompiledFunction>,
     blocks: Vec<CompiledBlock>,
     code: Vec<StatementOp>,
+    source_locations: Vec<Option<DebugSourceLocation>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -70,6 +227,10 @@ enum StatementOp {
     Out(CompiledExpression),
     Stop(Option<CompiledExpression>),
     Fail(CompiledExpression),
+    ErrorReturn {
+        message: CompiledExpression,
+        code: CompiledExpression,
+    },
     Return(CompiledExpression),
     Jump {
         target_pc: usize,
@@ -81,8 +242,10 @@ enum StatementOp {
     ExecScopedBlock(BlockId),
     LoopCheck {
         condition: CompiledExpression,
-        limit: i64,
-        exit_pc: usize,
+        limit: CompiledExpression,
+        normal_exit_pc: usize,
+        limit_exit_pc: usize,
+        else_exit_pc: usize,
     },
     ExecLoopBody {
         body: BlockId,
@@ -94,8 +257,22 @@ enum StatementOp {
         item_name: String,
         body: BlockId,
     },
+    Match {
+        value: CompiledExpression,
+        cases: Vec<(Vec<CompiledMatchPattern>, BlockId)>,
+        default_body: Option<BlockId>,
+    },
     Break,
     Continue,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum CompiledMatchPattern {
+    Value(CompiledExpression),
+    InclusiveRange {
+        start: CompiledExpression,
+        end: CompiledExpression,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -180,15 +357,29 @@ pub fn run_program(program: &Program, input: Vec<String>) -> Result<RunOutput, R
     run_compiled_program(&compiled, input)
 }
 
+pub fn run_program_with_arguments(
+    program: &Program,
+    input: Vec<String>,
+    arguments: &[String],
+) -> Result<RunOutput, RuntimeError> {
+    let compiled = compile_program(program)?;
+    run_compiled_program_with_arguments(&compiled, input, arguments)
+}
+
 pub fn compile_program(program: &Program) -> Result<CompiledProgram, RuntimeError> {
-    let mut compiler = StatementCompiler::new();
+    let mut compiler = StatementCompiler::new(&[]);
     let mut functions = HashMap::new();
     let mut entry_statements = Vec::new();
+    let mut has_main = false;
 
     for statement in &program.statements {
         if let Statement::FunctionDecl(function) = statement {
+            has_main |= function.name == "std::main";
             if functions
-                .insert(function.name.clone(), compiler.compile_function(function)?)
+                .insert(
+                    function.name.clone(),
+                    compiler.compile_function(function, &[])?,
+                )
                 .is_some()
             {
                 return Err(RuntimeError::Message(format!(
@@ -200,44 +391,170 @@ pub fn compile_program(program: &Program) -> Result<CompiledProgram, RuntimeErro
             entry_statements.push(statement.clone());
         }
     }
-
-    let entry = compiler.compile_block(&entry_statements)?;
+    if has_main {
+        entry_statements.push(Statement::Expression(Expression::Call {
+            name: "std::main".to_owned(),
+            args: Vec::new(),
+        }));
+    }
+    let entry = compiler.compile_block(&entry_statements, &[])?;
     Ok(CompiledProgram {
         entry,
         functions,
         blocks: compiler.blocks,
         code: compiler.code,
+        source_locations: compiler.compiled_locations,
+    })
+}
+
+pub fn compile_program_with_locations(
+    program: &Program,
+    locations: &[DebugSourceLocation],
+) -> Result<CompiledProgram, RuntimeError> {
+    let mut compiler = StatementCompiler::new(locations);
+    let mut functions = HashMap::new();
+    let mut entry_statements = Vec::new();
+    let mut has_main = false;
+
+    for (index, statement) in program.statements.iter().enumerate() {
+        let path = vec![index];
+        if let Statement::FunctionDecl(function) = statement {
+            has_main |= function.name == "std::main";
+            if functions
+                .insert(
+                    function.name.clone(),
+                    compiler.compile_function(function, &path)?,
+                )
+                .is_some()
+            {
+                return Err(RuntimeError::Message(format!(
+                    "duplicate function `{}`",
+                    function.name
+                )));
+            }
+        } else {
+            entry_statements.push((statement, Some(path)));
+        }
+    }
+
+    let main_entry = has_main.then(|| {
+        Statement::Expression(Expression::Call {
+            name: "std::main".to_owned(),
+            args: Vec::new(),
+        })
+    });
+    if let Some(main_entry) = &main_entry {
+        entry_statements.push((main_entry, None));
+    }
+
+    let entry = compiler.compile_mapped_block(&entry_statements)?;
+    Ok(CompiledProgram {
+        entry,
+        functions,
+        blocks: compiler.blocks,
+        code: compiler.code,
+        source_locations: compiler.compiled_locations,
     })
 }
 
 struct StatementCompiler {
     blocks: Vec<CompiledBlock>,
     code: Vec<StatementOp>,
+    source_locations: HashMap<Vec<usize>, DebugSourceLocation>,
+    compiled_locations: Vec<Option<DebugSourceLocation>>,
 }
 
 impl StatementCompiler {
-    fn new() -> Self {
+    fn new(locations: &[DebugSourceLocation]) -> Self {
         Self {
             blocks: Vec::new(),
             code: Vec::new(),
+            source_locations: locations
+                .iter()
+                .cloned()
+                .map(|location| (location.path.clone(), location))
+                .collect(),
+            compiled_locations: Vec::new(),
         }
     }
 
     fn compile_function(
         &mut self,
         function: &FunctionDecl,
+        path: &[usize],
     ) -> Result<CompiledFunction, RuntimeError> {
+        let body_path = if self.source_locations.is_empty() {
+            Vec::new()
+        } else {
+            nested_path(Some(path), 0)
+        };
         Ok(CompiledFunction {
             params: function.params.clone(),
-            body: self.compile_block(&function.body)?,
+            body: self.compile_block(&function.body, &body_path)?,
         })
     }
 
-    fn compile_block(&mut self, statements: &[Statement]) -> Result<BlockId, RuntimeError> {
-        let mut ops = Vec::new();
-        for statement in statements {
-            ops.extend(self.compile_statement(statement, ops.len())?);
+    fn compile_block(
+        &mut self,
+        statements: &[Statement],
+        base_path: &[usize],
+    ) -> Result<BlockId, RuntimeError> {
+        if self.source_locations.is_empty() {
+            let mut ops = Vec::new();
+            for statement in statements {
+                ops.extend(self.compile_statement(statement, ops.len(), None)?);
+            }
+            let locations = vec![None; ops.len()];
+            return self.finish_block(ops, locations);
         }
+        let mapped = statements
+            .iter()
+            .enumerate()
+            .map(|(index, statement)| {
+                let mut path = base_path.to_vec();
+                path.push(index);
+                (statement, Some(path))
+            })
+            .collect::<Vec<_>>();
+        self.compile_mapped_block(&mapped)
+    }
+
+    fn compile_mapped_block(
+        &mut self,
+        statements: &[(&Statement, Option<Vec<usize>>)],
+    ) -> Result<BlockId, RuntimeError> {
+        if self.source_locations.is_empty() {
+            let mut ops = Vec::new();
+            for &(statement, _) in statements {
+                ops.extend(self.compile_statement(statement, ops.len(), None)?);
+            }
+            let locations = vec![None; ops.len()];
+            return self.finish_block(ops, locations);
+        }
+        let mut ops = Vec::new();
+        let mut locations = Vec::new();
+        for &(statement, ref path) in statements {
+            let statement_ops = self.compile_statement(statement, ops.len(), path.as_deref())?;
+            let location = path
+                .as_ref()
+                .and_then(|path| self.source_locations.get(path))
+                .cloned();
+            locations.extend(
+                statement_ops
+                    .iter()
+                    .enumerate()
+                    .map(|(index, _)| (index == 0).then(|| location.clone()).flatten()),
+            );
+            ops.extend(statement_ops);
+        }
+        self.finish_block(ops, locations)
+    }
+
+    fn finish_block(
+        &mut self,
+        mut ops: Vec<StatementOp>,
+        locations: Vec<Option<DebugSourceLocation>>,
+    ) -> Result<BlockId, RuntimeError> {
         let start = self.code.len();
         for op in &mut ops {
             absolutize_statement_op_pcs(op, start);
@@ -245,6 +562,7 @@ impl StatementCompiler {
         let end = start + ops.len();
         let id = self.blocks.len();
         self.code.extend(ops);
+        self.compiled_locations.extend(locations);
         self.blocks.push(CompiledBlock { start, end });
         Ok(id)
     }
@@ -253,9 +571,13 @@ impl StatementCompiler {
         &mut self,
         statement: &Statement,
         base_pc: usize,
+        path: Option<&[usize]>,
     ) -> Result<Vec<StatementOp>, RuntimeError> {
         let op = match statement {
-            Statement::Include(_) | Statement::Exclude { .. } => return Ok(Vec::new()),
+            Statement::Include(_)
+            | Statement::Exclude { .. }
+            | Statement::UsingNamespace(_)
+            | Statement::NoConflicts(_) => return Ok(Vec::new()),
             Statement::VariableDecl(decl) => StatementOp::VariableDecl(CompiledVariableDecl {
                 kind: decl.kind,
                 value_type: decl.value_type,
@@ -299,29 +621,119 @@ impl StatementCompiler {
             Statement::Out(expression) => StatementOp::Out(compile_expression(expression)),
             Statement::Stop(reason) => StatementOp::Stop(reason.as_ref().map(compile_expression)),
             Statement::Fail(reason) => StatementOp::Fail(compile_expression(reason)),
+            Statement::ErrorReturn { message, code } => StatementOp::ErrorReturn {
+                message: compile_expression(message),
+                code: compile_expression(code),
+            },
             Statement::Return(expression) => StatementOp::Return(compile_expression(expression)),
             Statement::If(if_statement) => {
-                return self.compile_if_statement(if_statement, base_pc);
+                return self.compile_if_statement(if_statement, base_pc, path);
             }
             Statement::While(while_statement) => {
-                return Ok(vec![
+                let mut ops = vec![
                     StatementOp::LoopCheck {
                         condition: compile_expression(&while_statement.condition),
-                        limit: while_statement.limit,
-                        exit_pc: base_pc + 3,
+                        limit: compile_expression(&while_statement.limit),
+                        normal_exit_pc: 0,
+                        limit_exit_pc: 0,
+                        else_exit_pc: 0,
                     },
                     StatementOp::ExecLoopBody {
-                        body: self.compile_block(&while_statement.body)?,
+                        body: self.compile_nested_block(&while_statement.body, path, 0)?,
                         continue_pc: base_pc,
-                        break_pc: base_pc + 3,
+                        break_pc: 0,
                     },
                     StatementOp::Jump { target_pc: base_pc },
-                ]);
+                ];
+                let mut limit_jump_index = None;
+                let limit_exit_pc = if let Some(body) = &while_statement.limit_body {
+                    let pc = base_pc + ops.len();
+                    ops.push(StatementOp::ExecScopedBlock(
+                        self.compile_nested_block(body, path, 1)?,
+                    ));
+                    limit_jump_index = Some(ops.len());
+                    ops.push(StatementOp::Jump { target_pc: 0 });
+                    pc
+                } else {
+                    0
+                };
+                let else_exit_pc = if let Some(body) = &while_statement.else_body {
+                    let pc = base_pc + ops.len();
+                    ops.push(StatementOp::ExecScopedBlock(
+                        self.compile_nested_block(body, path, 2)?,
+                    ));
+                    pc
+                } else {
+                    0
+                };
+                let end_pc = base_pc + ops.len();
+                if let StatementOp::LoopCheck {
+                    normal_exit_pc,
+                    limit_exit_pc: target_limit,
+                    else_exit_pc: target_else,
+                    ..
+                } = &mut ops[0]
+                {
+                    *normal_exit_pc = end_pc;
+                    *target_limit = if limit_exit_pc == 0 {
+                        end_pc
+                    } else {
+                        limit_exit_pc
+                    };
+                    *target_else = if else_exit_pc == 0 {
+                        end_pc
+                    } else {
+                        else_exit_pc
+                    };
+                }
+                if let StatementOp::ExecLoopBody { break_pc, .. } = &mut ops[1] {
+                    *break_pc = end_pc;
+                }
+                if let Some(index) = limit_jump_index {
+                    if let StatementOp::Jump { target_pc } = &mut ops[index] {
+                        *target_pc = end_pc;
+                    }
+                }
+                return Ok(ops);
+            }
+            Statement::Match(match_statement) => {
+                let mut cases = Vec::with_capacity(match_statement.cases.len());
+                for (index, case) in match_statement.cases.iter().enumerate() {
+                    let patterns = case
+                        .patterns
+                        .iter()
+                        .map(|pattern| match pattern {
+                            apl_core::MatchPattern::Value(value) => {
+                                CompiledMatchPattern::Value(compile_expression(value))
+                            }
+                            apl_core::MatchPattern::InclusiveRange { start, end } => {
+                                CompiledMatchPattern::InclusiveRange {
+                                    start: compile_expression(start),
+                                    end: compile_expression(end),
+                                }
+                            }
+                        })
+                        .collect();
+                    cases.push((
+                        patterns,
+                        self.compile_nested_block(&case.body, path, index)?,
+                    ));
+                }
+                let default_body = match_statement
+                    .default_body
+                    .as_deref()
+                    .map(|body| self.compile_nested_block(body, path, match_statement.cases.len()))
+                    .transpose()?;
+                StatementOp::Match {
+                    value: compile_expression(&match_statement.value),
+                    cases,
+                    default_body,
+                }
             }
             Statement::Pick(pick_statement) => StatementOp::Pick {
                 value: compile_expression(&pick_statement.value),
                 item_name: pick_statement.item_name.clone(),
-                body: self.compile_block(&pick_statement.body)?,
+                body: self.compile_nested_block(&pick_statement.body, path, 0)?,
             },
             Statement::Break => StatementOp::Break,
             Statement::Continue => StatementOp::Continue,
@@ -333,22 +745,25 @@ impl StatementCompiler {
         &mut self,
         if_statement: &apl_core::IfStatement,
         base_pc: usize,
+        path: Option<&[usize]>,
     ) -> Result<Vec<StatementOp>, RuntimeError> {
         let mut branches = Vec::new();
         branches.push((
             compile_expression(&if_statement.condition),
-            self.compile_block(&if_statement.body)?,
+            self.compile_nested_block(&if_statement.body, path, 0)?,
         ));
-        for branch in &if_statement.else_if_branches {
+        for (index, branch) in if_statement.else_if_branches.iter().enumerate() {
             branches.push((
                 compile_expression(&branch.condition),
-                self.compile_block(&branch.body)?,
+                self.compile_nested_block(&branch.body, path, index + 1)?,
             ));
         }
         let else_body = if_statement
             .else_body
             .as_deref()
-            .map(|body| self.compile_block(body))
+            .map(|body| {
+                self.compile_nested_block(body, path, if_statement.else_if_branches.len() + 1)
+            })
             .transpose()?;
 
         let branch_count = branches.len();
@@ -379,16 +794,41 @@ impl StatementCompiler {
         }
         Ok(ops)
     }
+
+    fn compile_nested_block(
+        &mut self,
+        statements: &[Statement],
+        path: Option<&[usize]>,
+        segment: usize,
+    ) -> Result<BlockId, RuntimeError> {
+        if self.source_locations.is_empty() {
+            self.compile_block(statements, &[])
+        } else {
+            self.compile_block(statements, &nested_path(path, segment))
+        }
+    }
+}
+
+fn nested_path(path: Option<&[usize]>, segment: usize) -> Vec<usize> {
+    let mut nested = path.unwrap_or_default().to_vec();
+    nested.push(segment);
+    nested
 }
 
 fn absolutize_statement_op_pcs(op: &mut StatementOp, block_start: usize) {
     match op {
-        StatementOp::Jump { target_pc }
-        | StatementOp::JumpIfFalse { target_pc, .. }
-        | StatementOp::LoopCheck {
-            exit_pc: target_pc, ..
-        } => {
+        StatementOp::Jump { target_pc } | StatementOp::JumpIfFalse { target_pc, .. } => {
             *target_pc += block_start;
+        }
+        StatementOp::LoopCheck {
+            normal_exit_pc,
+            limit_exit_pc,
+            else_exit_pc,
+            ..
+        } => {
+            *normal_exit_pc += block_start;
+            *limit_exit_pc += block_start;
+            *else_exit_pc += block_start;
         }
         StatementOp::ExecLoopBody {
             continue_pc,
@@ -440,7 +880,7 @@ fn compile_expression_ops(expression: &Expression, ops: &mut Vec<ExpressionOp>) 
                 compile_expression_ops(arg, ops);
             }
             ops.push(ExpressionOp::Call {
-                name: name.clone(),
+                name: runtime_call_name(name),
                 arg_count: args.len(),
                 arg_forms: args.iter().map(expression_form).collect(),
             });
@@ -493,6 +933,16 @@ fn compile_expression_ops(expression: &Expression, ops: &mut Vec<ExpressionOp>) 
     }
 }
 
+fn runtime_call_name(name: &str) -> String {
+    if name == "std::main" {
+        name.to_owned()
+    } else if let Some(symbol) = name.strip_prefix("std::") {
+        symbol.to_owned()
+    } else {
+        name.replace("::", ".")
+    }
+}
+
 fn expression_form(expression: &Expression) -> ExpressionForm {
     match expression {
         Expression::Input => ExpressionForm::Input,
@@ -516,19 +966,86 @@ pub fn run_compiled_program(
     runtime.run(program)
 }
 
+pub fn run_compiled_program_with_arguments(
+    program: &CompiledProgram,
+    input: Vec<String>,
+    arguments: &[String],
+) -> Result<RunOutput, RuntimeError> {
+    let arguments = parse_numbered_input_arguments(arguments)
+        .map_err(|message| RuntimeError::Message(format!("input argument error: {message}")))?;
+    let mut runtime = Runtime::new_with_arguments(input, arguments);
+    runtime.run(program)
+}
+
+pub fn run_program_debug<F>(
+    program: &Program,
+    locations: &[DebugSourceLocation],
+    input: Vec<String>,
+    mut hook: F,
+) -> Result<RunOutput, RuntimeError>
+where
+    F: FnMut(&DebugSnapshot) -> DebugAction,
+{
+    let compiled = compile_program_with_locations(program, locations)?;
+    let mut runtime = Runtime::new_debug(input, &mut hook);
+    runtime.run(&compiled)
+}
+
 pub fn run_ir_bytes(bytes: &[u8], input: Vec<String>) -> Result<RunOutput, RuntimeError> {
     let program = compile_ir_bytes(bytes)?;
     run_compiled_program(&program, input)
 }
 
-struct Runtime<'a> {
+pub fn run_ir_bytes_with_arguments(
+    bytes: &[u8],
+    input: Vec<String>,
+    arguments: &[String],
+) -> Result<RunOutput, RuntimeError> {
+    let program = compile_ir_bytes(bytes)?;
+    run_compiled_program_with_arguments(&program, input, arguments)
+}
+
+struct RuntimeInput {
+    stdin: VecDeque<String>,
+    arguments: BTreeMap<usize, String>,
+    next_slot: usize,
+}
+
+impl RuntimeInput {
+    fn new(stdin: Vec<String>, arguments: NumberedInputArguments) -> Self {
+        Self {
+            stdin: stdin.into(),
+            arguments: arguments.values,
+            next_slot: 1,
+        }
+    }
+
+    fn read(&mut self) -> Result<(Option<String>, bool, usize), RuntimeError> {
+        let slot = self.next_slot;
+        self.next_slot = self
+            .next_slot
+            .checked_add(1)
+            .ok_or_else(|| RuntimeError::Message("input slot counter overflow".to_owned()))?;
+        if let Some(value) = self.arguments.remove(&slot) {
+            return Ok((Some(value), true, slot));
+        }
+        Ok((self.stdin.pop_front(), false, slot))
+    }
+}
+
+struct Runtime<'a, 'debug> {
     program: Option<&'a CompiledProgram>,
     absolute: HashMap<String, AbsoluteSlot>,
     lists: HashMap<String, RuntimeValue>,
     scopes: Vec<HashMap<String, RuntimeValue>>,
-    input: VecDeque<String>,
+    input: RuntimeInput,
     stdout: String,
     stopped: bool,
+    debug_hook: Option<&'debug mut dyn FnMut(&DebugSnapshot) -> DebugAction>,
+    call_stack: Vec<String>,
+    timer: TimerState,
+    raw_memory: RawMemoryTable,
+    windows: WindowsHost,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -589,6 +1106,158 @@ impl RuntimeData {
     }
 }
 
+fn runtime_descriptor(descriptor: Descriptor) -> RuntimeValue {
+    RuntimeValue::list(vec![
+        RuntimeValue::str(DESCRIPTOR_MAGIC.to_owned()),
+        RuntimeValue::new(RuntimeData::Int(descriptor.id), ProtectionLevel::Av),
+        RuntimeValue::new(RuntimeData::Int(descriptor.address), ProtectionLevel::Av),
+        RuntimeValue::str(descriptor.origin.name().to_owned()),
+    ])
+}
+
+fn runtime_int(value: &RuntimeValue, label: &str) -> Result<i64, RuntimeError> {
+    match value.data {
+        RuntimeData::Int(value) => Ok(value),
+        _ => Err(RuntimeError::Message(format!("{label} must be Int"))),
+    }
+}
+
+fn runtime_str(value: &RuntimeValue, label: &str) -> Result<String, RuntimeError> {
+    match &value.data {
+        RuntimeData::Str(value) => Ok(value.as_str().to_owned()),
+        _ => Err(RuntimeError::Message(format!("{label} must be Str"))),
+    }
+}
+
+fn runtime_bool_value(value: &RuntimeValue, label: &str) -> Result<bool, RuntimeError> {
+    match value.data {
+        RuntimeData::Bool(value) => Ok(value),
+        _ => Err(RuntimeError::Message(format!("{label} must be Bool"))),
+    }
+}
+
+fn runtime_pointer_id(table: &RawMemoryTable, value: &RuntimeValue) -> Result<i64, RuntimeError> {
+    if let RuntimeData::List(values) = &value.data {
+        if values.len() == 4
+            && matches!(&values[0].data, RuntimeData::Str(magic) if magic.as_str() == DESCRIPTOR_MAGIC)
+        {
+            return runtime_int(&values[1], "raw-memory descriptor ID");
+        }
+    }
+    let number = runtime_int(value, "raw-memory target")?;
+    table.resolve_number(number).map_err(RuntimeError::Message)
+}
+
+fn runtime_signature(value: &RuntimeValue) -> Result<Option<AbiSignature>, RuntimeError> {
+    if matches!(value.data, RuntimeData::None) {
+        return Ok(None);
+    }
+    let RuntimeData::List(parts) = &value.data else {
+        return Err(RuntimeError::Message(
+            "memory::load ABI must be NONE or [convention, argument_types, result_type]".to_owned(),
+        ));
+    };
+    if parts.len() != 3 {
+        return Err(RuntimeError::Message(
+            "memory::load ABI must contain convention, argument types, and result type".to_owned(),
+        ));
+    }
+    Ok(Some(AbiSignature {
+        convention: runtime_str(&parts[0], "ABI convention")?,
+        argument_types: runtime_string_list(&parts[1], "ABI argument types")?,
+        result_type: runtime_str(&parts[2], "ABI result type")?,
+    }))
+}
+
+fn runtime_string_list(value: &RuntimeValue, label: &str) -> Result<Vec<String>, RuntimeError> {
+    let RuntimeData::List(values) = &value.data else {
+        return Err(RuntimeError::Message(format!("{label} must be List")));
+    };
+    values
+        .iter()
+        .map(|value| runtime_str(value, label))
+        .collect()
+}
+
+fn runtime_accelerator_entries(
+    value: &RuntimeValue,
+) -> Result<Vec<apl_windows::AcceleratorEntry>, RuntimeError> {
+    let RuntimeData::List(entries) = &value.data else {
+        return Err(RuntimeError::Message(
+            "windows::create_accelerators entries must be List".to_owned(),
+        ));
+    };
+    entries
+        .iter()
+        .map(|entry| {
+            let RuntimeData::List(parts) = &entry.data else {
+                return Err(RuntimeError::Message(
+                    "each accelerator entry must be [key, command, modifiers]".to_owned(),
+                ));
+            };
+            if parts.len() != 3 {
+                return Err(RuntimeError::Message(
+                    "each accelerator entry must be [key, command, modifiers]".to_owned(),
+                ));
+            }
+            Ok(apl_windows::AcceleratorEntry {
+                key: runtime_int(&parts[0], "accelerator key")?,
+                command: runtime_int(&parts[1], "accelerator command")?,
+                modifiers: runtime_int(&parts[2], "accelerator modifiers")?,
+            })
+        })
+        .collect()
+}
+
+fn runtime_call_arguments(
+    table: &RawMemoryTable,
+    value: &RuntimeValue,
+) -> Result<Vec<i64>, RuntimeError> {
+    let RuntimeData::List(values) = &value.data else {
+        return Err(RuntimeError::Message(
+            "call arguments must be List".to_owned(),
+        ));
+    };
+    values
+        .iter()
+        .map(|value| {
+            if matches!(value.data, RuntimeData::List(_)) {
+                let id = runtime_pointer_id(table, value)?;
+                return table
+                    .descriptor(id)
+                    .map(|descriptor| descriptor.address)
+                    .map_err(RuntimeError::Message);
+            }
+            runtime_int(value, "call argument")
+        })
+        .collect()
+}
+
+fn runtime_scope_policy(value: &RuntimeValue) -> Result<ScopePolicy, RuntimeError> {
+    let names = runtime_string_list(value, "raw-memory scope policy")?;
+    Ok(ScopePolicy {
+        marked: names.iter().any(|name| name == "marked"),
+        collector: names.iter().any(|name| name == "collector"),
+        flee: names.iter().any(|name| name == "flee"),
+    })
+}
+
+fn collect_runtime_pointer_roots(value: &RuntimeValue, roots: &mut BTreeSet<i64>) {
+    let RuntimeData::List(values) = &value.data else {
+        return;
+    };
+    if values.len() == 4
+        && matches!(&values[0].data, RuntimeData::Str(magic) if magic.as_str() == DESCRIPTOR_MAGIC)
+    {
+        if let RuntimeData::Int(id) = values[1].data {
+            roots.insert(id);
+        }
+    }
+    for value in values.iter() {
+        collect_runtime_pointer_roots(value, roots);
+    }
+}
+
 enum Flow {
     None,
     Break,
@@ -602,25 +1271,60 @@ struct BlockFrame {
     block_id: BlockId,
     pc: usize,
     loop_iterations: HashMap<usize, i64>,
+    loop_limits: HashMap<usize, i64>,
 }
 
-impl<'a> Runtime<'a> {
+impl<'a, 'debug> Runtime<'a, 'debug> {
     fn new(input: Vec<String>) -> Self {
+        Self::new_with_arguments(input, NumberedInputArguments::default())
+    }
+
+    fn new_with_arguments(input: Vec<String>, arguments: NumberedInputArguments) -> Self {
         Self {
             program: None,
             absolute: HashMap::new(),
             lists: HashMap::new(),
             scopes: Vec::new(),
-            input: input.into(),
+            input: RuntimeInput::new(input, arguments),
             stdout: String::new(),
             stopped: false,
+            debug_hook: None,
+            call_stack: Vec::new(),
+            timer: TimerState::default(),
+            raw_memory: RawMemoryTable::new(),
+            windows: WindowsHost::default(),
         }
+    }
+
+    fn new_debug(
+        input: Vec<String>,
+        hook: &'debug mut dyn FnMut(&DebugSnapshot) -> DebugAction,
+    ) -> Self {
+        let mut runtime = Self::new(input);
+        runtime.debug_hook = Some(hook);
+        runtime
+    }
+
+    fn raw_memory_roots(&self) -> BTreeSet<i64> {
+        let mut roots = BTreeSet::new();
+        for slot in self.absolute.values() {
+            collect_runtime_pointer_roots(&slot.current, &mut roots);
+        }
+        for value in self.lists.values() {
+            collect_runtime_pointer_roots(value, &mut roots);
+        }
+        for scope in &self.scopes {
+            for value in scope.values() {
+                collect_runtime_pointer_roots(value, &mut roots);
+            }
+        }
+        roots
     }
 
     fn run(&mut self, program: &'a CompiledProgram) -> Result<RunOutput, RuntimeError> {
         self.program = Some(program);
 
-        match self.exec_block(program.entry)? {
+        match self.exec_active_block(program.entry)? {
             Flow::None | Flow::Stop => Ok(RunOutput {
                 stdout: self.stdout.clone(),
             }),
@@ -639,9 +1343,10 @@ impl<'a> Runtime<'a> {
             block_id,
             pc: block.start,
             loop_iterations: HashMap::new(),
+            loop_limits: HashMap::new(),
         };
 
-        while let Some(op) = self.next_statement_op(&mut frame)? {
+        while let Some((_, op)) = self.next_statement_op(&mut frame)? {
             let flow = self.exec_statement_op(&mut frame, &op)?;
             if self.stopped {
                 return Ok(Flow::Stop);
@@ -653,10 +1358,46 @@ impl<'a> Runtime<'a> {
         Ok(Flow::None)
     }
 
+    fn exec_debug_block(&mut self, block_id: BlockId) -> Result<Flow, RuntimeError> {
+        let block = self
+            .program
+            .and_then(|program| program.blocks.get(block_id))
+            .ok_or_else(|| RuntimeError::Message(format!("unknown block `{block_id}`")))?;
+        let mut frame = BlockFrame {
+            block_id,
+            pc: block.start,
+            loop_iterations: HashMap::new(),
+            loop_limits: HashMap::new(),
+        };
+
+        while let Some((pc, op)) = self.next_statement_op(&mut frame)? {
+            if self.debug_before(pc) == DebugAction::Stop {
+                self.stopped = true;
+                return Ok(Flow::Stop);
+            }
+            let flow = self.exec_statement_op(&mut frame, &op)?;
+            if self.stopped {
+                return Ok(Flow::Stop);
+            }
+            if !matches!(flow, Flow::None) {
+                return Ok(flow);
+            }
+        }
+        Ok(Flow::None)
+    }
+
+    fn exec_active_block(&mut self, block_id: BlockId) -> Result<Flow, RuntimeError> {
+        if self.debug_hook.is_some() {
+            self.exec_debug_block(block_id)
+        } else {
+            self.exec_block(block_id)
+        }
+    }
+
     fn next_statement_op(
         &self,
         frame: &mut BlockFrame,
-    ) -> Result<Option<StatementOp>, RuntimeError> {
+    ) -> Result<Option<(usize, StatementOp)>, RuntimeError> {
         let block = self
             .program
             .and_then(|program| program.blocks.get(frame.block_id))
@@ -664,17 +1405,56 @@ impl<'a> Runtime<'a> {
         if frame.pc >= block.end {
             return Ok(None);
         }
+        let pc = frame.pc;
         let op = self
             .program
             .and_then(|program| program.code.get(frame.pc))
             .cloned()
             .ok_or_else(|| RuntimeError::Message(format!("unknown pc `{}`", frame.pc)))?;
         frame.pc += 1;
-        Ok(Some(op))
+        Ok(Some((pc, op)))
+    }
+
+    fn debug_before(&mut self, pc: usize) -> DebugAction {
+        let Some(location) = self
+            .program
+            .and_then(|program| program.source_locations.get(pc))
+            .and_then(Option::as_ref)
+            .cloned()
+        else {
+            return DebugAction::Continue;
+        };
+        let snapshot = self.debug_snapshot(location);
+        self.debug_hook
+            .as_mut()
+            .map_or(DebugAction::Continue, |hook| hook(&snapshot))
+    }
+
+    fn debug_snapshot(&self, location: DebugSourceLocation) -> DebugSnapshot {
+        let mut visible = HashMap::new();
+        for (name, slot) in &self.absolute {
+            visible.insert(name.clone(), debug_variable(name, &slot.current));
+        }
+        for (name, value) in &self.lists {
+            visible.insert(name.clone(), debug_variable(name, value));
+        }
+        for scope in &self.scopes {
+            for (name, value) in scope {
+                visible.insert(name.clone(), debug_variable(name, value));
+            }
+        }
+        let mut variables = visible.into_values().collect::<Vec<_>>();
+        variables.sort_by(|left, right| left.name.cmp(&right.name));
+        DebugSnapshot {
+            location,
+            call_stack: self.call_stack.clone(),
+            variables,
+            stdout: self.stdout.clone(),
+        }
     }
 
     fn exec_scoped_block(&mut self, block_id: BlockId) -> Result<Flow, RuntimeError> {
-        self.with_scope(|runtime| runtime.exec_block(block_id))
+        self.with_scope(|runtime| runtime.exec_active_block(block_id))
     }
 
     fn exec_statement_op(
@@ -804,6 +1584,37 @@ impl<'a> Runtime<'a> {
                 }
                 Err(RuntimeError::Failed(value.render()))
             }
+            StatementOp::ErrorReturn { message, code } => {
+                let message = self.eval_expression(message)?;
+                if message.effective_protection() != ProtectionLevel::Av {
+                    return Err(RuntimeError::Message(
+                        "refusing to return secret ERR message".to_owned(),
+                    ));
+                }
+                let RuntimeData::Str(message) = message.data else {
+                    return Err(RuntimeError::Message(
+                        "ERR message must evaluate to Str".to_owned(),
+                    ));
+                };
+                let code = self.eval_expression(code)?;
+                if code.effective_protection() != ProtectionLevel::Av {
+                    return Err(RuntimeError::Message(
+                        "refusing to return secret ERR code".to_owned(),
+                    ));
+                }
+                let RuntimeData::Int(code) = code.data else {
+                    return Err(RuntimeError::Message(
+                        "ERR code must evaluate to Int".to_owned(),
+                    ));
+                };
+                let code = i32::try_from(code).map_err(|_| {
+                    RuntimeError::Message("ERR code must fit signed 32-bit range".to_owned())
+                })?;
+                Err(RuntimeError::FailedWithCode {
+                    message: message.text.clone(),
+                    code,
+                })
+            }
             StatementOp::Return(expression) => Ok(Flow::Return(self.eval_expression(expression)?)),
             StatementOp::Jump { target_pc } => {
                 frame.pc = *target_pc;
@@ -822,18 +1633,47 @@ impl<'a> Runtime<'a> {
             StatementOp::LoopCheck {
                 condition,
                 limit,
-                exit_pc,
+                normal_exit_pc,
+                limit_exit_pc,
+                else_exit_pc,
             } => {
                 let op_pc = frame.pc.saturating_sub(1);
+                let limit = if let Some(limit) = frame.loop_limits.get(&op_pc) {
+                    *limit
+                } else {
+                    let value = self.eval_expression(limit)?;
+                    let RuntimeData::Int(limit) = value.data else {
+                        return Err(RuntimeError::Message(
+                            "while limit must evaluate to Int".to_owned(),
+                        ));
+                    };
+                    if limit < -1 {
+                        return Err(RuntimeError::Message(format!(
+                            "invalid loop limit `{limit}`"
+                        )));
+                    }
+                    frame.loop_limits.insert(op_pc, limit);
+                    limit
+                };
                 if !self.eval_bool(condition)? {
+                    let entered = frame
+                        .loop_iterations
+                        .get(&op_pc)
+                        .is_some_and(|iterations| *iterations > 0);
                     frame.loop_iterations.remove(&op_pc);
-                    frame.pc = *exit_pc;
+                    frame.loop_limits.remove(&op_pc);
+                    frame.pc = if entered {
+                        *normal_exit_pc
+                    } else {
+                        *else_exit_pc
+                    };
                     return Ok(Flow::None);
                 }
                 let iterations = frame.loop_iterations.entry(op_pc).or_insert(0);
-                if *limit != -1 && *iterations >= *limit {
+                if limit != -1 && *iterations >= limit {
                     frame.loop_iterations.remove(&op_pc);
-                    frame.pc = *exit_pc;
+                    frame.loop_limits.remove(&op_pc);
+                    frame.pc = *limit_exit_pc;
                     return Ok(Flow::None);
                 }
                 *iterations += 1;
@@ -850,6 +1690,8 @@ impl<'a> Runtime<'a> {
                     Ok(Flow::None)
                 }
                 Flow::Break => {
+                    frame.loop_iterations.remove(continue_pc);
+                    frame.loop_limits.remove(continue_pc);
                     frame.pc = *break_pc;
                     Ok(Flow::None)
                 }
@@ -865,7 +1707,7 @@ impl<'a> Runtime<'a> {
                 for item in items {
                     match self.with_scope(|runtime| {
                         runtime.declare_vtime(item_name.clone(), item);
-                        runtime.exec_block(*body)
+                        runtime.exec_active_block(*body)
                     })? {
                         Flow::None | Flow::Continue => {}
                         Flow::Break => break,
@@ -873,6 +1715,58 @@ impl<'a> Runtime<'a> {
                     }
                 }
                 Ok(Flow::None)
+            }
+            StatementOp::Match {
+                value,
+                cases,
+                default_body,
+            } => {
+                let value = self.eval_expression(value)?;
+                for (patterns, body) in cases {
+                    let mut matched = false;
+                    for pattern in patterns {
+                        matched = match pattern {
+                            CompiledMatchPattern::Value(pattern) => {
+                                let pattern = self.eval_expression(pattern)?;
+                                self.runtime_bool(self.eval_binary(
+                                    value.clone(),
+                                    BinaryOperator::Equal,
+                                    pattern,
+                                )?)?
+                            }
+                            CompiledMatchPattern::InclusiveRange { start, end } => {
+                                let start = self.eval_expression(start)?;
+                                let lower = self.eval_binary(
+                                    value.clone(),
+                                    BinaryOperator::GreaterEqual,
+                                    start,
+                                )?;
+                                if !self.runtime_bool(lower)? {
+                                    false
+                                } else {
+                                    let end = self.eval_expression(end)?;
+                                    let upper = self.eval_binary(
+                                        value.clone(),
+                                        BinaryOperator::LessEqual,
+                                        end,
+                                    )?;
+                                    self.runtime_bool(upper)?
+                                }
+                            }
+                        };
+                        if matched {
+                            break;
+                        }
+                    }
+                    if matched {
+                        return self.exec_scoped_block(*body);
+                    }
+                }
+                if let Some(body) = default_body {
+                    self.exec_scoped_block(*body)
+                } else {
+                    Ok(Flow::None)
+                }
             }
             StatementOp::Break => Ok(Flow::Break),
             StatementOp::Continue => Ok(Flow::Continue),
@@ -916,8 +1810,8 @@ impl<'a> Runtime<'a> {
                     stack.push(RuntimeValue::from_ast(value.clone()));
                 }
                 ExpressionOp::PushNone => stack.push(RuntimeValue::none(ProtectionLevel::Av)),
-                ExpressionOp::ReadInput => stack.push(self.read_input(ProtectionLevel::Av)),
-                ExpressionOp::ReadSecretInput => stack.push(self.read_input(ProtectionLevel::Asv)),
+                ExpressionOp::ReadInput => stack.push(self.read_input(ProtectionLevel::Av)?),
+                ExpressionOp::ReadSecretInput => stack.push(self.read_input(ProtectionLevel::Asv)?),
                 ExpressionOp::LoadVariable(name) => stack.push(self.lookup(name)?),
                 ExpressionOp::Call {
                     name,
@@ -1028,6 +1922,910 @@ impl<'a> Runtime<'a> {
         }
 
         match name {
+            "windows_available" => Ok(RuntimeValue::new(
+                RuntimeData::Bool(self.windows.available()),
+                ProtectionLevel::Av,
+            )),
+            "windows_load_library" => {
+                let name = runtime_str(&args[0], "windows::load_library name")?;
+                let library = self
+                    .windows
+                    .load_library(&name)
+                    .map_err(RuntimeError::Message)?;
+                Ok(RuntimeValue::new(
+                    RuntimeData::Int(library),
+                    ProtectionLevel::Av,
+                ))
+            }
+            "windows_get_procedure" => {
+                let library = runtime_int(&args[0], "windows::get_procedure library")?;
+                let name = runtime_str(&args[1], "windows::get_procedure name")?;
+                let argument_types =
+                    runtime_string_list(&args[2], "windows::get_procedure argument types")?;
+                let result_type = runtime_str(&args[3], "windows::get_procedure result type")?;
+                let address = self
+                    .windows
+                    .procedure_address(library, &name)
+                    .map_err(RuntimeError::Message)?;
+                let descriptor = self
+                    .raw_memory
+                    .load(
+                        address,
+                        1,
+                        "rx",
+                        Some(AbiSignature {
+                            convention: "win64".to_owned(),
+                            argument_types,
+                            result_type,
+                        }),
+                    )
+                    .map_err(RuntimeError::Message)?;
+                self.windows
+                    .attach_procedure(library, descriptor.id)
+                    .map_err(RuntimeError::Message)?;
+                Ok(runtime_descriptor(descriptor))
+            }
+            "windows_call" => {
+                let id = runtime_pointer_id(&self.raw_memory, &args[0])?;
+                let call_args = runtime_call_arguments(&self.raw_memory, &args[1])?;
+                let value = self
+                    .raw_memory
+                    .call(id, &call_args)
+                    .map_err(RuntimeError::Message)?;
+                Ok(RuntimeValue::new(
+                    RuntimeData::Int(value),
+                    ProtectionLevel::Av,
+                ))
+            }
+            "windows_close_library" => {
+                let library = runtime_int(&args[0], "windows::close_library library")?;
+                let pointers = self
+                    .windows
+                    .close_library(library)
+                    .map_err(RuntimeError::Message)?;
+                for pointer in pointers {
+                    if self
+                        .raw_memory
+                        .state(pointer)
+                        .map_err(RuntimeError::Message)?
+                        == RawMemoryState::Live
+                    {
+                        self.raw_memory
+                            .mark(pointer)
+                            .map_err(RuntimeError::Message)?;
+                    }
+                }
+                Ok(RuntimeValue::new(
+                    RuntimeData::Bool(true),
+                    ProtectionLevel::Av,
+                ))
+            }
+            "windows_last_error" => Ok(RuntimeValue::new(
+                RuntimeData::Int(apl_windows::last_error()),
+                ProtectionLevel::Av,
+            )),
+            "windows_utf16" => {
+                let value = runtime_str(&args[0], "windows::utf16 value")?;
+                Ok(RuntimeValue::new(
+                    RuntimeData::Bytes(apl_windows::utf16_bytes(&value)),
+                    args[0].protection,
+                ))
+            }
+            "windows_message_box" => {
+                let text = runtime_str(&args[0], "windows::message_box text")?;
+                let caption = runtime_str(&args[1], "windows::message_box caption")?;
+                let kind = runtime_int(&args[2], "windows::message_box kind")?;
+                let result = apl_windows::message_box(&text, &caption, kind)
+                    .map_err(RuntimeError::Message)?;
+                Ok(RuntimeValue::new(
+                    RuntimeData::Int(result),
+                    ProtectionLevel::Av,
+                ))
+            }
+            "windows_create_window" => {
+                let title = runtime_str(&args[0], "windows::create_window title")?;
+                let width = runtime_int(&args[1], "windows::create_window width")?;
+                let height = runtime_int(&args[2], "windows::create_window height")?;
+                let window = self
+                    .windows
+                    .create_window(&title, width, height)
+                    .map_err(RuntimeError::Message)?;
+                Ok(RuntimeValue::new(
+                    RuntimeData::Int(window),
+                    ProtectionLevel::Av,
+                ))
+            }
+            "windows_load_icon" => {
+                let path = runtime_str(&args[0], "windows::load_icon path")?;
+                let icon = self
+                    .windows
+                    .load_icon(
+                        &path,
+                        runtime_int(&args[1], "windows::load_icon width")?,
+                        runtime_int(&args[2], "windows::load_icon height")?,
+                    )
+                    .map_err(RuntimeError::Message)?;
+                Ok(RuntimeValue::new(
+                    RuntimeData::Int(icon),
+                    ProtectionLevel::Av,
+                ))
+            }
+            "windows_create_accelerators" => {
+                let entries = runtime_accelerator_entries(&args[0])?;
+                let accelerators = self
+                    .windows
+                    .create_accelerators(&entries)
+                    .map_err(RuntimeError::Message)?;
+                Ok(RuntimeValue::new(
+                    RuntimeData::Int(accelerators),
+                    ProtectionLevel::Av,
+                ))
+            }
+            "windows_set_accelerators" => {
+                let changed = self
+                    .windows
+                    .set_accelerators(
+                        runtime_int(&args[0], "windows::set_accelerators window")?,
+                        runtime_int(&args[1], "windows::set_accelerators table")?,
+                    )
+                    .map_err(RuntimeError::Message)?;
+                Ok(RuntimeValue::new(
+                    RuntimeData::Bool(changed),
+                    ProtectionLevel::Av,
+                ))
+            }
+            "windows_destroy_accelerators" => {
+                let destroyed = self
+                    .windows
+                    .destroy_accelerators(runtime_int(
+                        &args[0],
+                        "windows::destroy_accelerators table",
+                    )?)
+                    .map_err(RuntimeError::Message)?;
+                Ok(RuntimeValue::new(
+                    RuntimeData::Bool(destroyed),
+                    ProtectionLevel::Av,
+                ))
+            }
+            "windows_set_window_icon" => {
+                let changed = self
+                    .windows
+                    .set_window_icon(
+                        runtime_int(&args[0], "windows::set_window_icon window")?,
+                        runtime_int(&args[1], "windows::set_window_icon icon")?,
+                    )
+                    .map_err(RuntimeError::Message)?;
+                Ok(RuntimeValue::new(
+                    RuntimeData::Bool(changed),
+                    ProtectionLevel::Av,
+                ))
+            }
+            "windows_set_deferred_close" => {
+                let changed = self
+                    .windows
+                    .set_deferred_close(
+                        runtime_int(&args[0], "windows::set_deferred_close window")?,
+                        runtime_bool_value(&args[1], "windows::set_deferred_close enabled")?,
+                    )
+                    .map_err(RuntimeError::Message)?;
+                Ok(RuntimeValue::new(
+                    RuntimeData::Bool(changed),
+                    ProtectionLevel::Av,
+                ))
+            }
+            "windows_destroy_icon" => {
+                let destroyed = self
+                    .windows
+                    .destroy_icon(runtime_int(&args[0], "windows::destroy_icon icon")?)
+                    .map_err(RuntimeError::Message)?;
+                Ok(RuntimeValue::new(
+                    RuntimeData::Bool(destroyed),
+                    ProtectionLevel::Av,
+                ))
+            }
+            "windows_create_menu" => {
+                let popup = runtime_bool_value(&args[0], "windows::create_menu popup")?;
+                let menu = self
+                    .windows
+                    .create_menu(popup)
+                    .map_err(RuntimeError::Message)?;
+                Ok(RuntimeValue::new(
+                    RuntimeData::Int(menu),
+                    ProtectionLevel::Av,
+                ))
+            }
+            "windows_append_menu_item" => {
+                let appended = self
+                    .windows
+                    .append_menu_item(
+                        runtime_int(&args[0], "windows::append_menu_item menu")?,
+                        runtime_int(&args[1], "windows::append_menu_item command id")?,
+                        &runtime_str(&args[2], "windows::append_menu_item text")?,
+                    )
+                    .map_err(RuntimeError::Message)?;
+                Ok(RuntimeValue::new(
+                    RuntimeData::Bool(appended),
+                    ProtectionLevel::Av,
+                ))
+            }
+            "windows_append_submenu" => {
+                let appended = self
+                    .windows
+                    .append_submenu(
+                        runtime_int(&args[0], "windows::append_submenu menu")?,
+                        runtime_int(&args[1], "windows::append_submenu submenu")?,
+                        &runtime_str(&args[2], "windows::append_submenu text")?,
+                    )
+                    .map_err(RuntimeError::Message)?;
+                Ok(RuntimeValue::new(
+                    RuntimeData::Bool(appended),
+                    ProtectionLevel::Av,
+                ))
+            }
+            "windows_append_menu_separator" => {
+                let appended = self
+                    .windows
+                    .append_menu_separator(runtime_int(
+                        &args[0],
+                        "windows::append_menu_separator menu",
+                    )?)
+                    .map_err(RuntimeError::Message)?;
+                Ok(RuntimeValue::new(
+                    RuntimeData::Bool(appended),
+                    ProtectionLevel::Av,
+                ))
+            }
+            "windows_set_menu" => {
+                let changed = self
+                    .windows
+                    .set_menu(
+                        runtime_int(&args[0], "windows::set_menu window")?,
+                        runtime_int(&args[1], "windows::set_menu menu")?,
+                    )
+                    .map_err(RuntimeError::Message)?;
+                Ok(RuntimeValue::new(
+                    RuntimeData::Bool(changed),
+                    ProtectionLevel::Av,
+                ))
+            }
+            "windows_set_menu_item_enabled" => {
+                let changed = self
+                    .windows
+                    .set_menu_item_enabled(
+                        runtime_int(&args[0], "windows::set_menu_item_enabled menu")?,
+                        runtime_int(&args[1], "windows::set_menu_item_enabled command id")?,
+                        runtime_bool_value(&args[2], "windows::set_menu_item_enabled enabled")?,
+                    )
+                    .map_err(RuntimeError::Message)?;
+                Ok(RuntimeValue::new(
+                    RuntimeData::Bool(changed),
+                    ProtectionLevel::Av,
+                ))
+            }
+            "windows_set_menu_item_checked" => {
+                let changed = self
+                    .windows
+                    .set_menu_item_checked(
+                        runtime_int(&args[0], "windows::set_menu_item_checked menu")?,
+                        runtime_int(&args[1], "windows::set_menu_item_checked command id")?,
+                        runtime_bool_value(&args[2], "windows::set_menu_item_checked checked")?,
+                    )
+                    .map_err(RuntimeError::Message)?;
+                Ok(RuntimeValue::new(
+                    RuntimeData::Bool(changed),
+                    ProtectionLevel::Av,
+                ))
+            }
+            "windows_destroy_menu" => {
+                let destroyed = self
+                    .windows
+                    .destroy_menu(runtime_int(&args[0], "windows::destroy_menu menu")?)
+                    .map_err(RuntimeError::Message)?;
+                Ok(RuntimeValue::new(
+                    RuntimeData::Bool(destroyed),
+                    ProtectionLevel::Av,
+                ))
+            }
+            "windows_show_window" => {
+                let window = runtime_int(&args[0], "windows::show_window window")?;
+                let shown = self
+                    .windows
+                    .show_window(window)
+                    .map_err(RuntimeError::Message)?;
+                Ok(RuntimeValue::new(
+                    RuntimeData::Bool(shown),
+                    ProtectionLevel::Av,
+                ))
+            }
+            "windows_destroy_window" => {
+                let window = runtime_int(&args[0], "windows::destroy_window window")?;
+                let destroyed = self
+                    .windows
+                    .destroy_window(window)
+                    .map_err(RuntimeError::Message)?;
+                Ok(RuntimeValue::new(
+                    RuntimeData::Bool(destroyed),
+                    ProtectionLevel::Av,
+                ))
+            }
+            "windows_run_message_loop" => {
+                let result = self
+                    .windows
+                    .run_message_loop()
+                    .map_err(RuntimeError::Message)?;
+                Ok(RuntimeValue::new(
+                    RuntimeData::Int(result),
+                    ProtectionLevel::Av,
+                ))
+            }
+            "windows_pump_messages" => {
+                let running = self
+                    .windows
+                    .pump_messages()
+                    .map_err(RuntimeError::Message)?;
+                Ok(RuntimeValue::new(
+                    RuntimeData::Bool(running),
+                    ProtectionLevel::Av,
+                ))
+            }
+            "windows_next_event" => Ok(match self.windows.next_event() {
+                Some(event) => RuntimeValue::list(vec![
+                    RuntimeValue::new(RuntimeData::Int(event.window), ProtectionLevel::Av),
+                    RuntimeValue::new(RuntimeData::Int(event.message), ProtectionLevel::Av),
+                    RuntimeValue::new(RuntimeData::Int(event.wparam), ProtectionLevel::Av),
+                    RuntimeValue::new(RuntimeData::Int(event.lparam), ProtectionLevel::Av),
+                    RuntimeValue::new(RuntimeData::Int(event.source), ProtectionLevel::Av),
+                    RuntimeValue::new(RuntimeData::Int(event.code), ProtectionLevel::Av),
+                    RuntimeValue::new(RuntimeData::Int(event.control_id), ProtectionLevel::Av),
+                ]),
+                None => RuntimeValue::none(ProtectionLevel::Av),
+            }),
+            "windows_wait_event" => Ok(
+                match self.windows.wait_event().map_err(RuntimeError::Message)? {
+                    Some(event) => RuntimeValue::list(vec![
+                        RuntimeValue::new(RuntimeData::Int(event.window), ProtectionLevel::Av),
+                        RuntimeValue::new(RuntimeData::Int(event.message), ProtectionLevel::Av),
+                        RuntimeValue::new(RuntimeData::Int(event.wparam), ProtectionLevel::Av),
+                        RuntimeValue::new(RuntimeData::Int(event.lparam), ProtectionLevel::Av),
+                        RuntimeValue::new(RuntimeData::Int(event.source), ProtectionLevel::Av),
+                        RuntimeValue::new(RuntimeData::Int(event.code), ProtectionLevel::Av),
+                        RuntimeValue::new(RuntimeData::Int(event.control_id), ProtectionLevel::Av),
+                    ]),
+                    None => RuntimeValue::none(ProtectionLevel::Av),
+                },
+            ),
+            "windows_create_control" => {
+                let parent = runtime_int(&args[0], "windows::create_control parent")?;
+                let class_name = runtime_str(&args[1], "windows::create_control class_name")?;
+                let text = runtime_str(&args[2], "windows::create_control text")?;
+                let control = self
+                    .windows
+                    .create_control(
+                        parent,
+                        &class_name,
+                        &text,
+                        runtime_int(&args[3], "windows::create_control id")?,
+                        runtime_int(&args[4], "windows::create_control x")?,
+                        runtime_int(&args[5], "windows::create_control y")?,
+                        runtime_int(&args[6], "windows::create_control width")?,
+                        runtime_int(&args[7], "windows::create_control height")?,
+                        runtime_int(&args[8], "windows::create_control style")?,
+                        runtime_int(&args[9], "windows::create_control extended_style")?,
+                    )
+                    .map_err(RuntimeError::Message)?;
+                Ok(RuntimeValue::new(
+                    RuntimeData::Int(control),
+                    ProtectionLevel::Av,
+                ))
+            }
+            "windows_set_window_text" => {
+                let window = runtime_int(&args[0], "windows::set_window_text window")?;
+                let text = runtime_str(&args[1], "windows::set_window_text text")?;
+                let changed = self
+                    .windows
+                    .set_window_text(window, &text)
+                    .map_err(RuntimeError::Message)?;
+                Ok(RuntimeValue::new(
+                    RuntimeData::Bool(changed),
+                    ProtectionLevel::Av,
+                ))
+            }
+            "windows_window_text" => {
+                let window = runtime_int(&args[0], "windows::window_text window")?;
+                let text = self
+                    .windows
+                    .window_text(window)
+                    .map_err(RuntimeError::Message)?;
+                Ok(RuntimeValue::str(text))
+            }
+            "windows_move_window" => {
+                let moved = self
+                    .windows
+                    .move_window(
+                        runtime_int(&args[0], "windows::move_window window")?,
+                        runtime_int(&args[1], "windows::move_window x")?,
+                        runtime_int(&args[2], "windows::move_window y")?,
+                        runtime_int(&args[3], "windows::move_window width")?,
+                        runtime_int(&args[4], "windows::move_window height")?,
+                        runtime_bool_value(&args[5], "windows::move_window repaint")?,
+                    )
+                    .map_err(RuntimeError::Message)?;
+                Ok(RuntimeValue::new(
+                    RuntimeData::Bool(moved),
+                    ProtectionLevel::Av,
+                ))
+            }
+            "windows_selection" => {
+                let control = runtime_int(&args[0], "windows::selection control")?;
+                let (start, end) = self
+                    .windows
+                    .selection(control)
+                    .map_err(RuntimeError::Message)?;
+                Ok(RuntimeValue::list(vec![
+                    RuntimeValue::new(RuntimeData::Int(start), ProtectionLevel::Av),
+                    RuntimeValue::new(RuntimeData::Int(end), ProtectionLevel::Av),
+                ]))
+            }
+            "windows_set_selection" => {
+                let changed = self
+                    .windows
+                    .set_selection(
+                        runtime_int(&args[0], "windows::set_selection control")?,
+                        runtime_int(&args[1], "windows::set_selection start")?,
+                        runtime_int(&args[2], "windows::set_selection end")?,
+                    )
+                    .map_err(RuntimeError::Message)?;
+                Ok(RuntimeValue::new(
+                    RuntimeData::Bool(changed),
+                    ProtectionLevel::Av,
+                ))
+            }
+            "windows_replace_selection" => {
+                let changed = self
+                    .windows
+                    .replace_selection(
+                        runtime_int(&args[0], "windows::replace_selection control")?,
+                        &runtime_str(&args[1], "windows::replace_selection text")?,
+                        runtime_bool_value(&args[2], "windows::replace_selection can_undo")?,
+                    )
+                    .map_err(RuntimeError::Message)?;
+                Ok(RuntimeValue::new(
+                    RuntimeData::Bool(changed),
+                    ProtectionLevel::Av,
+                ))
+            }
+            "windows_line_count" => {
+                let count = self
+                    .windows
+                    .line_count(runtime_int(&args[0], "windows::line_count control")?)
+                    .map_err(RuntimeError::Message)?;
+                Ok(RuntimeValue::new(
+                    RuntimeData::Int(count),
+                    ProtectionLevel::Av,
+                ))
+            }
+            "windows_set_text_color" => {
+                let changed = self
+                    .windows
+                    .set_text_color(
+                        runtime_int(&args[0], "windows::set_text_color control")?,
+                        runtime_int(&args[1], "windows::set_text_color start")?,
+                        runtime_int(&args[2], "windows::set_text_color end")?,
+                        runtime_int(&args[3], "windows::set_text_color color")?,
+                    )
+                    .map_err(RuntimeError::Message)?;
+                Ok(RuntimeValue::new(
+                    RuntimeData::Bool(changed),
+                    ProtectionLevel::Av,
+                ))
+            }
+            "windows_set_background_color" => {
+                let changed = self
+                    .windows
+                    .set_background_color(
+                        runtime_int(&args[0], "windows::set_background_color control")?,
+                        runtime_int(&args[1], "windows::set_background_color start")?,
+                        runtime_int(&args[2], "windows::set_background_color end")?,
+                        runtime_int(&args[3], "windows::set_background_color color")?,
+                    )
+                    .map_err(RuntimeError::Message)?;
+                Ok(RuntimeValue::new(
+                    RuntimeData::Bool(changed),
+                    ProtectionLevel::Av,
+                ))
+            }
+            "windows_set_text_bold" => {
+                let changed = self
+                    .windows
+                    .set_text_bold(
+                        runtime_int(&args[0], "windows::set_text_bold control")?,
+                        runtime_int(&args[1], "windows::set_text_bold start")?,
+                        runtime_int(&args[2], "windows::set_text_bold end")?,
+                        runtime_bool_value(&args[3], "windows::set_text_bold enabled")?,
+                    )
+                    .map_err(RuntimeError::Message)?;
+                Ok(RuntimeValue::new(
+                    RuntimeData::Bool(changed),
+                    ProtectionLevel::Av,
+                ))
+            }
+            "windows_set_text_font" => {
+                let changed = self
+                    .windows
+                    .set_text_font(
+                        runtime_int(&args[0], "windows::set_text_font control")?,
+                        runtime_int(&args[1], "windows::set_text_font start")?,
+                        runtime_int(&args[2], "windows::set_text_font end")?,
+                        &runtime_str(&args[3], "windows::set_text_font face")?,
+                        runtime_int(&args[4], "windows::set_text_font points")?,
+                    )
+                    .map_err(RuntimeError::Message)?;
+                Ok(RuntimeValue::new(
+                    RuntimeData::Bool(changed),
+                    ProtectionLevel::Av,
+                ))
+            }
+            "windows_run_process" => {
+                let output = apl_windows::run_process(
+                    &runtime_str(&args[0], "windows::run_process program")?,
+                    &runtime_string_list(&args[1], "windows::run_process arguments")?,
+                    &runtime_str(&args[2], "windows::run_process input")?,
+                    &runtime_str(&args[3], "windows::run_process working_directory")?,
+                )
+                .map_err(RuntimeError::Message)?;
+                Ok(RuntimeValue::list(vec![
+                    RuntimeValue::new(RuntimeData::Int(output.exit_code), ProtectionLevel::Av),
+                    RuntimeValue::str(output.stdout),
+                    RuntimeValue::str(output.stderr),
+                ]))
+            }
+            "windows_open_file_dialog" | "windows_save_file_dialog" => {
+                let owner = runtime_int(&args[0], "Windows file dialog owner")?;
+                let title = runtime_str(&args[1], "Windows file dialog title")?;
+                let initial_directory =
+                    runtime_str(&args[2], "Windows file dialog initial directory")?;
+                let file_name = runtime_str(&args[3], "Windows file dialog file name")?;
+                let filter_name = runtime_str(&args[4], "Windows file dialog filter name")?;
+                let filter_pattern = runtime_str(&args[5], "Windows file dialog filter pattern")?;
+                let default_extension =
+                    runtime_str(&args[6], "Windows file dialog default extension")?;
+                let selected = if name == "windows_open_file_dialog" {
+                    self.windows.open_file_dialog(
+                        owner,
+                        &title,
+                        &initial_directory,
+                        &file_name,
+                        &filter_name,
+                        &filter_pattern,
+                        &default_extension,
+                    )
+                } else {
+                    self.windows.save_file_dialog(
+                        owner,
+                        &title,
+                        &initial_directory,
+                        &file_name,
+                        &filter_name,
+                        &filter_pattern,
+                        &default_extension,
+                    )
+                }
+                .map_err(RuntimeError::Message)?;
+                Ok(match selected {
+                    Some(path) => RuntimeValue::str(path),
+                    None => RuntimeValue::none(ProtectionLevel::Av),
+                })
+            }
+            "windows_can_undo" => {
+                let result = self
+                    .windows
+                    .can_undo(runtime_int(&args[0], "windows::can_undo control")?)
+                    .map_err(RuntimeError::Message)?;
+                Ok(RuntimeValue::new(
+                    RuntimeData::Bool(result),
+                    ProtectionLevel::Av,
+                ))
+            }
+            "windows_undo" => {
+                let result = self
+                    .windows
+                    .undo(runtime_int(&args[0], "windows::undo control")?)
+                    .map_err(RuntimeError::Message)?;
+                Ok(RuntimeValue::new(
+                    RuntimeData::Bool(result),
+                    ProtectionLevel::Av,
+                ))
+            }
+            "windows_can_redo" => {
+                let result = self
+                    .windows
+                    .can_redo(runtime_int(&args[0], "windows::can_redo control")?)
+                    .map_err(RuntimeError::Message)?;
+                Ok(RuntimeValue::new(
+                    RuntimeData::Bool(result),
+                    ProtectionLevel::Av,
+                ))
+            }
+            "windows_redo" => {
+                let result = self
+                    .windows
+                    .redo(runtime_int(&args[0], "windows::redo control")?)
+                    .map_err(RuntimeError::Message)?;
+                Ok(RuntimeValue::new(
+                    RuntimeData::Bool(result),
+                    ProtectionLevel::Av,
+                ))
+            }
+            "windows_clear_history" => {
+                let result = self
+                    .windows
+                    .clear_history(runtime_int(&args[0], "windows::clear_history control")?)
+                    .map_err(RuntimeError::Message)?;
+                Ok(RuntimeValue::new(
+                    RuntimeData::Bool(result),
+                    ProtectionLevel::Av,
+                ))
+            }
+            "windows_event_mask" => {
+                let mask = self
+                    .windows
+                    .event_mask(runtime_int(&args[0], "windows::event_mask control")?)
+                    .map_err(RuntimeError::Message)?;
+                Ok(RuntimeValue::new(
+                    RuntimeData::Int(mask),
+                    ProtectionLevel::Av,
+                ))
+            }
+            "windows_set_event_mask" => {
+                let previous = self
+                    .windows
+                    .set_event_mask(
+                        runtime_int(&args[0], "windows::set_event_mask control")?,
+                        runtime_int(&args[1], "windows::set_event_mask mask")?,
+                    )
+                    .map_err(RuntimeError::Message)?;
+                Ok(RuntimeValue::new(
+                    RuntimeData::Int(previous),
+                    ProtectionLevel::Av,
+                ))
+            }
+            "windows_first_visible_line" => {
+                let line = self
+                    .windows
+                    .first_visible_line(runtime_int(
+                        &args[0],
+                        "windows::first_visible_line control",
+                    )?)
+                    .map_err(RuntimeError::Message)?;
+                Ok(RuntimeValue::new(
+                    RuntimeData::Int(line),
+                    ProtectionLevel::Av,
+                ))
+            }
+            "windows_scroll_lines" => {
+                let result = self
+                    .windows
+                    .scroll_lines(
+                        runtime_int(&args[0], "windows::scroll_lines control")?,
+                        runtime_int(&args[1], "windows::scroll_lines lines")?,
+                    )
+                    .map_err(RuntimeError::Message)?;
+                Ok(RuntimeValue::new(
+                    RuntimeData::Bool(result),
+                    ProtectionLevel::Av,
+                ))
+            }
+            "windows_focus" => {
+                let result = self
+                    .windows
+                    .focus(runtime_int(&args[0], "windows::focus window")?)
+                    .map_err(RuntimeError::Message)?;
+                Ok(RuntimeValue::new(
+                    RuntimeData::Bool(result),
+                    ProtectionLevel::Av,
+                ))
+            }
+            "windows_find_text" => {
+                let found = self
+                    .windows
+                    .find_text(
+                        runtime_int(&args[0], "windows::find_text control")?,
+                        &runtime_str(&args[1], "windows::find_text text")?,
+                        runtime_int(&args[2], "windows::find_text start")?,
+                        runtime_int(&args[3], "windows::find_text end")?,
+                        runtime_bool_value(&args[4], "windows::find_text match_case")?,
+                        runtime_bool_value(&args[5], "windows::find_text whole_word")?,
+                    )
+                    .map_err(RuntimeError::Message)?;
+                Ok(match found {
+                    Some((start, end)) => RuntimeValue::list(vec![
+                        RuntimeValue::new(RuntimeData::Int(start), ProtectionLevel::Av),
+                        RuntimeValue::new(RuntimeData::Int(end), ProtectionLevel::Av),
+                    ]),
+                    None => RuntimeValue::none(ProtectionLevel::Av),
+                })
+            }
+            "timer_start" => {
+                self.timer
+                    .start()
+                    .map_err(|error| RuntimeError::Message(error.to_owned()))?;
+                Ok(RuntimeValue::new(
+                    RuntimeData::Bool(true),
+                    ProtectionLevel::Av,
+                ))
+            }
+            "timer_stop" => {
+                self.timer
+                    .stop()
+                    .map_err(|error| RuntimeError::Message(error.to_owned()))?;
+                Ok(RuntimeValue::new(
+                    RuntimeData::Bool(true),
+                    ProtectionLevel::Av,
+                ))
+            }
+            "timer_elapsed" => Ok(RuntimeValue::new(
+                RuntimeData::Float(
+                    self.timer
+                        .elapsed()
+                        .map_err(|error| RuntimeError::Message(error.to_owned()))?
+                        .as_secs_f64(),
+                ),
+                ProtectionLevel::Av,
+            )),
+            "now_utc" => Ok(RuntimeValue::list(
+                utc_datetime_fields()
+                    .map_err(|error| RuntimeError::Message(error.to_owned()))?
+                    .into_iter()
+                    .map(|field| RuntimeValue::new(RuntimeData::Int(field), ProtectionLevel::Av))
+                    .collect(),
+            )),
+            "sha1" | "sha256" | "sha512" | "sha3_384" => {
+                let RuntimeData::Bytes(bytes) = &args[0].data else {
+                    return Err(RuntimeError::Message(format!(
+                        "{name}(value) requires Bytes"
+                    )));
+                };
+                let digest = match name {
+                    "sha1" => sha1(bytes),
+                    "sha256" => sha256(bytes),
+                    "sha512" => sha512(bytes),
+                    "sha3_384" => sha3_384(bytes),
+                    _ => unreachable!(),
+                };
+                Ok(RuntimeValue::new(
+                    RuntimeData::Bytes(digest),
+                    args[0].protection,
+                ))
+            }
+            "raw_malloc" => {
+                let size = runtime_int(&args[0], "memory::malloc size")?;
+                let descriptor = self
+                    .raw_memory
+                    .malloc(size)
+                    .map_err(RuntimeError::Message)?;
+                Ok(runtime_descriptor(descriptor))
+            }
+            "raw_load" => {
+                let address = runtime_int(&args[0], "memory::load address")?;
+                let size = runtime_int(&args[1], "memory::load size")?;
+                let permissions = runtime_str(&args[2], "memory::load permissions")?;
+                let signature = runtime_signature(&args[3])?;
+                let descriptor = self
+                    .raw_memory
+                    .load(address, size, &permissions, signature)
+                    .map_err(RuntimeError::Message)?;
+                Ok(runtime_descriptor(descriptor))
+            }
+            "raw_mark" => {
+                let id = runtime_pointer_id(&self.raw_memory, &args[0])?;
+                self.raw_memory.mark(id).map_err(RuntimeError::Message)?;
+                Ok(RuntimeValue::new(
+                    RuntimeData::Bool(true),
+                    ProtectionLevel::Av,
+                ))
+            }
+            "raw_free" => Ok(RuntimeValue::new(
+                RuntimeData::Int(self.raw_memory.free_pending() as i64),
+                ProtectionLevel::Av,
+            )),
+            "raw_where" => {
+                let selector = runtime_int(&args[1], "memory::where selector")?;
+                match selector {
+                    0 => {
+                        let id = runtime_pointer_id(&self.raw_memory, &args[0])?;
+                        Ok(RuntimeValue::new(
+                            RuntimeData::Int(
+                                self.raw_memory
+                                    .descriptor(id)
+                                    .map_err(RuntimeError::Message)?
+                                    .address,
+                            ),
+                            ProtectionLevel::Av,
+                        ))
+                    }
+                    1 => Ok(RuntimeValue::new(
+                        RuntimeData::Int(runtime_pointer_id(&self.raw_memory, &args[0])?),
+                        ProtectionLevel::Av,
+                    )),
+                    2 => Ok(match &arg_forms[0] {
+                        ExpressionForm::Variable(name) => RuntimeValue::str(name.clone()),
+                        _ => RuntimeValue::none(ProtectionLevel::Av),
+                    }),
+                    3 => Ok(args[0].clone()),
+                    _ => Err(RuntimeError::Message(
+                        "memory::where selector must be 0, 1, 2, or 3".to_owned(),
+                    )),
+                }
+            }
+            "raw_read" => {
+                let id = runtime_pointer_id(&self.raw_memory, &args[0])?;
+                let offset = runtime_int(&args[1], "memory::read offset")?;
+                let count = runtime_int(&args[2], "memory::read count")?;
+                let bytes = self
+                    .raw_memory
+                    .read(id, offset, count)
+                    .map_err(RuntimeError::Message)?;
+                Ok(RuntimeValue::new(
+                    RuntimeData::Bytes(bytes),
+                    ProtectionLevel::Av,
+                ))
+            }
+            "raw_write" => {
+                let id = runtime_pointer_id(&self.raw_memory, &args[0])?;
+                let offset = runtime_int(&args[1], "memory::write offset")?;
+                let RuntimeData::Bytes(bytes) = &args[2].data else {
+                    return Err(RuntimeError::Message(
+                        "memory::write value must be Bytes".to_owned(),
+                    ));
+                };
+                self.raw_memory
+                    .write(id, offset, bytes)
+                    .map_err(RuntimeError::Message)?;
+                Ok(RuntimeValue::new(
+                    RuntimeData::Bool(true),
+                    ProtectionLevel::Av,
+                ))
+            }
+            "raw_call" => {
+                let id = runtime_pointer_id(&self.raw_memory, &args[0])?;
+                let call_args = runtime_call_arguments(&self.raw_memory, &args[1])?;
+                let value = self
+                    .raw_memory
+                    .call(id, &call_args)
+                    .map_err(RuntimeError::Message)?;
+                Ok(RuntimeValue::new(
+                    RuntimeData::Int(value),
+                    ProtectionLevel::Av,
+                ))
+            }
+            "raw_scope_enter" => {
+                let policy = runtime_scope_policy(&args[0])?;
+                self.raw_memory.enter_scope(policy);
+                Ok(RuntimeValue::new(
+                    RuntimeData::Bool(true),
+                    ProtectionLevel::Av,
+                ))
+            }
+            "raw_scope_exit" => {
+                let roots = self.raw_memory_roots();
+                let released = self
+                    .raw_memory
+                    .exit_scope(&roots)
+                    .map_err(RuntimeError::Message)?;
+                Ok(RuntimeValue::new(
+                    RuntimeData::Int(released as i64),
+                    ProtectionLevel::Av,
+                ))
+            }
+            "raw_scope_leave" => {
+                let value = args[0].clone();
+                let mut roots = self.raw_memory_roots();
+                collect_runtime_pointer_roots(&value, &mut roots);
+                self.raw_memory
+                    .exit_scope(&roots)
+                    .map_err(RuntimeError::Message)?;
+                Ok(value)
+            }
             "get" => {
                 let target = args[0].clone();
                 let index = args[1].clone();
@@ -1186,11 +2984,15 @@ impl<'a> Runtime<'a> {
                     }
                     _ => name.to_owned(),
                 };
-                self.with_scope(|runtime| {
+                let debugging = self.debug_hook.is_some();
+                if debugging {
+                    self.call_stack.push(error_context.clone());
+                }
+                let result = self.with_scope(|runtime| {
                     for (param, value) in function.params.iter().zip(args) {
                         runtime.declare_vtime(param.clone(), value);
                     }
-                    match runtime.exec_block(function.body)? {
+                    match runtime.exec_active_block(function.body)? {
                         Flow::Return(value) => Ok(value),
                         Flow::None | Flow::Stop => Ok(RuntimeValue::none(ProtectionLevel::Av)),
                         Flow::Break => {
@@ -1200,8 +3002,11 @@ impl<'a> Runtime<'a> {
                             "continue escaped function".to_owned(),
                         )),
                     }
-                })
-                .map_err(|error| error.in_function(&error_context))
+                });
+                if debugging {
+                    self.call_stack.pop();
+                }
+                result.map_err(|error| error.in_function(&error_context))
             }
         }
     }
@@ -1242,7 +3047,7 @@ impl<'a> Runtime<'a> {
         let protection = target.effective_protection();
         let step = step.unwrap_or(1);
         if step == 0 {
-            return Ok(RuntimeValue::none(protection));
+            return Err(RuntimeError::Message("zero slice step".to_owned()));
         }
         match target.data {
             RuntimeData::Str(value) => {
@@ -1494,6 +3299,14 @@ impl<'a> Runtime<'a> {
         }
     }
 
+    fn runtime_bool(&self, value: RuntimeValue) -> Result<bool, RuntimeError> {
+        match value.data {
+            RuntimeData::Bool(value) => Ok(value),
+            RuntimeData::None => Ok(false),
+            _ => Err(RuntimeError::Message("condition is not Bool".to_owned())),
+        }
+    }
+
     fn apply_arithmetic(
         &self,
         current: RuntimeValue,
@@ -1650,12 +3463,17 @@ impl<'a> Runtime<'a> {
             .any(|scope| scope.contains_key(name))
     }
 
-    fn read_input(&mut self, protection: ProtectionLevel) -> RuntimeValue {
-        self.input
-            .pop_front()
+    fn read_input(&mut self, protection: ProtectionLevel) -> Result<RuntimeValue, RuntimeError> {
+        let (input, from_argument, slot) = self.input.read()?;
+        if from_argument && protection != ProtectionLevel::Av {
+            return Err(RuntimeError::Message(format!(
+                "secret input cannot be supplied by process argument `-{slot}`"
+            )));
+        }
+        Ok(input
             .map(RuntimeValue::str)
             .unwrap_or_else(|| RuntimeValue::none(protection))
-            .with_protection(protection)
+            .with_protection(protection))
     }
 }
 
@@ -1815,7 +3633,17 @@ impl RuntimeValue {
             return Self::none(protection);
         }
         let converted = match value_type {
-            ValueType::Int => self.render().parse::<i64>().ok().map(RuntimeData::Int),
+            ValueType::Int => match &self.data {
+                RuntimeData::Int(value) => Some(RuntimeData::Int(*value)),
+                RuntimeData::Float(value)
+                    if value.is_finite()
+                        && *value >= i64::MIN as f64
+                        && *value < -(i64::MIN as f64) =>
+                {
+                    Some(RuntimeData::Int(*value as i64))
+                }
+                _ => self.render().parse::<i64>().ok().map(RuntimeData::Int),
+            },
             ValueType::Float => self.render().parse::<f64>().ok().map(RuntimeData::Float),
             ValueType::Bool => match self.render().as_str() {
                 "true" => Some(RuntimeData::Bool(true)),
@@ -1824,7 +3652,15 @@ impl RuntimeValue {
             },
             ValueType::Str => Some(RuntimeData::Str(Rc::new(RuntimeString::new(self.render())))),
             ValueType::Bytes => Some(RuntimeData::Bytes(self.render().into_bytes())),
-            ValueType::Json => Some(RuntimeData::Json(self.render())),
+            ValueType::Json => match &self.data {
+                RuntimeData::Json(value) => Some(RuntimeData::Json(value.clone())),
+                _ => {
+                    let rendered = self.render();
+                    serde_json::from_str::<serde_json::Value>(&rendered)
+                        .ok()
+                        .map(|_| RuntimeData::Json(rendered))
+                }
+            },
             ValueType::List => match self.data {
                 RuntimeData::List(values) => Some(RuntimeData::List(values)),
                 _ => None,
@@ -1853,6 +3689,20 @@ impl RuntimeValue {
             }
             RuntimeData::None => "NONE".to_owned(),
         }
+    }
+}
+
+fn debug_variable(name: &str, value: &RuntimeValue) -> DebugVariable {
+    let protection = value.effective_protection();
+    let rendered = match protection {
+        ProtectionLevel::Av => value.render(),
+        ProtectionLevel::Asv => "<ASV protected>".to_owned(),
+        ProtectionLevel::Sasv => "<SASV protected>".to_owned(),
+    };
+    DebugVariable {
+        name: name.to_owned(),
+        value: rendered,
+        protection,
     }
 }
 
@@ -1974,6 +3824,29 @@ mod tests {
         Value, VariableDecl, WhileStatement,
     };
 
+    #[test]
+    fn timer_accumulates_pauses_and_rejects_invalid_transitions() {
+        let mut timer = TimerState::default();
+        assert_eq!(timer.elapsed(), Ok(Duration::ZERO));
+        assert_eq!(timer.stop(), Err("timer is not running"));
+        assert_eq!(timer.start(), Ok(()));
+        assert_eq!(timer.start(), Err("timer is already running"));
+
+        timer.started_at = Some(Instant::now() - Duration::from_secs(2));
+        timer.stop().unwrap();
+        let first = timer.elapsed().unwrap();
+        assert!(first >= Duration::from_secs(2));
+        assert!(first < Duration::from_secs(3));
+        assert_eq!(timer.elapsed(), Ok(first));
+
+        timer.start().unwrap();
+        timer.started_at = Some(Instant::now() - Duration::from_secs(3));
+        timer.stop().unwrap();
+        let resumed = timer.elapsed().unwrap();
+        assert!(resumed >= Duration::from_secs(5));
+        assert!(resumed < Duration::from_secs(6));
+    }
+
     fn run(source: Vec<Statement>) -> Result<String, RuntimeError> {
         run_program(&Program::new(source), vec![]).map(|output| output.stdout)
     }
@@ -1984,11 +3857,68 @@ mod tests {
         run_program(&program, vec![]).map(|output| output.stdout)
     }
 
+    #[test]
+    fn debugger_tracks_source_stack_and_redacts_secrets() {
+        let source = "ASVInt hidden = 73\nfunc touch(value) {\n  VTime local = value\n  return local\n}\nAVInt std::main() {\n  AVInt visible = 4\n  touch(visible)\n  return 0\n}";
+        let parsed = apl_parser::parse_program_with_locations(source).unwrap();
+        validate_program(&parsed.program).unwrap();
+        let locations = parsed
+            .locations
+            .into_iter()
+            .map(|location| DebugSourceLocation {
+                path: location.path,
+                line: location.line,
+                column: location.column,
+            })
+            .collect::<Vec<_>>();
+        let mut snapshots = Vec::new();
+
+        let output = run_program_debug(&parsed.program, &locations, Vec::new(), |snapshot| {
+            snapshots.push(snapshot.clone());
+            DebugAction::Continue
+        })
+        .unwrap();
+
+        assert_eq!(output.stdout, "");
+        assert!(snapshots.iter().any(|snapshot| snapshot.location.line == 7));
+        assert!(snapshots.iter().any(|snapshot| {
+            snapshot.location.line == 3 && snapshot.call_stack.iter().any(|frame| frame == "touch")
+        }));
+        assert!(snapshots.iter().any(|snapshot| {
+            snapshot.variables.iter().any(|variable| {
+                variable.name == "hidden"
+                    && variable.value == "<ASV protected>"
+                    && variable.protection == ProtectionLevel::Asv
+            })
+        }));
+        assert!(!snapshots
+            .iter()
+            .flat_map(|snapshot| &snapshot.variables)
+            .any(|variable| variable.name == "hidden" && variable.value.contains("73")));
+    }
+
     fn run_source_with_prelude(source: &str) -> Result<String, RuntimeError> {
         run_source_with_prelude_and_input(source, vec![])
     }
 
     fn run_source_with_prelude_and_input(
+        source: &str,
+        input: Vec<String>,
+    ) -> Result<String, RuntimeError> {
+        std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .name("apl-self-hosted-runtime-test".to_owned())
+                .stack_size(8 * 1024 * 1024)
+                .spawn_scoped(scope, move || {
+                    run_source_with_prelude_on_current_thread(source, input)
+                })
+                .expect("spawn self-hosted runtime test")
+                .join()
+                .expect("self-hosted runtime test panicked")
+        })
+    }
+
+    fn run_source_with_prelude_on_current_thread(
         source: &str,
         input: Vec<String>,
     ) -> Result<String, RuntimeError> {
@@ -1998,6 +3928,12 @@ mod tests {
             include_str!("../../../std/lexer.apl"),
             "\n\n",
             include_str!("../../../std/parser.apl"),
+            "\n\n",
+            include_str!("../../../std/raw_memory.apl"),
+            "\n\n",
+            include_str!("../../../std/structures.apl"),
+            "\n\n",
+            include_str!("../../../std/classes.apl"),
             "\n\n",
             include_str!("../../../std/checker.apl"),
             "\n\n",
@@ -2164,55 +4100,67 @@ mod tests {
     #[test]
     fn rust_and_apl_frontends_agree_on_core_source_acceptance() {
         let cases = [
-            ("AVInt value = 1 out value", true),
-            ("func halt() { stop } out 1", true),
-            ("out 1 stop out 2", true),
-            ("VTime value = [1, 2][0] out value", true),
-            ("AVStr value = \"line\\nquote=\\\"\" out value", true),
+            ("AVInt value = 1 \nout value", true),
+            ("func halt() { \nstop \n} \nout 1", true),
+            ("out 1 \nstop \nout 2", true),
+            ("VTime value = [1, 2][0] \nout value", true),
+            ("AVStr value = \"line\\nquote=\\\"\" \nout value", true),
+            ("out 1 out 2", false),
+            ("func work() { return 1 }", false),
+            ("func work() {\n  return 1\n}\nout work()", true),
             ("AVInt value =", false),
             ("AVFloat value = 1.", false),
-            ("func pair(left right) { return left }", false),
+            ("func pair(left right) {\n  return left\n}", false),
             ("List values = [1 2]", false),
             ("out \"bad\\q\"", false),
-            ("if true { out 1", false),
+            ("if true { \nout 1", false),
             ("break", false),
             ("return 1", false),
-            ("AVInt value = 1 out missing", false),
-            ("VTime value = 1 value = str(value) out value", true),
+            ("AVInt value = 1 \nout missing", false),
+            ("VTime value = 1 \nvalue = str(value) \nout value", true),
             ("out len([1, 2, 3])", true),
-            ("List values = [1] set(values, -1, 2) out values[0]", true),
-            ("List values = [1] set(values, true, 2)", false),
-            ("List values = [1] VTime result = set(values, 0, 2)", false),
+            (
+                "List values = [1] \nset(values, -1, 2) \nout values[0]",
+                true,
+            ),
+            ("List values = [1] \nset(values, true, 2)", false),
+            (
+                "List values = [1] \nVTime result = set(values, 0, 2)",
+                false,
+            ),
             ("out len(1)", false),
             ("out pow(2)", false),
-            ("AVInt value = 7 % 3 out value", true),
+            ("AVInt value = 7 % 3 \nout value", true),
             ("AVInt value = 7 % 3.0", false),
-            ("AVStr value = \"x\" value %= 2", false),
+            ("AVStr value = \"x\" \nvalue %= 2", false),
             ("AVInt value = true", false),
-            ("ASVInt hidden = 1 out hidden", false),
-            ("while true (-2) { break }", false),
-            ("func same(value, value) { return value }", false),
+            ("ASVInt hidden = 1 \nout hidden", false),
+            ("while true (-2) {\n  break\n}", false),
+            ("func same(value, value) { \nreturn value \n}", false),
             ("out missing()", false),
-            ("func touch(value) { return value } touch(42) out 1", true),
-            ("include >> base out 1", true),
-            ("exclude \"len\" << base out 1", true),
-            ("exclude \"len\" << base out len([1])", false),
             (
-                "exclude \"set\" << base List values = [1] set(values, 0, 2)",
+                "func touch(value) { \nreturn value \n} \ntouch(42) \nout 1",
+                true,
+            ),
+            ("include >> base \nout 1", true),
+            ("exclude \"len\" << base \nout 1", true),
+            ("exclude \"len\" << base \nout len([1])", false),
+            (
+                "exclude \"set\" << base \nList values = [1] \nset(values, 0, 2)",
                 false,
             ),
             (
-                "exclude \"pick\" << base pick(\"A\"): item { out item }",
+                "exclude \"pick\" << base \npick(\"A\"): item { \nout item \n}",
                 false,
             ),
-            ("include >> math out 1", false),
-            ("exclude \"missing\" << base out 1", false),
-            ("include >> base include >> base out 1", false),
+            ("include >> math \nout 1", false),
+            ("exclude \"missing\" << base \nout 1", false),
+            ("include >> base \ninclude >> base \nout 1", false),
             (
-                "exclude \"len\" << base exclude \"len\" << base out 1",
+                "exclude \"len\" << base \nexclude \"len\" << base \nout 1",
                 false,
             ),
-            ("if true { include >> base }", false),
+            ("if true { \ninclude >> base \n}", false),
         ];
         let sources = cases.iter().map(|(source, _)| *source).collect::<Vec<_>>();
         let apl_outcomes = apl_compile_outcomes(&sources);
@@ -2241,10 +4189,10 @@ mod tests {
         let output = run_source_with_prelude(
             r#"
             VTime quote = char(34)
-            VTime ok_source = join(["include >> base exclude ", quote, "pick", quote, " << base out 42"], "")
-            VTime excluded_source = join(["exclude ", quote, "len", quote, " << base out len([1])"], "")
-            VTime unknown_source = "include >> math out 1"
-            VTime nested_source = "if true { include >> base }"
+            VTime ok_source = "include >> base \nexclude \"pick\" << base \nout 42"
+            VTime excluded_source = "exclude \"len\" << base \nout len([1])"
+            VTime unknown_source = "include >> math \nout 1"
+            VTime nested_source = "if true { \ninclude >> base \n}"
             VTime ok_report = bootstrap.compile_report(ok_source)
             VTime excluded_report = bootstrap.compile_report(excluded_source)
             VTime unknown_report = bootstrap.compile_report(unknown_source)
@@ -2265,7 +4213,7 @@ mod tests {
 
         assert_eq!(
             output,
-            "OK1OUTFAILsemantic error at 1:23: excluded symbol `len` from library `base`FAILsemantic error at 1:1: unknown library `math`FAILsemantic error at 1:11: composition directive must be top-level"
+            "OK1OUTFAILsemantic error at 2:1: excluded symbol `len` from library `base`FAILsemantic error at 1:1: unknown library `math`FAILsemantic error at 2:1: composition directive must be top-level"
         );
     }
 
@@ -2275,11 +4223,11 @@ mod tests {
             ("arithmetic", "out (2 + 3) * 4", "OK", "20"),
             (
                 "remainder",
-                "AVInt value = 17 value %= 5 out 2 + 10 % 4 * 3 out value out -17 % 5 out 2 ** 5 % 5",
+                "AVInt value = 17 \nvalue %= 5 \nout 2 + 10 % 4 * 3 \nout value \nout -17 % 5 \nout 2 ** 5 % 5",
                 "OK",
                 "82-22",
             ),
-            ("float", "AVFloat value = -1.5 out value", "OK", "-1.5"),
+            ("float", "AVFloat value = -1.5 \nout value", "OK", "-1.5"),
             (
                 "escapes",
                 r#"out "line\nquote=\" slash=\\ tab=\t""#,
@@ -2288,100 +4236,122 @@ mod tests {
             ),
             (
                 "function",
-                "func double(value) { return value * 2 } out double(21)",
+                "func double(value) { \nreturn value * 2 \n} \nout double(21)",
                 "OK",
                 "42",
             ),
             (
                 "while",
-                "AVInt value = 0 while (value < 4) (10) { value += 1 } out value",
+                "AVInt value = 0 \nwhile (value < 4) (10) { \nvalue += 1 \n} \nout value",
                 "OK",
                 "4",
             ),
-            ("pick", r#"pick("APL"): item { out item }"#, "OK", "APL"),
+            ("pick", r#"pick("APL"): item {
+out item
+}"#, "OK", "APL"),
             (
                 "nested index",
-                "List matrix = [[1, 2], [3, 4]] out matrix[1][0]",
+                "List matrix = [[1, 2], [3, 4]] \nout matrix[1][0]",
                 "OK",
                 "3",
             ),
             (
                 "reverse slice",
-                r#"AVStr value = "APL" out value[::-1]"#,
+                r#"AVStr value = "APL"
+out value[::-1]"#,
                 "OK",
                 "LPA",
             ),
             (
                 "conversions",
-                r#"out int("42") out str(true) out bool(0)"#,
+                r#"out int("42")
+out str(true)
+out bool(0)"#,
                 "OK",
                 "42trueNONE",
             ),
             ("logical", "out (3 < 4) and (4 != 5)", "OK", "true"),
             (
                 "self",
-                "AVInt value = 1 out value =self= value += 1 out value =self=",
+                "AVInt value = 1 \nout value =self= \nvalue += 1 \nout value =self=",
                 "OK",
                 "truefalse",
             ),
-            ("none", "VTime value = NONE out value", "OK", "NONE"),
+            ("none", "VTime value = NONE \nout value", "OK", "NONE"),
             (
                 "list mutation",
-                "List values = [1, 2] add(values, 3) out pop(values) out len(values)",
+                "List values = [1, 2] \nadd(values, 3) \nout pop(values) \nout len(values)",
                 "OK",
                 "32",
             ),
             (
                 "list replacement",
-                "List values = [1, 2, 3] set(values, 0, 9) set(values, -1, 7) set(values, 99, 5) out values[0] out values[2] out len(values)",
+                "List values = [1, 2, 3] \nset(values, 0, 9) \nset(values, -1, 7) \nset(values, 99, 5) \nout values[0] \nout values[2] \nout len(values)",
                 "OK",
                 "973",
             ),
             (
                 "info",
-                r#"SASVStr key = "raw" AVStr typ = "" AVStr level = "" typ, level = info(key) out typ out level"#,
+                r#"SASVStr key = "raw"
+AVStr typ = ""
+AVStr level = ""
+typ, level = info(key)
+out typ
+out level"#,
                 "OK",
                 "StrSASV",
             ),
             (
                 "bare stop",
-                r#"out "before" if true { stop } out "after""#,
+                r#"out "before"
+if true {
+stop
+}
+out "after""#,
                 "STOP",
                 "before",
             ),
             (
                 "if else-if",
-                "AVInt value = 2 if value == 1 { out 1 } else if value == 2 { out 2 } else { out 3 }",
+                "AVInt value = 2 \nif value == 1 { \nout 1 \n} else if value == 2 { \nout 2 \n} else { \nout 3 \n}",
                 "OK",
                 "2",
             ),
             (
                 "while limit",
-                "AVInt value = 0 while (true) (3) { value += 1 } out value",
+                "AVInt value = 0 \nwhile (true) (3) { \nvalue += 1 \n} \nout value",
                 "OK",
                 "3",
             ),
             (
-                "continue and break",
-                "AVInt value = 0 while (value < 10) (20) { value += 1 if value == 2 { continue } if value == 4 { break } out value } out value",
+                "continue \nand break",
+                "AVInt value = 0 \nwhile (value < 10) (20) { \nvalue += 1 \nif value == 2 { \ncontinue \n} \nif value == 4 { \nbreak \n} \nout value \n} \nout value",
                 "OK",
                 "134",
             ),
             (
                 "builtins",
-                r#"out len("APL") out get([7], 0) out join(split("a,b", ","), "-") out contains("apl", "p") out ord("A") out char(66) out pow(2, 5)"#,
+                r#"out len("APL")
+out get([7], 0)
+out join(split("a,b", ","), "-")
+out contains("apl", "p")
+out ord("A")
+out char(66)
+out pow(2, 5)"#,
                 "OK",
                 "37a-btrue65B32",
             ),
             (
                 "slices",
-                r#"out "abcdef"[1:5:2] out [1, 2, 3][-1]"#,
+                r#"out "abcdef"[1:5:2]
+out [1, 2, 3][-1]"#,
                 "OK",
                 "bd3",
             ),
             (
                 "bytes and json",
-                r#"out bytes("AB") out json("42")"#,
+                r#"out bytes("AB")
+out json("42")"#,
                 "OK",
                 "[65, 66]42",
             ),
@@ -2393,19 +4363,19 @@ mod tests {
             ),
             (
                 "nested functions",
-                "func add_one(value) { return value + 1 } func twice(value) { return add_one(add_one(value)) } out twice(40)",
+                "func add_one(value) { \nreturn value + 1 \n} \nfunc twice(value) { \nreturn add_one(add_one(value)) \n} \nout twice(40)",
                 "OK",
                 "42",
             ),
             (
                 "nested scope",
-                "AVInt value = 1 if true { VTime amount = 2 value += amount } out value",
+                "AVInt value = 1 \nif true { \nVTime amount = 2 \nvalue += amount \n} \nout value",
                 "OK",
                 "3",
             ),
             (
                 "base composition",
-                "include >> base exclude \"len\" << base out 42",
+                "include >> base \nexclude \"len\" << base \nout 42",
                 "OK",
                 "42",
             ),
@@ -2432,29 +4402,38 @@ mod tests {
     #[test]
     fn rust_and_apl_runtimes_agree_on_input_programs() {
         let cases: [(&str, &[&str], &str); 6] = [
-            ("VTime value = input out value", &["hello"], "hello"),
+            ("VTime value = input \nout value", &["hello"], "hello"),
             (
-                "AVInt whole = input AVFloat ratio = input AVBool flag = input AVStr text = input out whole out ratio out flag out text",
+                "AVInt whole = input \nAVFloat ratio = input \nAVBool flag = input \nAVStr text = input \nout whole \nout ratio \nout flag \nout text",
                 &["42", "2.5", "true", "abc"],
                 "422.5trueabc",
             ),
             (
-                "AVInt whole = input AVFloat ratio = input AVBool flag = input out whole out ratio out flag",
+                "AVInt whole = input \nAVFloat ratio = input \nAVBool flag = input \nout whole \nout ratio \nout flag",
                 &["bad", "bad", "0"],
                 "NONENONENONE",
             ),
             (
-                r#"VTime first = input VTime second = input out first out "|" out second"#,
+                r#"VTime first = input
+VTime second = input
+out first
+out "|"
+out second"#,
                 &["only"],
                 "only|NONE",
             ),
             (
-                r#"ASVStr hidden = secret input AVStr typ = "" AVStr level = "" typ, level = info(hidden) out typ out level"#,
+                r#"ASVStr hidden = secret input
+AVStr typ = ""
+AVStr level = ""
+typ, level = info(hidden)
+out typ
+out level"#,
                 &["hidden"],
                 "StrASV",
             ),
             (
-                "func read() { return input } out read() out input",
+                "func read() { \nreturn input \n} \nout read() \nout input",
                 &["A", "B"],
                 "AB",
             ),
@@ -2535,7 +4514,7 @@ mod tests {
     fn source_runtime_apl_vm_propagates_integer_overflow_prelude() {
         let error = run_source_with_prelude(
             r#"
-            AVStr source = "AVInt value = input out -value"
+            AVStr source = "AVInt value = input \nout -value"
             VTime output = vm.run_source_with_input(source, ["-9223372036854775808"])
             out output
             "#,
@@ -2625,7 +4604,7 @@ mod tests {
         for (source, expected) in [
             ("out 1 % 0", "remainder by zero"),
             (
-                "AVInt value = -9223372036854775808 out value % -1",
+                "AVInt value = -9223372036854775808 \nout value % -1",
                 "integer overflow in rem",
             ),
         ] {
@@ -2666,18 +4645,134 @@ mod tests {
                     operator: BinaryOperator::Less,
                     right: Box::new(Expression::Literal(Value::Int(10))),
                 },
-                limit: 3,
+                limit: Expression::Literal(Value::Int(3)),
                 body: vec![Statement::Assignment(Assignment {
                     name: "x".to_owned(),
                     operator: AssignmentOperator::AddAssign,
                     value: Expression::Literal(Value::Int(1)),
                 })],
+                limit_body: None,
+                else_body: None,
             }),
             Statement::Out(Expression::Variable("x".to_owned())),
         ])
         .unwrap();
 
         assert_eq!(output, "3");
+    }
+
+    #[test]
+    fn source_runtime_supports_dynamic_loop_limits_and_postfix_assignment() {
+        let output = run_source(
+            r#"
+            AVInt limit = 2
+            AVInt count = 0
+            while (true) (limit) {
+              count++
+              limit = 0
+            }
+            count--
+            out count
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(output, "1");
+    }
+
+    #[test]
+    fn match_and_while_handlers_follow_their_completion_causes() {
+        let output = run_source(
+            r#"
+            AVInt count = 0
+            match 4 {
+              case 1, 2 {
+out "small"
+}
+              case 3..5 {
+out "range"
+}
+              case default {
+out "default"
+}
+            }
+            while (false) (3) {
+out "bad-body"
+} limit {
+out "bad-limit"
+} else {
+out ":else"
+}
+            while (true) (2) {
+count += 1
+} limit {
+out ":limit"
+} else {
+out "bad-else"
+}
+            while (count < 3) (5) {
+count += 1
+} limit {
+out "bad-limit"
+} else {
+out "bad-else"
+}
+            while (true) (1) {
+break
+} limit {
+out "bad-break"
+} else {
+out "bad-break"
+}
+            out ":"
+            out count
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(output, "range:else:limit:3");
+    }
+
+    #[test]
+    fn error_return_terminates_the_whole_program_with_its_code() {
+        let error = run_source(
+            r#"
+            func abort() {
+              return(ERR=["boom"][7])
+            }
+            abort()
+            out "unreachable"
+            "#,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            RuntimeError::FailedWithCode {
+                message: "boom".to_owned(),
+                code: 7,
+            }
+        );
+    }
+
+    #[test]
+    fn float_to_int_truncates_toward_zero() {
+        let output = run_source("out int(3.7) \nout int(-3.7)").unwrap();
+
+        assert_eq!(output, "3-3");
+    }
+
+    #[test]
+    fn json_conversion_and_typed_input_validate_json() {
+        let output = run_source("out json(\"{\") \nout json(\"42\")").unwrap();
+        assert_eq!(output, "NONE42");
+
+        let program = apl_parser::parse_program("AVJson value = input \nout value").unwrap();
+        validate_program(&program).unwrap();
+        let invalid = run_program(&program, vec!["{".to_owned()]).unwrap();
+        let valid = run_program(&program, vec!["[1, 2]".to_owned()]).unwrap();
+        assert_eq!(invalid.stdout, "NONE");
+        assert_eq!(valid.stdout, "[1, 2]");
     }
 
     #[test]
@@ -2763,6 +4858,14 @@ mod tests {
     }
 
     #[test]
+    fn source_runtime_rejects_zero_slice_step() {
+        assert_eq!(
+            run_source("List values = [1, 2, 3] \nVTime invalid = values[::0]"),
+            Err(RuntimeError::Message("zero slice step".to_owned()))
+        );
+    }
+
+    #[test]
     fn source_runtime_uses_apl_lexer_prelude() {
         let output = run_source_with_prelude(
             r#"
@@ -2839,13 +4942,13 @@ mod tests {
     fn source_runtime_uses_apl_parser_prelude() {
         let output = run_source_with_prelude(
             r#"
-            AVStr source = "AVInt x = 42 out x x += 1"
+            AVStr source = "AVInt x = 42 \nout x \nx += 1"
             VTime statements = parser.parse_source(source)
             VTime decl = get(statements, 0)
             VTime out_node = get(statements, 1)
             VTime assign = get(statements, 2)
             VTime literal = get(decl, 3)
-            AVStr loop_source = "while (true) (-1) { break }"
+            AVStr loop_source = "while (true) (-1) { \nbreak \n}"
             VTime loop_node = get(parser.parse_source(loop_source), 0)
 
             out len(statements)
@@ -2863,14 +4966,14 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(output, "3DeclAVIntxInt42OutAssign+=While-1");
+        assert_eq!(output, "3DeclAVIntxInt42OutAssign+=While[Int, -1]");
     }
 
     #[test]
     fn source_runtime_parser_keeps_positions_out_of_the_success_ast() {
         let output = run_source_with_prelude(
             r#"
-            AVStr source = "AVInt x = 1 if true { out missing }"
+            AVStr source = "AVInt x = 1 \nif true { \nout missing \n}"
             VTime compact = parser.parse_source(source)
             VTime located = parser.parse_source_with_positions(source)
             VTime compact_decl = get(compact, 0)
@@ -2886,7 +4989,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(output, "4true607");
+        assert_eq!(output, "4true609");
     }
 
     #[test]
@@ -2894,7 +4997,7 @@ mod tests {
         let output = run_source_with_prelude(
             r#"
             VTime quote = char(34)
-            AVStr source = join(["out ", quote, "(", quote, " out ", quote, "[", quote, " out ", quote, "]", quote, " out ", quote, "input", quote, " out ", quote, "secret", quote, " out ", quote, "-", quote], "")
+            AVStr source = "out \"(\" \nout \"[\" \nout \"]\" \nout \"input\" \nout \"secret\" \nout \"-\""
             VTime statements = parser.parse_source(source)
             out len(statements)
 
@@ -2904,7 +5007,7 @@ mod tests {
               out parser.expr_value(expression)
             }
 
-            AVStr index_source = join(["List values = [", quote, "a", quote, "] VTime value = values[", quote, ":", quote, "] out value"], "")
+            AVStr index_source = "List values = [\"a\"] \nVTime value = values[\":\"] \nout value"
             VTime index_statements = parser.parse_source(index_source)
             VTime index_expression = get(get(index_statements, 1), 2)
             VTime string_index = get(index_expression, 2)
@@ -2922,8 +5025,8 @@ mod tests {
     fn source_runtime_apl_parser_accepts_bare_stop_at_statement_boundaries() {
         let output = run_source_with_prelude(
             r#"
-            AVStr block_source = "func halt() { stop } out \"before\" VTime unused = halt() out \"after\""
-            AVStr statement_source = "out \"before\" stop out \"after\""
+            AVStr block_source = "func halt() { \nstop \n} \nout \"before\" \nVTime unused = halt() \nout \"after\""
+            AVStr statement_source = "out \"before\" \nstop \nout \"after\""
             VTime block_report = bootstrap.run_report(block_source)
             VTime statement_report = bootstrap.run_report(statement_source)
 
@@ -2944,7 +5047,7 @@ mod tests {
     fn source_runtime_uses_apl_ir_prelude() {
         let output = run_source_with_prelude(
             r#"
-            AVStr source = "AVInt x = 42 out x x += 1"
+            AVStr source = "AVInt x = 42 \nout x \nx += 1"
             VTime program = ir.compile_source(source)
             VTime decl = get(program, 0)
             VTime out_instruction = get(program, 1)
@@ -2971,7 +5074,7 @@ mod tests {
     fn source_runtime_uses_apl_vm_prelude() {
         let output = run_source_with_prelude(
             r#"
-            AVStr source = "AVInt x = 41 x += 1 out x"
+            AVStr source = "AVInt x = 41 \nx += 1 \nout x"
             VTime vm_output = vm.run_source(source)
 
             out len(vm_output)
@@ -2987,7 +5090,7 @@ mod tests {
     fn source_runtime_uses_apl_vm_if_prelude() {
         let output = run_source_with_prelude(
             r#"
-            AVStr source = "AVInt x = 1 if x == 1 { x += 41 out x } if x != 42 { out 0 }"
+            AVStr source = "AVInt x = 1 \nif x == 1 { \nx += 41 \nout x \n} \nif x != 42 { \nout 0 \n}"
             VTime vm_output = vm.run_source(source)
 
             out len(vm_output)
@@ -3003,7 +5106,7 @@ mod tests {
     fn source_runtime_uses_apl_vm_else_prelude() {
         let output = run_source_with_prelude(
             r#"
-            AVStr source = "AVInt x = 1 if x == 2 { out 0 } else { x += 41 out x }"
+            AVStr source = "AVInt x = 1 \nif x == 2 { \nout 0 \n} else { \nx += 41 \nout x \n}"
             VTime vm_output = vm.run_source(source)
 
             out len(vm_output)
@@ -3019,7 +5122,7 @@ mod tests {
     fn source_runtime_uses_apl_vm_else_if_prelude() {
         let output = run_source_with_prelude(
             r#"
-            AVStr source = "AVInt x = 2 if x == 1 { out 1 } else if x == 2 { out 42 } else { out 0 }"
+            AVStr source = "AVInt x = 2 \nif x == 1 { \nout 1 \n} else if x == 2 { \nout 42 \n} else { \nout 0 \n}"
             VTime vm_output = vm.run_source(source)
 
             out len(vm_output)
@@ -3035,7 +5138,7 @@ mod tests {
     fn source_runtime_uses_apl_vm_while_prelude() {
         let output = run_source_with_prelude(
             r#"
-            AVStr source = "AVInt x = 0 while ( x < 3 ) ( 10 ) { x += 1 out x }"
+            AVStr source = "AVInt x = 0 \nwhile ( x < 3 ) ( 10 ) { \nx += 1 \nout x \n}"
             VTime vm_output = vm.run_source(source)
 
             out len(vm_output)
@@ -3053,7 +5156,7 @@ mod tests {
     fn source_runtime_uses_apl_vm_loop_flow_prelude() {
         let output = run_source_with_prelude(
             r#"
-            AVStr source = "AVInt x = 0 while ( x < 10 ) ( 20 ) { x += 1 if x == 2 { continue } if x == 5 { break } out x } out x"
+            AVStr source = "AVInt x = 0 \nwhile ( x < 10 ) ( 20 ) { \nx += 1 \nif x == 2 { \ncontinue \n} \nif x == 5 { \nbreak \n} \nout x \n} \nout x"
             VTime vm_output = vm.run_source(source)
 
             out len(vm_output)
@@ -3072,7 +5175,7 @@ mod tests {
     fn source_runtime_uses_apl_vm_function_prelude() {
         let output = run_source_with_prelude(
             r#"
-            AVStr source = "func sum_two(left, right) { return left + right } AVInt x = sum_two(20, 22) out x"
+            AVStr source = "func sum_two(left, right) { \nreturn left + right \n} \nAVInt x = sum_two(20, 22) \nout x"
             VTime vm_output = vm.run_source(source)
 
             out len(vm_output)
@@ -3088,7 +5191,7 @@ mod tests {
     fn source_runtime_apl_vm_scopes_calls_and_blocks() {
         let output = run_source_with_prelude(
             r#"
-            AVStr source = "AVInt counter = 0 func bump(value) { VTime index = value if true { VTime local = index index += 1 } counter += index return index } func wrap(value) { VTime index = 40 return bump(value) + index } out wrap(1) out counter"
+            AVStr source = "AVInt counter = 0 \nfunc bump(value) { \nVTime index = value \nif true { \nVTime local = index \nindex += 1 \n} \ncounter += index \nreturn index \n} \nfunc wrap(value) { \nVTime index = 40 \nreturn bump(value) + index \n} \nout wrap(1) \nout counter"
             VTime vm_output = vm.run_source(source)
 
             out len(vm_output)
@@ -3105,7 +5208,7 @@ mod tests {
     fn source_runtime_uses_apl_vm_list_prelude() {
         let output = run_source_with_prelude(
             r#"
-            AVStr source = "List items = [1, 2] add(items, 3) VTime first = get(items, 0) VTime last = pop(items) out first out last out len(items)"
+            AVStr source = "List items = [1, 2] \nadd(items, 3) \nVTime first = get(items, 0) \nVTime last = pop(items) \nout first \nout last \nout len(items)"
             VTime vm_output = vm.run_source(source)
 
             out len(vm_output)
@@ -3123,7 +5226,7 @@ mod tests {
     fn source_runtime_uses_apl_vm_index_slice_prelude() {
         let output = run_source_with_prelude(
             r#"
-            AVStr source = join(["List items = [1, 2, 3, 4] VTime first = items[0] VTime tail = items[1:] AVStr text = ", char(34), "APL", char(34), " out first out get(tail, 0) out get(tail, 2) out text[::-1]"], "")
+            AVStr source = "List items = [1, 2, 3, 4] \nVTime first = items[0] \nVTime tail = items[1:] \nAVStr text = \"APL\" \nout first \nout get(tail, 0) \nout get(tail, 2) \nout text[::-1]"
             VTime vm_output = vm.run_source(source)
 
             out len(vm_output)
@@ -3142,7 +5245,7 @@ mod tests {
     fn source_runtime_uses_apl_vm_pick_prelude() {
         let output = run_source_with_prelude(
             r#"
-            AVStr source = "List items = [1, 2, 3, 4] AVInt total = 0 pick(items): item { if item == 2 { continue } if item == 4 { break } total += item } out total out item"
+            AVStr source = "List items = [1, 2, 3, 4] \nAVInt total = 0 \npick(items): item { \nif item == 2 { \ncontinue \n} \nif item == 4 { \nbreak \n} \ntotal += item \n} \nout total \nout item"
             VTime vm_output = vm.run_source(source)
 
             out len(vm_output)
@@ -3159,7 +5262,7 @@ mod tests {
     fn source_runtime_uses_apl_vm_info_and_secret_out_prelude() {
         let output = run_source_with_prelude(
             r#"
-            AVStr source = join(["AVStr typ = ", char(34), char(34), " AVStr level = ", char(34), char(34), " SASVStr master = ", char(34), "root", char(34), " typ, level = info(master) out typ out level out master"], "")
+            AVStr source = "AVStr typ = \"\" \nAVStr level = \"\" \nSASVStr master = \"root\" \ntyp, level = info(master) \nout typ \nout level \nout master"
             VTime vm_output = vm.run_source(source)
 
             out len(vm_output)
@@ -3177,7 +5280,7 @@ mod tests {
     fn source_runtime_uses_apl_vm_derived_secret_out_prelude() {
         let output = run_source_with_prelude(
             r#"
-            AVStr source = join(["ASVStr token = ", char(34), "root", char(34), " VTime tmp = token List items = [token] out tmp out token == token out items out get(items, 0)"], "")
+            AVStr source = "ASVStr token = \"root\" \nVTime tmp = token \nList items = [token] \nout tmp \nout token == token \nout items \nout get(items, 0)"
             VTime vm_output = vm.run_source(source)
 
             out len(vm_output)
@@ -3196,7 +5299,7 @@ mod tests {
     fn source_runtime_rejects_apl_vm_secret_downgrade_prelude() {
         let output = run_source_with_prelude(
             r#"
-            AVStr source = join(["out ", char(34), "before", char(34), " ASVStr token = ", char(34), "root", char(34), " VTime tmp = token AVStr public = tmp out public out ", char(34), "after", char(34)], "")
+            AVStr source = "out \"before\" \nASVStr token = \"root\" \nVTime tmp = token \nAVStr public = tmp \nout public \nout \"after\""
             VTime vm_output = vm.run_source(source)
 
             out len(vm_output)
@@ -3213,8 +5316,8 @@ mod tests {
     fn source_runtime_rejects_apl_vm_duplicate_names_prelude() {
         let output = run_source_with_prelude(
             r#"
-            AVStr duplicate_var = join(["AVInt x = 1 out x AVStr x = ", char(34), "bad", char(34), " out x"], "")
-            AVStr duplicate_func = "func same() { return 1 } func same() { return 2 } out same()"
+            AVStr duplicate_var = "AVInt x = 1 \nout x \nAVStr x = \"bad\" \nout x"
+            AVStr duplicate_func = "func same() { \nreturn 1 \n} \nfunc same() { \nreturn 2 \n} \nout same()"
             VTime var_output = vm.run_source(duplicate_var)
             VTime func_output = vm.run_source(duplicate_func)
 
@@ -3234,8 +5337,8 @@ mod tests {
     fn source_runtime_rejects_apl_vm_unknown_mutation_targets_prelude() {
         let output = run_source_with_prelude(
             r#"
-            AVStr assign_source = join(["out ", char(34), "before", char(34), " missing = 4 out ", char(34), "after", char(34)], "")
-            AVStr secretup_source = join(["out ", char(34), "start", char(34), " secretup(missing) out ", char(34), "after", char(34)], "")
+            AVStr assign_source = "out \"before\" \nmissing = 4 \nout \"after\""
+            AVStr secretup_source = "out \"start\" \nsecretup(missing) \nout \"after\""
             VTime assign_output = vm.run_source(assign_source)
             VTime secretup_output = vm.run_source(secretup_source)
 
@@ -3256,10 +5359,10 @@ mod tests {
     fn source_runtime_rejects_apl_vm_bad_compound_assignments_prelude() {
         let output = run_source_with_prelude(
             r#"
-            AVStr public_source = "AVInt x = 1 x += 2 out x"
-            AVStr secret_source = "ASVInt x = 1 x += 2 out x"
-            AVStr string_source = join(["AVStr text = ", char(34), "a", char(34), " text += ", char(34), "b", char(34), " out text"], "")
-            AVStr list_source = "List items = [1] items = [2] out items"
+            AVStr public_source = "AVInt x = 1 \nx += 2 \nout x"
+            AVStr secret_source = "ASVInt x = 1 \nx += 2 \nout x"
+            AVStr string_source = "AVStr text = \"a\" \ntext += \"b\" \nout text"
+            AVStr list_source = "List items = [1] \nitems = [2] \nout items"
             VTime public_output = vm.run_source(public_source)
             VTime secret_output = vm.run_source(secret_source)
             VTime string_output = vm.run_source(string_source)
@@ -3280,10 +5383,10 @@ mod tests {
     fn source_runtime_rejects_apl_vm_bad_info_targets_prelude() {
         let output = run_source_with_prelude(
             r#"
-            AVStr ok_source = join(["AVStr typ = ", char(34), char(34), " AVStr level = ", char(34), char(34), " SASVStr master = ", char(34), "root", char(34), " typ, level = info(master) out typ out level"], "")
-            AVStr missing_target_source = join(["out ", char(34), "before", char(34), " SASVStr master = ", char(34), "root", char(34), " typ, level = info(master) out typ"], "")
-            AVStr secret_target_source = join(["ASVStr typ = ", char(34), char(34), " AVStr level = ", char(34), char(34), " AVStr public = ", char(34), "x", char(34), " typ, level = info(public) out level"], "")
-            AVStr vtime_source = join(["AVStr typ = ", char(34), char(34), " AVStr level = ", char(34), char(34), " VTime tmp = 1 typ, level = info(tmp) out typ"], "")
+            AVStr ok_source = "AVStr typ = \"\" \nAVStr level = \"\" \nSASVStr master = \"root\" \ntyp, level = info(master) \nout typ \nout level"
+            AVStr missing_target_source = "out \"before\" \nSASVStr master = \"root\" \ntyp, level = info(master) \nout typ"
+            AVStr secret_target_source = "ASVStr typ = \"\" \nAVStr level = \"\" \nAVStr public = \"x\" \ntyp, level = info(public) \nout level"
+            AVStr vtime_source = "AVStr typ = \"\" \nAVStr level = \"\" \nVTime tmp = 1 \ntyp, level = info(tmp) \nout typ"
             VTime ok_output = vm.run_source(ok_source)
             VTime missing_target_output = vm.run_source(missing_target_source)
             VTime secret_target_output = vm.run_source(secret_target_source)
@@ -3306,7 +5409,7 @@ mod tests {
     fn source_runtime_guards_apl_vm_list_mutation_builtins_prelude() {
         let output = run_source_with_prelude(
             r#"
-            AVStr source = "List items = [1] add(items, 2) AVInt x = 7 VTime bad_add = add(x, 9) VTime missing_add = add(missing, 1) VTime missing_pop = pop(missing) out len(items) out pop(items) out len(items) out bad_add out missing_add out missing_pop"
+            AVStr source = "List items = [1] \nadd(items, 2) \nAVInt x = 7 \nVTime bad_add = add(x, 9) \nVTime missing_add = add(missing, 1) \nVTime missing_pop = pop(missing) \nout len(items) \nout pop(items) \nout len(items) \nout bad_add \nout missing_add \nout missing_pop"
             VTime vm_output = vm.run_source(source)
 
             out len(vm_output)
@@ -3327,9 +5430,9 @@ mod tests {
     fn source_runtime_uses_apl_vm_secret_aware_stop_fail_prelude() {
         let output = run_source_with_prelude(
             r#"
-            AVStr public_stop = join(["stop ", char(34), "done", char(34), " out ", char(34), "after", char(34)], "")
-            AVStr secret_stop = join(["ASVStr token = ", char(34), "root", char(34), " stop token out ", char(34), "after", char(34)], "")
-            AVStr public_fail = join(["fail ", char(34), "bad", char(34), " out ", char(34), "after", char(34)], "")
+            AVStr public_stop = "stop \"done\" \nout \"after\""
+            AVStr secret_stop = "ASVStr token = \"root\" \nstop token \nout \"after\""
+            AVStr public_fail = "fail \"bad\" \nout \"after\""
             VTime stop_output = vm.run_source(public_stop)
             VTime secret_output = vm.run_source(secret_stop)
             VTime fail_output = vm.run_source(public_fail)
@@ -3351,9 +5454,9 @@ mod tests {
     fn source_runtime_propagates_apl_vm_stop_fail_through_function_calls_prelude() {
         let output = run_source_with_prelude(
             r#"
-            AVStr stop_source = join(["func halt() { stop ", char(34), "done", char(34), " } out ", char(34), "before", char(34), " VTime unused = halt() out ", char(34), "after", char(34)], "")
-            AVStr fail_source = join(["func reject() { fail ", char(34), "bad", char(34), " } out ", char(34), "before", char(34), " VTime unused = reject() out ", char(34), "after", char(34)], "")
-            AVStr nested_source = join(["func halt() { stop ", char(34), "deep", char(34), " } func late() { out ", char(34), "late", char(34), " return 1 } func pair(left, right) { return left } out ", char(34), "before", char(34), " VTime unused = pair(halt(), late()) out ", char(34), "after", char(34)], "")
+            AVStr stop_source = "func halt() { \nstop \"done\" \n} \nout \"before\" \nVTime unused = halt() \nout \"after\""
+            AVStr fail_source = "func reject() { \nfail \"bad\" \n} \nout \"before\" \nVTime unused = reject() \nout \"after\""
+            AVStr nested_source = "func halt() { \nstop \"deep\" \n} \nfunc late() { \nout \"late\" \nreturn 1 \n} \nfunc pair(left, right) { \nreturn left \n} \nout \"before\" \nVTime unused = pair(halt(), late()) \nout \"after\""
             VTime stop_report = vm.run_source_report(stop_source)
             VTime fail_report = vm.run_source_report(fail_source)
             VTime nested_report = vm.run_source_report(nested_source)
@@ -3381,7 +5484,7 @@ mod tests {
     fn source_runtime_uses_apl_vm_grouped_logical_conditions_prelude() {
         let output = run_source_with_prelude(
             r#"
-            AVStr source = join(["AVBool a = true AVBool b = false ASVBool hidden = true if (a == true) and (b != true) { out ", char(34), "ok", char(34), " } if (hidden == true) or (b == true) { out hidden == true }"], "")
+            AVStr source = "AVBool a = true \nAVBool b = false \nASVBool hidden = true \nif (a == true) and (b != true) { \nout \"ok\" \n} \nif (hidden == true) or (b == true) { \nout hidden == true \n}"
             VTime vm_output = vm.run_source(source)
 
             out len(vm_output)
@@ -3398,7 +5501,7 @@ mod tests {
     fn source_runtime_uses_apl_vm_expression_precedence_prelude() {
         let output = run_source_with_prelude(
             r#"
-            AVStr source = "AVInt x = 1 + 2 * 3 AVInt y = (1 + 2) * 3 AVBool ok = (x == 7) and (y == 9) or false out x out y out ok"
+            AVStr source = "AVInt x = 1 + 2 * 3 \nAVInt y = (1 + 2) * 3 \nAVBool ok = (x == 7) and (y == 9) or false \nout x \nout y \nout ok"
             VTime vm_output = vm.run_source(source)
 
             out len(vm_output)
@@ -3416,7 +5519,7 @@ mod tests {
     fn source_runtime_uses_apl_vm_float_literals_prelude() {
         let output = run_source_with_prelude(
             r#"
-            AVStr source = "AVFloat x = 1.5 AVFloat y = -2.5 AVFloat z = x + y out z out z < 0.0"
+            AVStr source = "AVFloat x = 1.5 \nAVFloat y = -2.5 \nAVFloat z = x + y \nout z \nout z < 0.0"
             VTime vm_output = vm.run_source(source)
 
             out len(vm_output)
@@ -3433,7 +5536,7 @@ mod tests {
     fn source_runtime_uses_apl_vm_unary_expressions_prelude() {
         let output = run_source_with_prelude(
             r#"
-            AVStr source = "AVInt x = 4 AVInt y = -x AVFloat z = -1.5 AVBool flag = false out y out z out not flag out -(x + 1)"
+            AVStr source = "AVInt x = 4 \nAVInt y = -x \nAVFloat z = -1.5 \nAVBool flag = false \nout y \nout z \nout not flag \nout -(x + 1)"
             VTime vm_output = vm.run_source(source)
 
             out len(vm_output)
@@ -3452,7 +5555,7 @@ mod tests {
     fn source_runtime_uses_apl_vm_pow_builtin_prelude() {
         let output = run_source_with_prelude(
             r#"
-            AVStr source = "AVInt x = pow(2, 3) AVFloat y = pow(2.0, 3) AVInt bad = pow(2, -1) ASVInt hidden = 2 out x out y == 8.0 out bad out pow(hidden, 2)"
+            AVStr source = "AVInt x = pow(2, 3) \nAVFloat y = pow(2.0, 3) \nAVInt bad = pow(2, -1) \nASVInt hidden = 2 \nout x \nout y == 8.0 \nout bad \nout pow(hidden, 2)"
             VTime vm_output = vm.run_source(source)
 
             out len(vm_output)
@@ -3471,7 +5574,7 @@ mod tests {
     fn source_runtime_uses_apl_vm_power_operator_prelude() {
         let output = run_source_with_prelude(
             r#"
-            AVStr source = "AVInt nested = 2 ** 3 ** 2 AVInt signed = -2 ** 2 AVFloat decimal = 2.0 ** 3 AVInt negative = 2 ** -1 AVInt overflow = 2 ** 63 out nested out signed out decimal out negative out overflow"
+            AVStr source = "AVInt nested = 2 ** 3 ** 2 \nAVInt signed = -2 ** 2 \nAVFloat decimal = 2.0 ** 3 \nAVInt negative = 2 ** -1 \nAVInt overflow = 2 ** 63 \nout nested \nout signed \nout decimal \nout negative \nout overflow"
             VTime vm_output = vm.run_source(source)
 
             out len(vm_output)
@@ -3489,7 +5592,7 @@ mod tests {
     fn source_runtime_uses_apl_vm_remainder_operator_prelude() {
         let output = run_source_with_prelude(
             r#"
-            AVStr source = "AVInt cycle = 17 cycle %= 5 AVFloat decimal = 5.5 % 2.0 out 2 + 10 % 4 * 3 out cycle out -17 % 5 out decimal"
+            AVStr source = "AVInt cycle = 17 \ncycle %= 5 \nAVFloat decimal = 5.5 % 2.0 \nout 2 + 10 % 4 * 3 \nout cycle \nout -17 % 5 \nout decimal"
             VTime vm_output = vm.run_source(source)
 
             out len(vm_output)
@@ -3507,11 +5610,15 @@ mod tests {
     fn source_runtime_apl_vm_propagates_remainder_errors_prelude() {
         for (driver, expected) in [
             (
-                r#"AVStr source = "out 1 % 0" VTime output = vm.run_source(source) out output"#,
+                r#"AVStr source = "out 1 % 0"
+VTime output = vm.run_source(source)
+out output"#,
                 "remainder by zero",
             ),
             (
-                r#"AVStr source = "AVInt value = -9223372036854775808 out value % -1" VTime output = vm.run_source(source) out output"#,
+                r#"AVStr source = "AVInt value = -9223372036854775808 \nout value % -1"
+VTime output = vm.run_source(source)
+out output"#,
                 "integer overflow in rem",
             ),
         ] {
@@ -3530,10 +5637,10 @@ mod tests {
             apl_compile_outcomes(&[
                 "AVInt value = 2 ** 8",
                 "AVFloat value = 2.0 ** 8",
-                "AVInt hidden = 2 ASVInt result = hidden ** 8",
+                "AVInt hidden = 2 \nASVInt result = hidden ** 8",
                 "AVInt value = true ** 2",
                 "AVInt value = 2 ** 2.0",
-                "ASVInt hidden = 2 AVInt leaked = hidden ** 8",
+                "ASVInt hidden = 2 \nAVInt leaked = hidden ** 8",
             ]),
             vec!["OK", "OK", "OK", "FAIL", "FAIL", "FAIL"]
         );
@@ -3543,7 +5650,7 @@ mod tests {
     fn source_runtime_uses_apl_vm_self_check_prelude() {
         let output = run_source_with_prelude(
             r#"
-            AVStr source = join(["AVInt x = 4 out x =self= x += 1 out x =self= ASVStr token = ", char(34), "root", char(34), " out token =self="], "")
+            AVStr source = "AVInt x = 4 \nout x =self= \nx += 1 \nout x =self= \nASVStr token = \"root\" \nout token =self="
             VTime vm_output = vm.run_source(source)
 
             out len(vm_output)
@@ -3580,7 +5687,7 @@ mod tests {
     fn source_runtime_uses_apl_vm_conversion_builtins_prelude() {
         let output = run_source_with_prelude(
             r#"
-            AVStr source = join(["AVStr raw = ", char(34), "42", char(34), " AVStr bad = ", char(34), "no", char(34), " ASVStr hidden = ", char(34), "7", char(34), " out int(raw) out int(bad) out bool(", char(34), "true", char(34), ") out str(42) out int(hidden)"], "")
+            AVStr source = "AVStr raw = \"42\" \nAVStr bad = \"no\" \nASVStr hidden = \"7\" \nout int(raw) \nout int(bad) \nout bool(\"true\") \nout str(42) \nout int(hidden)"
             VTime vm_output = vm.run_source(source)
 
             out len(vm_output)
@@ -3601,7 +5708,7 @@ mod tests {
     fn source_runtime_uses_apl_vm_secretup_prelude() {
         let output = run_source_with_prelude(
             r#"
-            AVStr source = join(["AVStr token = ", char(34), "root", char(34), " AVStr typ = ", char(34), char(34), " AVStr level = ", char(34), char(34), " secretup(token) typ, level = info(token) out level out token secretup(token) typ, level = info(token) out level out token =self="], "")
+            AVStr source = "AVStr token = \"root\" \nAVStr typ = \"\" \nAVStr level = \"\" \nsecretup(token) \ntyp, level = info(token) \nout level \nout token \nsecretup(token) \ntyp, level = info(token) \nout level \nout token =self="
             VTime vm_output = vm.run_source(source)
 
             out len(vm_output)
@@ -3620,7 +5727,7 @@ mod tests {
     fn source_runtime_uses_apl_vm_string_helper_builtins_prelude() {
         let output = run_source_with_prelude(
             r#"
-            AVStr source = join(["AVStr text = ", char(34), "A P L", char(34), " List parts = split(text, ", char(34), " ", char(34), ") ASVStr hidden = ", char(34), "secret words", char(34), " out len(parts) out join(parts, ", char(34), "-", char(34), ") out contains(text, ", char(34), "P", char(34), ") out ord(", char(34), "A", char(34), ") out char(90) out split(hidden, ", char(34), " ", char(34), ")"], "")
+            AVStr source = "AVStr text = \"A P L\" \nList parts = split(text, \" \") \nASVStr hidden = \"secret words\" \nout len(parts) \nout join(parts, \"-\") \nout contains(text, \"P\") \nout ord(\"A\") \nout char(90) \nout split(hidden, \" \")"
             VTime vm_output = vm.run_source(source)
 
             out len(vm_output)
@@ -3641,7 +5748,7 @@ mod tests {
     fn source_runtime_uses_apl_vm_tagged_list_elements_prelude() {
         let output = run_source_with_prelude(
             r#"
-            AVStr source = join(["AVStr typ = ", char(34), char(34), " AVStr level = ", char(34), char(34), " List items = [1:SASV, ", char(34), "public", char(34), "] add(items, ", char(34), "hidden", char(34), ":ASV) set(items, 1, ", char(34), "replaced", char(34), ":ASV) typ, level = info(items) out typ out level out items out get(items, 0) out get(items, 1) out get(items, 2) pick(items): item { out item }"], "")
+            AVStr source = "AVStr typ = \"\" \nAVStr level = \"\" \nList items = [1:SASV, \"public\"] \nadd(items, \"hidden\":ASV) \nset(items, 1, \"replaced\":ASV) \ntyp, level = info(items) \nout typ \nout level \nout items \nout get(items, 0) \nout get(items, 1) \nout get(items, 2) \npick(items): item { \nout item \n}"
             VTime vm_output = vm.run_source(source)
 
             out len(vm_output)
@@ -3668,7 +5775,7 @@ mod tests {
     fn source_runtime_uses_apl_vm_input_placeholders_prelude() {
         let output = run_source_with_prelude(
             r#"
-            AVStr source = join(["AVStr public = input ASVStr hidden = secret input AVStr typ = ", char(34), char(34), " AVStr level = ", char(34), char(34), " typ, level = info(public) out typ out level out public typ, level = info(hidden) out typ out level out hidden"], "")
+            AVStr source = "AVStr public = input \nASVStr hidden = secret input \nAVStr typ = \"\" \nAVStr level = \"\" \ntyp, level = info(public) \nout typ \nout level \nout public \ntyp, level = info(hidden) \nout typ \nout level \nout hidden"
             VTime vm_output = vm.run_source(source)
 
             out len(vm_output)
@@ -3689,7 +5796,7 @@ mod tests {
     fn source_runtime_uses_apl_vm_input_stream_prelude() {
         let output = run_source_with_prelude(
             r#"
-            AVStr source = "AVStr public = input ASVStr hidden = secret input AVStr missing = input out public out hidden out missing"
+            AVStr source = "AVStr public = input \nASVStr hidden = secret input \nAVStr missing = input \nout public \nout hidden \nout missing"
             VTime vm_output = vm.run_source_with_input(source, ["hello", "token"])
 
             out len(vm_output)
@@ -3707,7 +5814,7 @@ mod tests {
     fn source_runtime_runs_compiled_bootstrap_scenario_prelude() {
         let output = run_source_with_prelude(
             r#"
-            AVStr source = "AVStr public = input ASVStr hidden = secret input AVInt age = input List values = [age, 2, [3, 4]] func inc(x) { return x + 1 } VTime next = inc(age) VTime first = values[0] out public out next out first AVStr missing = input out missing"
+            AVStr source = "AVStr public = input \nASVStr hidden = secret input \nAVInt age = input \nList values = [age, 2, [3, 4]] \nfunc inc(x) { \nreturn x + 1 \n} \nVTime next = inc(age) \nVTime first = values[0] \nout public \nout next \nout first \nAVStr missing = input \nout missing"
             VTime vm_output = bootstrap.run_with_input(source, ["hello", "token", "41"])
 
             out len(vm_output)
@@ -3726,7 +5833,7 @@ mod tests {
     fn source_runtime_uses_apl_bootstrap_facade_prelude() {
         let output = run_source_with_prelude(
             r#"
-            AVStr source = "AVInt x = input x += 1 out x"
+            AVStr source = "AVInt x = input \nx += 1 \nout x"
             VTime tokens = bootstrap.tokens(source)
             VTime ast = bootstrap.ast(source)
             VTime program = bootstrap.ir(source)
@@ -3740,16 +5847,16 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(output, "9DeclDECL5");
+        assert_eq!(output, "11DeclDECL5");
     }
 
     #[test]
     fn source_runtime_uses_apl_bootstrap_report_facade_prelude() {
         let output = run_source_with_prelude(
             r#"
-            AVStr ok_source = "AVInt x = input x += 1 out x"
-            AVStr stop_source = join(["out ", char(34), "before", char(34), " stop ", char(34), "done", char(34), " out ", char(34), "after", char(34)], "")
-            AVStr fail_source = join(["out ", char(34), "before", char(34), " fail ", char(34), "bad", char(34), " out ", char(34), "after", char(34)], "")
+            AVStr ok_source = "AVInt x = input \nx += 1 \nout x"
+            AVStr stop_source = "out \"before\" \nstop \"done\" \nout \"after\""
+            AVStr fail_source = "out \"before\" \nfail \"bad\" \nout \"after\""
 
             VTime ok_report = bootstrap.run_with_input_report(ok_source, ["4"])
             VTime stop_report = bootstrap.run_report(stop_source)
@@ -3774,7 +5881,7 @@ mod tests {
     fn source_runtime_uses_apl_bootstrap_compile_report_prelude() {
         let output = run_source_with_prelude(
             r#"
-            AVStr ok_source = "AVInt x = 1 out x"
+            AVStr ok_source = "AVInt x = 1 \nout x"
             AVStr bad_source = "AVInt x 1 out x"
 
             VTime ok_report = bootstrap.compile_report(ok_source)
@@ -3803,13 +5910,13 @@ mod tests {
             r#"
             VTime quote = char(34)
             VTime slash = char(92)
-            VTime unicode_source = join(["out ", quote, char(1105), char(1078), quote, " AVInt x 1"], "")
+            VTime unicode_source = "out \"ёж\" \nAVInt x 1"
             VTime crlf_source = join(["out 1", char(13), char(10), "AVInt x 1"], "")
             VTime escape_source = join(["out ", quote, char(1105), char(1078), slash, "q", quote], "")
             VTime tokenized = lexer.tokenize_with_offsets(unicode_source)
             VTime offsets = get(tokenized, 1)
-            VTime declaration_position = lexer.position_at(unicode_source, get(offsets, 2))
-            VTime bad_value_position = lexer.position_at(unicode_source, get(offsets, 4))
+            VTime declaration_position = lexer.position_at(unicode_source, get(offsets, 3))
+            VTime bad_value_position = lexer.position_at(unicode_source, get(offsets, 5))
             VTime unicode_report = bootstrap.compile_report(unicode_source)
             VTime crlf_report = bootstrap.compile_report(crlf_source)
             VTime escape_report = bootstrap.compile_report(escape_source)
@@ -3836,7 +5943,7 @@ mod tests {
 
         assert_eq!(
             output,
-            "1:10|1:18|FAILparse error at 1:18: declaration expects =|FAILparse error at 2:9: declaration expects =|FAILparse error at 1:8: invalid escape sequence `\\q`"
+            "2:1|2:9|FAILparse error at 2:9: declaration expects =|FAILparse error at 2:9: declaration expects =|FAILparse error at 1:8: invalid escape sequence `\\q`"
         );
     }
 
@@ -3864,7 +5971,7 @@ mod tests {
     fn source_runtime_apl_frontend_checks_numeric_literal_boundaries() {
         let output = run_source_with_prelude(
             r#"
-            AVStr min_source = "AVInt value = -9223372036854775808 out value"
+            AVStr min_source = "AVInt value = -9223372036854775808 \nout value"
             AVStr positive_overflow = "AVInt value = 9223372036854775808"
             AVStr negative_overflow = "AVInt value = -9223372036854775809"
             AVStr trailing_dot = "AVFloat value = 1."
@@ -3898,16 +6005,16 @@ mod tests {
             r#"
             VTime quote = char(34)
             List sources = [
-              "if true { out 1",
+              "if true {\nout 1\n",
               "AVInt value = (1 + 2",
               "VTime value = len([1]",
               "List values = [1, 2",
               "VTime value = pow(2 3)",
               "List values = [1 2]",
               "VTime value = pow(2,)",
-              "List values = [1] VTime value = values[0",
-              "out 1 } out 2",
-              join(["if true { out 1 ", quote, "}", quote], "")
+              "List values = [1] \nVTime value = values[0",
+              "out 1 \n} out 2",
+              "if true {\nout 1\n\"}\"\n"
             ]
 
             pick(sources): source {
@@ -3921,7 +6028,7 @@ mod tests {
 
         assert_eq!(
             output,
-            "FAILparse error at 1:16: expected }FAILparse error at 1:21: group expects )FAILparse error at 1:22: call expects )FAILparse error at 1:20: list expects ]FAILparse error at 1:21: call expects , or )FAILparse error at 1:18: list expects , or ]FAILparse error at 1:21: expected expression after ,FAILparse error at 1:41: index expects ]FAILparse error at 1:7: unexpected }FAILparse error at 1:17: unknown statement"
+            "FAILparse error at 3:1: expected }FAILparse error at 1:21: group expects )FAILparse error at 1:22: call expects )FAILparse error at 1:20: list expects ]FAILparse error at 1:21: call expects , or )FAILparse error at 1:18: list expects , or ]FAILparse error at 1:21: expected expression after ,FAILparse error at 2:23: index expects ]FAILparse error at 2:1: unexpected }FAILparse error at 3:1: unknown statement"
         );
     }
 
@@ -3944,10 +6051,10 @@ mod tests {
               join(["type, ", quote, "level", quote, " = info(source)"], ""),
               join(["type, level = info(", quote, "source", quote, ")"], ""),
               join([quote, "if", quote, " true { out 1 }"], ""),
-              join(["VTime value = 1 ", quote, "+", quote, " 2"], ""),
-              join(["VTime value = 1 ", quote, "==", quote, " 1"], ""),
-              join(["VTime value = true ", quote, "and", quote, " false"], ""),
-              join(["AVInt x = 1 VTime value = x ", quote, "=self=", quote], ""),
+              "VTime value = 1 \n\"+\" 2",
+              "VTime value = 1 \n\"==\" 1",
+              "VTime value = true \n\"and\" false",
+              "AVInt x = 1 \nVTime value = x \n\"=self=\"",
               join(["List values = [1 ", quote, ":", quote, " ASV]"], ""),
               join(["VTime value = secret ", quote, "input", quote], "")
             ]
@@ -3963,7 +6070,7 @@ mod tests {
 
         assert_eq!(
             output,
-            "FAILparse error at 1:5: unterminated string literalFAILparse error at 1:7: declaration expects identifierFAILparse error at 1:6: list declaration expects identifierFAILparse error at 1:7: vtime declaration expects identifierFAILparse error at 1:6: func expects identifierFAILparse error at 1:8: func expects parameter identifierFAILparse error at 1:10: func expects , or )FAILparse error at 1:10: func expects parameter identifierFAILparse error at 1:12: pick expects item identifierFAILparse error at 1:10: secretup expects identifierFAILparse error at 1:7: info assignment expects identifierFAILparse error at 1:20: info assignment expects source identifierFAILparse error at 1:1: unknown statementFAILparse error at 1:17: unknown statementFAILparse error at 1:17: unknown statementFAILparse error at 1:20: unknown statementFAILparse error at 1:29: unknown statementFAILparse error at 1:18: list expects , or ]FAILsemantic error at 1:1: unknown variable `secret`"
+            "FAILparse error at 1:5: unterminated string literalFAILparse error at 1:7: declaration expects identifierFAILparse error at 1:6: list declaration expects identifierFAILparse error at 1:7: vtime declaration expects identifierFAILparse error at 1:6: func expects identifierFAILparse error at 1:8: func expects parameter identifierFAILparse error at 1:10: func expects , or )FAILparse error at 1:10: func expects parameter identifierFAILparse error at 1:12: pick expects item identifierFAILparse error at 1:10: secretup expects identifierFAILparse error at 1:7: info assignment expects identifierFAILparse error at 1:20: info assignment expects source identifierFAILparse error at 1:1: unknown statementFAILparse error at 2:1: unknown statementFAILparse error at 2:1: unknown statementFAILparse error at 2:1: unknown statementFAILparse error at 3:1: unknown statementFAILparse error at 1:18: list expects , or ]FAILsemantic error at 1:1: unknown variable `secret`"
         );
     }
 
@@ -3971,7 +6078,7 @@ mod tests {
     fn source_runtime_uses_apl_bootstrap_artifact_report_prelude() {
         let output = run_source_with_prelude(
             r#"
-            AVStr ok_source = "AVInt x = 1 out x"
+            AVStr ok_source = "AVInt x = 1 \nout x"
             AVStr bad_source = "AVInt x 1 out x"
 
             VTime ok_report = bootstrap.artifact_report(ok_source)
@@ -3998,7 +6105,7 @@ mod tests {
     fn source_runtime_runs_apl_bootstrap_artifact_images_prelude() {
         let output = run_source_with_prelude(
             r#"
-            AVStr source = "func inc(x) { return x + 1 } AVInt x = input out inc(x)"
+            AVStr source = "func inc(x) { \nreturn x + 1 \n} \nAVInt x = input \nout inc(x)"
             VTime image_report = bootstrap.artifact_image_report(source)
             VTime image = get(image_report, 1)
             VTime first_run = bootstrap.run_artifact_image_with_input_report(image, ["4"])
@@ -4025,7 +6132,7 @@ mod tests {
     fn source_runtime_runs_loaded_apl_images_prelude() {
         let output = run_source_with_prelude(
             r#"
-            AVStr source = "func inc(x) { return add_one(x) } func add_one(x) { return x + 1 } AVInt x = input out inc(x)"
+            AVStr source = "func inc(x) { \nreturn add_one(x) \n} \nfunc add_one(x) { \nreturn x + 1 \n} \nAVInt x = input \nout inc(x)"
             VTime loaded_report = bootstrap.loaded_image_report(source)
             VTime loaded = get(loaded_report, 1)
             VTime entry_call = get(get(get(loaded, 1), 1), 1)
@@ -4068,7 +6175,7 @@ mod tests {
     fn source_runtime_apl_linker_retains_only_reachable_functions_prelude() {
         let output = run_source_with_prelude(
             r#"
-            AVStr source = "func dead(x) { return x + 100 } func even(x) { if x == 0 { return true } return odd(x - 1) } func unused_middle() { return dead(1) } func odd(x) { if x == 0 { return false } return even(x - 1) } func recurse(x) { if x == 0 { return 0 } return recurse(x - 1) } out even(4) out recurse(3)"
+            AVStr source = "func dead(x) { \nreturn x + 100 \n} \nfunc even(x) { \nif x == 0 { \nreturn true \n} \nreturn odd(x - 1) \n} \nfunc unused_middle() { \nreturn dead(1) \n} \nfunc odd(x) { \nif x == 0 { \nreturn false \n} \nreturn even(x - 1) \n} \nfunc recurse(x) { \nif x == 0 { \nreturn 0 \n} \nreturn recurse(x - 1) \n} \nout even(4) \nout recurse(3)"
             VTime encoded_report = bootstrap.linked_artifact_report(source)
             VTime encoded = get(encoded_report, 1)
             VTime loaded_report = bootstrap.load_linked_artifact_report(encoded)
@@ -4100,7 +6207,7 @@ mod tests {
     fn source_runtime_lowers_linked_programs_to_linear_native_ir_prelude() {
         let output = run_source_with_prelude(
             r#"
-            AVStr source = "func twice(value) { return value * 2 } AVInt x = 1 out twice(x + 2)"
+            AVStr source = "func twice(value) { \nreturn value * 2 \n} \nAVInt x = 1 \nout twice(x + 2)"
             VTime linked = bootstrap.linked_artifact_report(source)
             VTime lowered = native.lower_linked_artifact_report(get(linked, 1))
             VTime encoded = get(lowered, 1)
@@ -4145,7 +6252,7 @@ mod tests {
     fn source_runtime_native_ir_flattens_control_flow_and_scope_unwinds_prelude() {
         let output = run_source_with_prelude(
             r#"
-            AVStr source = "AVInt x = 0 if true { x = 1 } else { x = 2 } while (x < 3) (4) { if x == 1 { x += 1 continue } if x == 2 { break } } pick([1, 2]): item { if item == 1 { continue } break }"
+            AVStr source = "AVInt x = 0 \nif true { \nx = 1 \n} else { \nx = 2 \n} \nwhile (x < 3) (4) { \nif x == 1 { \nx += 1 \ncontinue \n} \nif x == 2 { \nbreak \n} \n} \npick([1, 2]): item { \nif item == 1 { \ncontinue \n} \nbreak \n}"
             VTime linked = bootstrap.linked_artifact_report(source)
             VTime lowered = native.lower_linked_artifact_report(get(linked, 1))
             VTime image = get(native.decode_image_report(get(lowered, 1)), 1)
@@ -4192,14 +6299,14 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(output, "OKOKtrue125112,2,2,1");
+        assert_eq!(output, "OKOKtrue166112,2,2,1");
     }
 
     #[test]
     fn source_runtime_native_ir_covers_current_value_and_statement_surface_prelude() {
         let output = run_source_with_prelude(
             r#"
-            AVStr source = "func echo(value) { return value } AVInt x = input AVFloat ratio = 2.5 ASVStr hidden = secret input AVBool same = x =self= AVStr type_name = \"\" AVStr protection = \"\" type_name, protection = info(x) List items = [1:ASV, 2] VTime first = items[0] VTime part = items[:] VTime neg = -x x += 1 add(items, 3) set(items, 0, 4) VTime last = pop(items) VTime returned = echo(neg + 2) secretup(x) if false { fail \"never\" } out \"ok\" stop"
+            AVStr source = "func echo(value) { \nreturn value \n} \nAVInt x = input \nAVFloat ratio = 2.5 \nASVStr hidden = secret input \nAVBool same = x =self= \nAVStr type_name = \"\" \nAVStr protection = \"\" \ntype_name, protection = info(x) \nList items = [1:ASV, 2] \nVTime first = items[0] \nVTime part = items[:] \nVTime neg = -x \nx += 1 \nadd(items, 3) \nset(items, 0, 4) \nVTime last = pop(items) \nVTime returned = echo(neg + 2) \nsecretup(x) \nif false { \nfail \"never\" \n} \nout \"ok\" \nstop"
             VTime linked = bootstrap.linked_artifact_report(source)
             VTime lowered = native.lower_linked_artifact_report(get(linked, 1))
             VTime image = get(native.decode_image_report(get(lowered, 1)), 1)
@@ -4348,7 +6455,7 @@ mod tests {
     fn source_runtime_lowers_native_ir_to_stable_platform_abi_prelude() {
         let output = run_source_with_prelude(
             r#"
-            AVStr source = "func twice(value) { return value * 2 } AVInt x = 1 out twice(x + 2)"
+            AVStr source = "func twice(value) { \nreturn value * 2 \n} \nAVInt x = 1 \nout twice(x + 2)"
             VTime linked = bootstrap.linked_artifact_report(source)
             VTime low = native.lower_linked_artifact_report(get(linked, 1))
             VTime lowered = abi.lower_encoded_report(get(low, 1), abi.TARGET_WINDOWS_X64)
@@ -4395,7 +6502,7 @@ mod tests {
     fn source_runtime_native_abi_covers_complete_low_ir_surface_prelude() {
         let output = run_source_with_prelude(
             r#"
-            AVStr source = "func echo(value) { return value } AVInt x = input AVFloat ratio = 2.5 ASVStr hidden = secret input AVBool same = x =self= AVStr type_name = \"\" AVStr protection = \"\" type_name, protection = info(x) List items = [1:ASV, 2] VTime first = items[0] VTime part = items[:] VTime neg = -x x += 1 add(items, 3) set(items, 0, 4) VTime last = pop(items) VTime returned = echo(neg + 2) echo(x) if false { fail \"never\" } while (x < 3) (4) { x += 1 if x == 2 { continue } break } pick(items): item { if item == 1 { continue } break } secretup(x) out \"ok\" stop"
+            AVStr source = "func echo(value) { \nreturn value \n} \nfunc abort() { \nreturn(ERR=[\"never\"][7]) \n} \nAVInt x = input \nAVFloat ratio = 2.5 \nASVStr hidden = secret input \nAVBool same = x =self= \nAVStr type_name = \"\" \nAVStr protection = \"\" \ntype_name, protection = info(x) \nList items = [1:ASV, 2] \nVTime first = items[0] \nVTime part = items[:] \nVTime neg = -x \nx += 1 \nadd(items, 3) \nset(items, 0, 4) \nVTime last = pop(items) \nVTime returned = echo(neg + 2) \necho(x) \nif false { \nfail \"never\" \nabort() \n} \nwhile (x < 3) (4) { \nx += 1 \nif x == 2 { \ncontinue \n} \nbreak \n} \npick(items): item { \nif item == 1 { \ncontinue \n} \nbreak \n} \nsecretup(x) \nout \"ok\" \nstop"
             VTime linked = bootstrap.linked_artifact_report(source)
             VTime low = native.lower_linked_artifact_report(get(linked, 1))
             VTime lowered = abi.lower_encoded_report(get(low, 1), abi.TARGET_LINUX_X64)
@@ -4524,7 +6631,7 @@ mod tests {
     fn source_runtime_emits_windows_and_linux_x64_assembly_prelude() {
         let output = run_source_with_prelude(
             r##"
-            AVStr source = "func increment(value) { return value + 1 } AVStr text = \"AЖ🙂\" out text out increment(41)"
+            AVStr source = "func increment(value) { \nreturn value + 1 \n} \nAVStr text = \"AЖ🙂\" \nout text \nout increment(41)"
             VTime linked = bootstrap.linked_artifact_report(source)
             VTime low = native.lower_linked_artifact_report(get(linked, 1))
             VTime windows_abi = abi.lower_encoded_report(get(low, 1), abi.TARGET_WINDOWS_X64)
@@ -4537,7 +6644,7 @@ mod tests {
             out get(linked, 0)
             out get(windows, 0)
             out get(linux, 0)
-            out contains(windows_text, "# APLASM1 runtime-abi=1 target=x86_64-pc-windows-msvc")
+            out contains(windows_text, "# APLASM1 runtime-abi=2 target=x86_64-pc-windows-msvc")
             out contains(windows_text, ".def apl_program_entry; .scl 2; .type 32; .endef")
             out contains(windows_text, "sub rsp, 40")
             out contains(windows_text, "mov r12, rcx")
@@ -4546,7 +6653,7 @@ mod tests {
             out contains(windows_text, "call apl_fn_0")
             out contains(windows_text, "call apl_rt_function_enter")
             out contains(windows_text, "call apl_rt_finish")
-            out contains(linux_text, "# APLASM1 runtime-abi=1 target=x86_64-unknown-linux-gnu")
+            out contains(linux_text, "# APLASM1 runtime-abi=2 target=x86_64-unknown-linux-gnu")
             out contains(linux_text, ".type apl_program_entry, @function")
             out contains(linux_text, "sub rsp, 8")
             out contains(linux_text, "mov r12, rdi")
@@ -4566,7 +6673,7 @@ mod tests {
     fn source_runtime_x64_assembly_covers_complete_abi_surface_prelude() {
         let output = run_source_with_prelude(
             r#"
-            AVStr source = "func echo(value) { return value } AVInt x = input AVFloat ratio = 2.5 ASVStr hidden = secret input AVBool same = x =self= AVStr type_name = \"\" AVStr protection = \"\" type_name, protection = info(x) List items = [1:ASV, 2] VTime first = items[0] VTime part = items[:] VTime neg = -x x += 1 add(items, 3) VTime last = pop(items) VTime returned = echo(neg + 2) echo(x) if false { fail \"never\" } while (x < 3) (4) { x += 1 if x == 2 { continue } break } pick(items): item { if item == 1 { continue } break } secretup(x) out \"ok\" stop"
+            AVStr source = "func echo(value) { \nreturn value \n} \nfunc abort() { \nreturn(ERR=[\"never\"][7]) \n} \nAVInt x = input \nAVFloat ratio = 2.5 \nASVStr hidden = secret input \nAVBool same = x =self= \nAVStr type_name = \"\" \nAVStr protection = \"\" \ntype_name, protection = info(x) \nList items = [1:ASV, 2] \nVTime first = items[0] \nVTime part = items[:] \nVTime neg = -x \nx += 1 \nadd(items, 3) \nVTime last = pop(items) \nVTime returned = echo(neg + 2) \necho(x) \nif false { \nfail \"never\" \nabort() \n} \nwhile (x < 3) (4) { \nx += 1 \nif x == 2 { \ncontinue \n} \nbreak \n} \npick(items): item { \nif item == 1 { \ncontinue \n} \nbreak \n} \nsecretup(x) \nout \"ok\" \nstop"
             VTime linked = bootstrap.linked_artifact_report(source)
             VTime low = native.lower_linked_artifact_report(get(linked, 1))
             VTime lowered = abi.lower_encoded_report(get(low, 1), abi.TARGET_WINDOWS_X64)
@@ -4580,7 +6687,7 @@ mod tests {
               "call apl_rt_self", "call apl_rt_tag", "call apl_rt_declare",
               "call apl_rt_declare_list", "call apl_rt_declare_vtime", "call apl_rt_assign",
               "call apl_rt_info_assign", "call apl_rt_drop", "call apl_rt_secretup",
-              "call apl_rt_out", "call apl_rt_stop", "call apl_rt_fail",
+              "call apl_rt_out", "call apl_rt_stop", "call apl_rt_fail", "call apl_rt_error_return",
               "call apl_rt_return", "call apl_rt_branch_false", "call apl_rt_scope_enter",
               "call apl_rt_scope_exit", "call apl_rt_unwind", "call apl_rt_loop_enter",
               "call apl_rt_loop_check", "call apl_rt_loop_exit", "call apl_rt_pick_enter",
@@ -4633,13 +6740,7 @@ mod tests {
         let output = run_source_with_prelude(
             r#"
             VTime quote = char(34)
-            AVStr source = join([
-              "func say() { return echo(",
-              quote,
-              "a:b,[x]",
-              quote,
-              ")[::-1] } func echo(x) { return x } out say() AVInt x = input out echo(x) + 1 out 2.5 out true out NONE"
-            ], "")
+            AVStr source = "func say() { \nreturn echo(\"a:b,[x]\")[::-1] \n} \nfunc echo(x) { \nreturn x \n} \nout say() \nAVInt x = input \nout echo(x) + 1 \nout 2.5 \nout true \nout NONE"
 
             VTime encoded_report = bootstrap.linked_artifact_report(source)
             VTime encoded = get(encoded_report, 1)
@@ -4761,11 +6862,11 @@ mod tests {
     fn source_runtime_links_relocatable_apl_modules_prelude() {
         let output = run_source_with_prelude(
             r#"
-            AVStr module_source = "AVInt module.answer = 40 List module.values = [2] func module.add_one(value) { return value + 1 } func module.total() { return module.add_one(module.answer) + get(module.values, 0) - 1 } func module.later(value) { return value + 100 }"
+            AVStr module_source = "AVInt module.answer = 40 \nList module.values = [2] \nfunc module.add_one(value) { \nreturn value + 1 \n} \nfunc module.total() { \nreturn module.add_one(module.answer) + get(module.values, 0) - 1 \n} \nfunc module.later(value) { \nreturn value + 100 \n}"
             VTime module_report = bootstrap.module_report(module_source)
             VTime encoded_module = get(module_report, 1)
             VTime loaded_module = bootstrap.load_module_report(encoded_module)
-            VTime linked_report = bootstrap.linked_artifact_with_module_report(encoded_module, "out module.answer out get(module.values, 0) out module.total()")
+            VTime linked_report = bootstrap.linked_artifact_with_module_report(encoded_module, "out module.answer \nout get(module.values, 0) \nout module.total()")
             VTime run_report = bootstrap.run_linked_artifact_report(get(linked_report, 1))
             VTime later_linked_report = bootstrap.linked_artifact_with_module_report(encoded_module, "out module.later(1)")
             VTime later_run_report = bootstrap.run_linked_artifact_report(get(later_linked_report, 1))
@@ -4828,14 +6929,14 @@ mod tests {
     fn source_runtime_links_named_libraries_over_precompiled_base_module_prelude() {
         let output = run_source_with_prelude(
             r#"
-            VTime base_report = bootstrap.module_report("func base.one() { return 1 }")
-            VTime math_report = bootstrap.module_report("func math.hidden(value) { return value + 1 } func math.answer() { return math.hidden(40) }")
+            VTime base_report = bootstrap.module_report("func base.one() { \nreturn 1 \n}")
+            VTime math_report = bootstrap.module_report("func math.hidden(value) { \nreturn value + 1 \n} \nfunc math.answer() { \nreturn math.hidden(40) \n}")
             VTime libraries = [["math", get(math_report, 1)]]
-            VTime linked = bootstrap.linked_artifact_with_module_and_libraries_report(get(base_report, 1), libraries, "include >> math exclude \"math.hidden\" << math out base.one() out math.answer()")
+            VTime linked = bootstrap.linked_artifact_with_module_and_libraries_report(get(base_report, 1), libraries, "include >> math \nexclude \"hidden\" << math \nout base.one() \nout math.answer()")
             VTime manifest_report = bootstrap.linked_artifact_manifest_report(get(linked, 1))
             VTime manifest = get(manifest_report, 1)
             VTime run = bootstrap.run_linked_artifact_report(get(linked, 1))
-            VTime excluded = bootstrap.linked_artifact_with_module_and_libraries_report(get(base_report, 1), libraries, "include >> math exclude \"math.hidden\" << math out math.hidden(1)")
+            VTime excluded = bootstrap.linked_artifact_with_module_and_libraries_report(get(base_report, 1), libraries, "include >> math \nexclude \"hidden\" << math \nout math.hidden(1)")
             VTime missing_include = bootstrap.linked_artifact_with_module_and_libraries_report(get(base_report, 1), libraries, "out math.answer()")
 
             out get(linked, 0)
@@ -4859,7 +6960,7 @@ mod tests {
 
         assert_eq!(
             output,
-            "OKAPLLINK3:OKAPLMAN1base2mathmath.hiddenOK141FAILsemantic error at 1:47: excluded symbol `math.hidden` from library `math`FAILsemantic error at 1:1: unknown function `math.answer`"
+            "OKAPLLINK3:OKAPLMAN1base2mathmath.hiddenOK141FAILsemantic error at 3:1: excluded symbol `math.hidden` from library `math`FAILsemantic error at 1:1: unknown function `math.answer`"
         );
     }
 
@@ -4873,7 +6974,7 @@ mod tests {
             VTime secret_list_symbols = artifact.module_symbols(secret_list_image)
             VTime secret_list_link = bootstrap.linked_artifact_with_module_report(secret_list_text, "out get(module.items, 0)")
 
-            VTime promoted_report = bootstrap.module_report("AVInt module.value = 1 secretup(module.value)")
+            VTime promoted_report = bootstrap.module_report("AVInt module.value = 1 \nsecretup(module.value)")
             VTime promoted_text = get(promoted_report, 1)
             VTime promoted_image = get(bootstrap.load_module_report(promoted_text), 1)
             VTime promoted_symbols = artifact.module_symbols(promoted_image)
@@ -4923,11 +7024,11 @@ mod tests {
     fn source_runtime_uses_apl_checker_prelude() {
         let output = run_source_with_prelude(
             r#"
-            AVStr ok_source = "AVInt x = 1 List items = [x] func done() { return x } out done()"
-            AVStr duplicate_var = "AVInt x = 1 AVStr x = 2 out x"
-            AVStr duplicate_func = "func go() { return 1 } func go() { return 2 } out go()"
-            AVStr nested_duplicate = "AVInt x = 1 if true { AVInt x = 2 } out x"
-            AVStr nested_func_duplicate = "func go() { return 1 } if true { func go() { return 2 } } out go()"
+            AVStr ok_source = "AVInt x = 1 \nList items = [x] \nfunc done() { \nreturn x \n} \nout done()"
+            AVStr duplicate_var = "AVInt x = 1 \nAVStr x = 2 \nout x"
+            AVStr duplicate_func = "func go() { \nreturn 1 \n} \nfunc go() { \nreturn 2 \n} \nout go()"
+            AVStr nested_duplicate = "AVInt x = 1 \nif true { \nAVInt x = 2 \n} \nout x"
+            AVStr nested_func_duplicate = "func go() { \nreturn 1 \n} \nif true { \nfunc go() { \nreturn 2 \n} \n} \nout go()"
 
             VTime ok_report = bootstrap.compile_report(ok_source)
             VTime var_report = bootstrap.compile_report(duplicate_var)
@@ -4951,7 +7052,7 @@ mod tests {
 
         assert_eq!(
             output,
-            "OKDECLFAILsemantic error at 1:13: duplicate name `x`FAILsemantic error at 1:24: duplicate name `go`FAILsemantic error at 1:23: duplicate name `x`FAILsemantic error at 1:34: duplicate name `go`"
+            "OKDECLFAILsemantic error at 2:1: duplicate name `x`FAILsemantic error at 4:1: duplicate name `go`FAILsemantic error at 3:1: duplicate name `x`FAILsemantic error at 5:1: duplicate name `go`"
         );
     }
 
@@ -4959,8 +7060,8 @@ mod tests {
     fn source_runtime_apl_checker_scopes_vtime_names() {
         let output = run_source_with_prelude(
             r#"
-            AVStr scoped_source = "func first(value) { VTime text = value if true { VTime local = text text = local } return text } func second(value) { VTime text = value while (false) (-1) { VTime local = text } pick([value]): item { VTime local = item } return text } out first(1) out second(2)"
-            AVStr leaked_source = "func make() { VTime local = 1 return local } out local"
+            AVStr scoped_source = "func first(value) { \nVTime text = value \nif true { \nVTime local = text \ntext = local \n} \nreturn text \n} \nfunc second(value) { \nVTime text = value \nwhile (false) (-1) { \nVTime local = text \n} \npick([value]): item { \nVTime local = item \n} \nreturn text \n} \nout first(1) \nout second(2)"
+            AVStr leaked_source = "func make() { \nVTime local = 1 \nreturn local \n} \nout local"
             VTime scoped_report = bootstrap.compile_report(scoped_source)
             VTime leaked_report = bootstrap.compile_report(leaked_source)
 
@@ -4973,7 +7074,7 @@ mod tests {
 
         assert_eq!(
             output,
-            "OKFAILsemantic error at 1:46: unknown variable `local`"
+            "OKFAILsemantic error at 5:1: unknown variable `local`"
         );
     }
 
@@ -4981,17 +7082,17 @@ mod tests {
     fn source_runtime_checker_rejects_unknown_mutation_targets_prelude() {
         let output = run_source_with_prelude(
             r#"
-            AVStr missing_assign = "missing = 1 out missing"
-            AVStr list_assign = "List items = [] items = 1"
-            AVStr func_assign = "func go() { return 1 } go = 2"
-            AVStr secret_compound = "ASVInt hidden = 1 hidden += 1"
-            AVStr string_compound = join(["AVStr text = ", char(34), char(34), " text += 1"], "")
-            AVStr vtime_compound = "VTime temp = 1 temp += 1 out temp"
+            AVStr missing_assign = "missing = 1 \nout missing"
+            AVStr list_assign = "List items = [] \nitems = 1"
+            AVStr func_assign = "func go() { \nreturn 1 \n} \ngo = 2"
+            AVStr secret_compound = "ASVInt hidden = 1 \nhidden += 1"
+            AVStr string_compound = "AVStr text = \"\" \ntext += 1"
+            AVStr vtime_compound = "VTime temp = 1 \ntemp += 1 \nout temp"
             AVStr missing_secretup = "secretup(missing)"
-            AVStr list_secretup = "List items = [] secretup(items)"
-            AVStr missing_info_target = join(["AVStr level = ", char(34), char(34), " typ, level = info(level)"], "")
-            AVStr bad_info_target = join(["AVInt typ = 1 AVStr level = ", char(34), char(34), " typ, level = info(typ)"], "")
-            AVStr missing_info_source = join(["AVStr typ = ", char(34), char(34), " AVStr level = ", char(34), char(34), " typ, level = info(missing)"], "")
+            AVStr list_secretup = "List items = [] \nsecretup(items)"
+            AVStr missing_info_target = "AVStr level = \"\" \ntyp, level = info(level)"
+            AVStr bad_info_target = "AVInt typ = 1 \nAVStr level = \"\" \ntyp, level = info(typ)"
+            AVStr missing_info_source = "AVStr typ = \"\" \nAVStr level = \"\" \ntyp, level = info(missing)"
 
             VTime assign_report = bootstrap.compile_report(missing_assign)
             VTime list_assign_report = bootstrap.compile_report(list_assign)
@@ -5033,7 +7134,7 @@ mod tests {
 
         assert_eq!(
             output,
-            "FAILsemantic error at 1:1: unknown assignment target `missing`FAILsemantic error at 1:17: invalid assignment target `items`FAILsemantic error at 1:24: invalid assignment target `go`FAILsemantic error at 1:19: invalid compound assignment target `hidden`FAILsemantic error at 1:17: invalid compound assignment target `text`OK2FAILsemantic error at 1:1: unknown secretup target `missing`FAILsemantic error at 1:17: invalid secretup target `items`FAILsemantic error at 1:18: unknown info target `typ`FAILsemantic error at 1:32: invalid info target `typ`FAILsemantic error at 1:33: unknown info source `missing`"
+            "FAILsemantic error at 1:1: unknown assignment target `missing`FAILsemantic error at 2:1: invalid assignment target `items`FAILsemantic error at 4:1: invalid assignment target `go`FAILsemantic error at 2:1: invalid compound assignment target `hidden`FAILsemantic error at 2:1: invalid compound assignment target `text`OK2FAILsemantic error at 1:1: unknown secretup target `missing`FAILsemantic error at 2:1: invalid secretup target `items`FAILsemantic error at 2:1: unknown info target `typ`FAILsemantic error at 3:1: invalid info target `typ`FAILsemantic error at 3:1: unknown info source `missing`"
         );
     }
 
@@ -5041,14 +7142,14 @@ mod tests {
     fn source_runtime_checker_rejects_unknown_expression_refs_prelude() {
         let output = run_source_with_prelude(
             r#"
-            AVStr valid = "AVInt x = 1 VTime y = x + 1 out y"
+            AVStr valid = "AVInt x = 1 \nVTime y = x + 1 \nout y"
             AVStr missing_out = "out missing"
             AVStr missing_decl = "AVInt x = missing"
-            AVStr missing_assignment_value = "AVInt x = 1 x = missing"
+            AVStr missing_assignment_value = "AVInt x = 1 \nx = missing"
             AVStr missing_list = "List items = [missing]"
-            AVStr missing_if = "if missing { out 1 }"
-            AVStr bad_self = "VTime temp = 1 out temp =self="
-            AVStr missing_slice = "List items = [1] VTime part = items[:missing]"
+            AVStr missing_if = "if missing { \nout 1 \n}"
+            AVStr bad_self = "VTime temp = 1 \nout temp =self="
+            AVStr missing_slice = "List items = [1] \nVTime part = items[:missing]"
 
             VTime valid_report = bootstrap.run_report(valid)
             VTime out_report = bootstrap.compile_report(missing_out)
@@ -5081,7 +7182,7 @@ mod tests {
 
         assert_eq!(
             output,
-            "OK2FAILsemantic error at 1:1: unknown variable `missing`FAILsemantic error at 1:1: unknown variable `missing`FAILsemantic error at 1:13: unknown variable `missing`FAILsemantic error at 1:1: unknown variable `missing`FAILsemantic error at 1:1: unknown variable `missing`FAILsemantic error at 1:16: invalid self target `temp`FAILsemantic error at 1:18: unknown variable `missing`"
+            "OK2FAILsemantic error at 1:1: unknown variable `missing`FAILsemantic error at 1:1: unknown variable `missing`FAILsemantic error at 2:1: unknown variable `missing`FAILsemantic error at 1:1: unknown variable `missing`FAILsemantic error at 1:1: unknown variable `missing`FAILsemantic error at 2:1: invalid self target `temp`FAILsemantic error at 2:1: unknown variable `missing`"
         );
     }
 
@@ -5089,11 +7190,11 @@ mod tests {
     fn source_runtime_checker_validates_function_calls_prelude() {
         let output = run_source_with_prelude(
             r#"
-            AVStr valid_forward = "out go() func go() { return 7 }"
+            AVStr valid_forward = "out go() \nfunc go() { \nreturn 7 \n}"
             AVStr builtin_ok = "out len([1, 2])"
             AVStr missing_func = "out missing()"
-            AVStr var_as_func = "AVInt x = 1 out x()"
-            AVStr bad_arity = "func go(a) { return a } out go()"
+            AVStr var_as_func = "AVInt x = 1 \nout x()"
+            AVStr bad_arity = "func go(a) { \nreturn a \n} \nout go()"
             AVStr missing_arg = "out len(missing)"
             AVStr builtin_missing = "out len()"
             AVStr builtin_extra = "out pow(2, 3, 4)"
@@ -5133,7 +7234,7 @@ mod tests {
 
         assert_eq!(
             output,
-            "OK7OK2FAILsemantic error at 1:1: unknown function `missing`FAILsemantic error at 1:13: invalid function `x`FAILsemantic error at 1:25: wrong argument count `go`FAILsemantic error at 1:1: unknown variable `missing`FAILsemantic error at 1:1: wrong argument count `len`FAILsemantic error at 1:1: wrong argument count `pow`FAILsemantic error at 1:1: wrong argument count `add`"
+            "OK7OK2FAILsemantic error at 1:1: unknown function `missing`FAILsemantic error at 2:1: invalid function `x`FAILsemantic error at 4:1: wrong argument count `go`FAILsemantic error at 1:1: unknown variable `missing`FAILsemantic error at 1:1: wrong argument count `len`FAILsemantic error at 1:1: wrong argument count `pow`FAILsemantic error at 1:1: wrong argument count `add`"
         );
     }
 
@@ -5144,6 +7245,7 @@ mod tests {
             List binary_builtins = ["get", "split", "join", "contains", "pow", "add"]
             List unary_builtins = ["len", "ord", "char", "pop", "int", "float", "bool", "str", "bytes", "json"]
             List ternary_builtins = ["set"]
+            List zero_builtins = ["timer_start", "timer_stop", "timer_elapsed"]
             AVBool builtin_arity_matches = true
 
             pick(binary_builtins): builtin_name {
@@ -5176,6 +7278,16 @@ mod tests {
               }
             }
 
+            pick(zero_builtins): builtin_name {
+              if checker.builtin_arity(builtin_name) != 0 {
+                builtin_arity_matches = false
+              }
+
+              if checker.builtin_arity(builtin_name) != verifier.builtin_arity(builtin_name) {
+                builtin_arity_matches = false
+              }
+            }
+
             out builtin_arity_matches
             out checker.builtin_arity("missing")
             "#,
@@ -5189,8 +7301,8 @@ mod tests {
     fn source_runtime_checker_validates_builtin_argument_types_prelude() {
         let output = run_source_with_prelude(
             r#"
-            AVStr valid_static = "List values = [1] out len(values) out get(values, 0) out char(65) out pow(2, 3)"
-            AVStr valid_dynamic = "VTime value = 1 out len(value) out split(value, value) out pow(value, value)"
+            AVStr valid_static = "List values = [1] \nout len(values) \nout get(values, 0) \nout char(65) \nout pow(2, 3)"
+            AVStr valid_dynamic = "VTime value = 1 \nout len(value) \nout split(value, value) \nout pow(value, value)"
             AVStr bad_len = "out len(1)"
             AVStr bad_get = "out get(1, 0)"
             AVStr bad_split = "out split(1, 2)"
@@ -5200,7 +7312,7 @@ mod tests {
             AVStr bad_char = "out char(true)"
             AVStr bad_pow = "out pow(true, 2)"
             AVStr bad_pop = "VTime value = pop(1)"
-            AVStr bad_add = "AVInt value = 1 add(value, 2)"
+            AVStr bad_add = "AVInt value = 1 \nadd(value, 2)"
 
             List reports = [
               bootstrap.compile_report(valid_static),
@@ -5230,7 +7342,7 @@ mod tests {
 
         assert_eq!(
             output,
-            "OKOKFAILsemantic error at 1:1: len(value) requires Str, Bytes, List, or VTimeFAILsemantic error at 1:1: get(list, index) requires List and IntFAILsemantic error at 1:1: split(value, separator) requires Str and StrFAILsemantic error at 1:1: join(values, separator) requires List and StrFAILsemantic error at 1:1: contains(value, needle) requires Str and StrFAILsemantic error at 1:1: ord(value) requires StrFAILsemantic error at 1:1: char(value) requires IntFAILsemantic error at 1:1: pow(base, exponent) requires Int/Float and IntFAILsemantic error at 1:1: pop(list) requires ListFAILsemantic error at 1:17: add(list, value) requires List"
+            "OKOKFAILsemantic error at 1:1: len(value) requires Str, Bytes, List, or VTimeFAILsemantic error at 1:1: get(list, index) requires List and IntFAILsemantic error at 1:1: split(value, separator) requires Str and StrFAILsemantic error at 1:1: join(values, separator) requires List and StrFAILsemantic error at 1:1: contains(value, needle) requires Str and StrFAILsemantic error at 1:1: ord(value) requires StrFAILsemantic error at 1:1: char(value) requires IntFAILsemantic error at 1:1: pow(base, exponent) requires Int/Float and IntFAILsemantic error at 1:1: pop(list) requires ListFAILsemantic error at 2:1: add(list, value) requires List"
         );
     }
 
@@ -5238,11 +7350,11 @@ mod tests {
     fn source_runtime_checker_validates_list_mutation_contracts_prelude() {
         let output = run_source_with_prelude(
             r#"
-            AVStr valid_pop = "List items = [1] VTime item = pop(items) out item"
-            AVStr bad_expression_add = "List items = [1] VTime result = add(items, 2)"
+            AVStr valid_pop = "List items = [1] \nVTime item = pop(items) \nout item"
+            AVStr bad_expression_add = "List items = [1] \nVTime result = add(items, 2)"
             AVStr bad_temporary_add = "add([1], 2)"
             AVStr bad_temporary_pop = "VTime item = pop([1])"
-            AVStr bad_vtime_out = "VTime items = [1] ASVInt hidden = 2 add(items, hidden) out items"
+            AVStr bad_vtime_out = "VTime items = [1] \nASVInt hidden = 2 \nadd(items, hidden) \nout items"
 
             List reports = [
               bootstrap.compile_report(valid_pop),
@@ -5265,24 +7377,72 @@ mod tests {
 
         assert_eq!(
             output,
-            "OKFAILsemantic error at 1:18: add(list, value) is only valid as a statementFAILsemantic error at 1:1: add(list, value) requires a named List or VTime targetFAILsemantic error at 1:1: pop(list) requires a named List or VTime targetFAILsemantic error at 1:56: secret expression denied `out`"
+            "OKFAILsemantic error at 2:1: add(list, value) is only valid as a statementFAILsemantic error at 1:1: add(list, value) requires a named List or VTime targetFAILsemantic error at 1:1: pop(list) requires a named List or VTime targetFAILsemantic error at 4:1: secret expression denied `out`"
         );
+    }
+
+    #[test]
+    fn source_runtime_checker_tracks_prefixed_list_mutation_protection_prelude() {
+        let output = run_source_with_prelude(
+            r#"
+            AVStr bad_add_get = "SASVStr secret_value = \"hidden\" \nList values = [\"public\"] \nstd::add(values, secret_value) \nVTime selected = std::get(values, 1) \nout selected"
+            AVStr bad_set_index = "SASVStr secret_value = \"hidden\" \nList values = [\"public\"] \nstd::set(values, 0, secret_value) \nVTime selected = values[0] \nout selected"
+            AVStr bad_add_pop = "SASVStr secret_value = \"hidden\" \nList values = [\"public\"] \nstd::add(values, secret_value) \nVTime removed = std::pop(values) \nout removed"
+            AVStr bad_alias_add = "SASVStr secret_value = \"hidden\" \nList values = [\"public\"] \nVTime alias = values \nstd::add(alias, secret_value) \nout std::get(values, 1)"
+            AVStr bad_alias_set = "SASVStr secret_value = \"hidden\" \nList values = [\"public\"] \nVTime alias = values \nstd::set(alias, 0, secret_value) \nout std::get(values, 0)"
+            AVStr bad_original_add = "SASVStr secret_value = \"hidden\" \nList values = [\"public\"] \nVTime alias = values \nstd::add(values, secret_value) \nout std::get(alias, 1)"
+            List reports = [
+              bootstrap.compile_report(bad_add_get),
+              bootstrap.compile_report(bad_set_index),
+              bootstrap.compile_report(bad_add_pop),
+              bootstrap.compile_report(bad_alias_add),
+              bootstrap.compile_report(bad_alias_set),
+              bootstrap.compile_report(bad_original_add)
+            ]
+
+            pick(reports): report {
+              if contains(get(report, 1), "secret expression denied") {
+                out "DENIED"
+              } else {
+                out get(report, 0)
+              }
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(output, "DENIEDDENIEDDENIEDDENIEDDENIEDDENIED");
+    }
+
+    #[test]
+    fn source_runtime_apl_vm_reports_zero_slice_step_prelude() {
+        let output = run_source_with_prelude(
+            r#"
+            AVStr source = "List values = [1, 2, 3] \nVTime invalid = values[::0] \nout len(invalid)"
+            VTime report = bootstrap.run_report(source)
+            out get(report, 0)
+            out get(get(report, 1), 0)
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(output, "FAILzero slice step");
     }
 
     #[test]
     fn source_runtime_checker_validates_decl_and_assignment_types_prelude() {
         let output = run_source_with_prelude(
             r#"
-            AVStr valid_exact = "AVInt integer = 1 AVFloat decimal = 1.0 AVBool flag = true AVStr text = str(1) AVBytes raw = bytes(text) AVJson document = json(text) integer = 2 decimal = 2.0 flag = false text = str(2) raw = bytes(text) document = json(text)"
-            AVStr valid_dynamic = "AVInt value = input value = NONE VTime dynamic = 1 dynamic = str(dynamic) value = dynamic"
+            AVStr valid_exact = "AVInt integer = 1 \nAVFloat decimal = 1.0 \nAVBool flag = true \nAVStr text = str(1) \nAVBytes raw = bytes(text) \nAVJson document = json(text) \ninteger = 2 \ndecimal = 2.0 \nflag = false \ntext = str(2) \nraw = bytes(text) \ndocument = json(text)"
+            AVStr valid_dynamic = "AVInt value = input \nvalue = NONE \nVTime dynamic = 1 \ndynamic = str(dynamic) \nvalue = dynamic"
             AVStr bad_int = "AVInt value = str(1)"
             AVStr bad_float = "AVFloat value = 1"
             AVStr bad_bool = "AVBool value = 1"
             AVStr bad_str = "AVStr value = 1"
             AVStr bad_bytes = "AVBytes value = str(1)"
             AVStr bad_json = "AVJson value = str(1)"
-            AVStr bad_assignment = "AVInt value = 1 value = str(2)"
-            AVStr bad_compound = "AVInt value = 1 value += 1.0"
+            AVStr bad_assignment = "AVInt value = 1 \nvalue = str(2)"
+            AVStr bad_compound = "AVInt value = 1 \nvalue += 1.0"
 
             List reports = [
               bootstrap.compile_report(valid_exact),
@@ -5310,7 +7470,7 @@ mod tests {
 
         assert_eq!(
             output,
-            "OKOKFAILsemantic error at 1:1: type mismatch `value`: expected Int, got StrFAILsemantic error at 1:1: type mismatch `value`: expected Float, got IntFAILsemantic error at 1:1: type mismatch `value`: expected Bool, got IntFAILsemantic error at 1:1: type mismatch `value`: expected Str, got IntFAILsemantic error at 1:1: type mismatch `value`: expected Bytes, got StrFAILsemantic error at 1:1: type mismatch `value`: expected Json, got StrFAILsemantic error at 1:17: type mismatch `value`: expected Int, got StrFAILsemantic error at 1:17: type mismatch `value`: expected Int, got Float"
+            "OKOKFAILsemantic error at 1:1: type mismatch `value`: expected Int, got StrFAILsemantic error at 1:1: type mismatch `value`: expected Float, got IntFAILsemantic error at 1:1: type mismatch `value`: expected Bool, got IntFAILsemantic error at 1:1: type mismatch `value`: expected Str, got IntFAILsemantic error at 1:1: type mismatch `value`: expected Bytes, got StrFAILsemantic error at 1:1: type mismatch `value`: expected Json, got StrFAILsemantic error at 2:1: type mismatch `value`: expected Int, got StrFAILsemantic error at 2:1: type mismatch `value`: expected Int, got Float"
         );
     }
 
@@ -5318,8 +7478,8 @@ mod tests {
     fn source_runtime_checker_validates_expression_operand_types_prelude() {
         let output = run_source_with_prelude(
             r#"
-            AVStr valid_exact = "AVInt integer = 1 AVFloat decimal = 1.0 AVBool flag = true AVInt sum = integer + 2 AVFloat quotient = decimal / 2.0 AVBool equal = integer == 1 AVBool ordered = decimal >= 1.0 AVBool logical = flag and true if flag { out integer } while (integer < 2) (1) { integer += 1 } pick([integer]): item { out item }"
-            AVStr valid_dynamic = "VTime value = 1 VTime other = value + true VTime index = true VTime item = value[index] VTime part = value[index:index:index] if value { out other } while (value) (1) { value = false } pick(value): picked { out picked }"
+            AVStr valid_exact = "AVInt integer = 1 \nAVFloat decimal = 1.0 \nAVBool flag = true \nAVInt sum = integer + 2 \nAVFloat quotient = decimal / 2.0 \nAVBool equal = integer == 1 \nAVBool ordered = decimal >= 1.0 \nAVBool logical = flag and true \nif flag { \nout integer \n} \nwhile (integer < 2) (1) { \ninteger += 1 \n} \npick([integer]): item { \nout item \n}"
+            AVStr valid_dynamic = "VTime value = 1 \nVTime other = value + true \nVTime index = true \nVTime item = value[index] \nVTime part = value[index:index:index] \nif value { \nout other \n} \nwhile (value) (1) { \nvalue = false \n} \npick(value): picked { \nout picked \n}"
             AVStr bad_negate = "VTime value = -true"
             AVStr bad_not = "VTime value = not 1"
             AVStr bad_arithmetic_shape = "VTime value = 1 + 1.0"
@@ -5327,9 +7487,9 @@ mod tests {
             AVStr bad_equality = "VTime value = 1 == bytes(1)"
             AVStr bad_ordered = "VTime value = 1 < 1.0"
             AVStr bad_logical = "VTime value = true and 1"
-            AVStr bad_if = "if 1 { out 1 }"
-            AVStr bad_while = "while (bytes(1)) (1) { out 1 }"
-            AVStr bad_pick = "pick(1): item { out item }"
+            AVStr bad_if = "if 1 { \nout 1 \n}"
+            AVStr bad_while = "while (bytes(1)) (1) { \nout 1 \n}"
+            AVStr bad_pick = "pick(1): item { \nout item \n}"
             AVStr bad_index_target = "VTime value = 1[0]"
             AVStr bad_index_value = "VTime value = [1][true]"
             AVStr bad_slice_target = "VTime value = true[:]"
@@ -5375,17 +7535,17 @@ mod tests {
     fn source_runtime_checker_validates_control_flow_context_prelude() {
         let output = run_source_with_prelude(
             r#"
-            AVStr valid_function = "func choose(value) { if true { return value } return NONE } VTime result = choose(1)"
-            AVStr valid_loops = "func work() { while (true) (1) { continue } pick([1]): item { break } return NONE }"
-            AVStr valid_unlimited = "while (true) (-1) { break }"
+            AVStr valid_function = "func choose(value) { \nif true { \nreturn value \n} \nreturn NONE \n} \nVTime result = choose(1)"
+            AVStr valid_loops = "func work() { \nwhile (true) (1) { \ncontinue \n} \npick([1]): item { \nbreak \n} \nreturn NONE \n}"
+            AVStr valid_unlimited = "while (true) (-1) { \nbreak \n}"
             AVStr bad_return = "return NONE"
-            AVStr bad_nested_return = "if true { return NONE }"
+            AVStr bad_nested_return = "if true { \nreturn NONE \n}"
             AVStr bad_break = "break"
             AVStr bad_continue = "continue"
-            AVStr bad_nested_break = "if true { break }"
-            AVStr bad_function_break = "func work() { break }"
-            AVStr bad_limit = "while (true) (-2) { break }"
-            AVStr bad_nested_function_break = "while (true) (1) { func nested() { break } }"
+            AVStr bad_nested_break = "if true { \nbreak \n}"
+            AVStr bad_function_break = "func work() { \nbreak \n}"
+            AVStr bad_limit = "while (true) (-2) { \nbreak \n}"
+            AVStr bad_nested_function_break = "while (true) (1) { \nfunc nested() { \nbreak \n} \n}"
 
             List reports = [
               bootstrap.compile_report(valid_function),
@@ -5414,7 +7574,7 @@ mod tests {
 
         assert_eq!(
             output,
-            "OKOKOKFAILsemantic error at 1:1: return outside functionFAILsemantic error at 1:11: return outside functionFAILsemantic error at 1:1: break outside loopFAILsemantic error at 1:1: continue outside loopFAILsemantic error at 1:11: break outside loopFAILsemantic error at 1:15: break outside loopFAILsemantic error at 1:1: invalid loop limit `-2`FAILsemantic error at 1:36: break outside loop"
+            "OKOKOKFAILsemantic error at 1:1: return outside functionFAILsemantic error at 2:1: return outside functionFAILsemantic error at 1:1: break outside loopFAILsemantic error at 1:1: continue outside loopFAILsemantic error at 2:1: break outside loopFAILsemantic error at 2:1: break outside loopFAILsemantic error at 1:1: invalid loop limit `-2`FAILsemantic error at 3:1: break outside loop"
         );
     }
 
@@ -5422,19 +7582,19 @@ mod tests {
     fn source_runtime_checker_validates_names_and_parameter_scopes_prelude() {
         let output = run_source_with_prelude(
             r#"
-            AVStr valid_names = "AVInt alpha.beta_2 = 1 func echo(value) { return value } VTime result = echo(alpha.beta_2)"
-            AVStr valid_shadow = join(["AVStr value = ", char(34), "global", char(34), " func increment(value) { return value + 1 } func apply(increment) { return increment(increment) } out apply(1) out value"], "")
+            AVStr valid_names = "AVInt alpha.beta_2 = 1 \nfunc echo(value) { \nreturn value \n} \nVTime result = echo(alpha.beta_2)"
+            AVStr valid_shadow = "AVStr value = \"global\" \nfunc increment(value) { \nreturn value + 1 \n} \nfunc apply(increment) { \nreturn increment(increment) \n} \nout apply(1) \nout value"
             AVStr bad_symbol = "AVInt bad?name = 1"
             AVStr bad_leading_dot = "AVInt .hidden = 1"
             AVStr bad_reserved = "AVInt len = 1"
             AVStr bad_function = "func bad?name(value) { return value }"
-            AVStr bad_duplicate_param = "func duplicate(value, value) { return value }"
+            AVStr bad_duplicate_param = "func duplicate(value, value) { \nreturn value \n}"
             AVStr bad_param = "func identity(bad?name) { return bad?name }"
-            AVStr bad_pick_collision = "AVInt item = 1 pick([1]): item { out item }"
+            AVStr bad_pick_collision = "AVInt item = 1 \npick([1]): item { \nout item \n}"
             AVStr bad_pick_name = "pick([1]): bad?name { out bad?name }"
-            AVStr bad_shadow_secretup = "AVInt value = 1 func promote(value) { secretup(value) }"
-            AVStr bad_shadow_self = "AVInt value = 1 func same(value) { return value =self= }"
-            AVStr bad_function_value = "func go() { return 1 } out go"
+            AVStr bad_shadow_secretup = "AVInt value = 1 \nfunc promote(value) { \nsecretup(value) \n}"
+            AVStr bad_shadow_self = "AVInt value = 1 \nfunc same(value) { \nreturn value =self= \n}"
+            AVStr bad_function_value = "func go() { \nreturn 1 \n} \nout go"
 
             VTime valid_names_report = bootstrap.compile_report(valid_names)
             VTime valid_shadow_report = bootstrap.run_report(valid_shadow)
@@ -5472,7 +7632,7 @@ mod tests {
 
         assert_eq!(
             output,
-            "OKOK2globalFAILsemantic error at 1:1: invalid name `bad?name`FAILsemantic error at 1:1: invalid name `.hidden`FAILsemantic error at 1:1: invalid name `len`FAILsemantic error at 1:1: invalid name `bad?name`FAILsemantic error at 1:1: duplicate parameter `value`FAILsemantic error at 1:1: invalid name `bad?name`FAILsemantic error at 1:16: duplicate name `item`FAILsemantic error at 1:1: invalid name `bad?name`FAILsemantic error at 1:39: invalid secretup target `value`FAILsemantic error at 1:36: invalid self target `value`FAILsemantic error at 1:24: unknown variable `go`"
+            "OKOK2globalFAILsemantic error at 1:1: invalid name `bad?name`FAILsemantic error at 1:1: invalid name `.hidden`FAILsemantic error at 1:1: invalid name `len`FAILsemantic error at 1:1: invalid name `bad?name`FAILsemantic error at 1:1: duplicate parameter `value`FAILsemantic error at 1:1: invalid name `bad?name`FAILsemantic error at 2:1: duplicate name `item`FAILsemantic error at 1:1: invalid name `bad?name`FAILsemantic error at 3:1: invalid secretup target `value`FAILsemantic error at 3:1: invalid self target `value`FAILsemantic error at 4:1: unknown variable `go`"
         );
     }
 
@@ -5480,27 +7640,27 @@ mod tests {
     fn source_runtime_checker_validates_protection_flow_prelude() {
         let output = run_source_with_prelude(
             r#"
-            AVStr valid_assignments = "ASVInt hidden = 1 SASVInt vault = hidden VTime temporary = hidden ASVInt copy = temporary"
-            AVStr valid_tags = "List items = [1:ASV, 2:SASV] SASVInt vault = 1"
+            AVStr valid_assignments = "ASVInt hidden = 1 \nSASVInt vault = hidden \nVTime temporary = hidden \nASVInt copy = temporary"
+            AVStr valid_tags = "List items = [1:ASV, 2:SASV] \nSASVInt vault = 1"
             AVStr valid_secret_input = "ASVStr value = secret input"
-            AVStr bad_decl = "ASVInt hidden = 1 AVInt public = hidden"
-            AVStr bad_assign = "ASVInt hidden = 1 AVInt public = 0 public = hidden"
+            AVStr bad_decl = "ASVInt hidden = 1 \nAVInt public = hidden"
+            AVStr bad_assign = "ASVInt hidden = 1 \nAVInt public = 0 \npublic = hidden"
             AVStr bad_secret_input_av = "AVStr public = secret input"
             AVStr bad_input_sasv = "SASVStr vault = input"
             AVStr bad_secret_input_sasv = "SASVStr vault = secret input"
-            AVStr bad_tag = "ASVInt hidden = 1 List items = [hidden:AV]"
-            AVStr bad_out = "ASVInt hidden = 1 out hidden"
-            AVStr bad_derived_out = "ASVInt hidden = 1 out hidden + 1"
-            AVStr bad_vtime = "ASVInt hidden = 1 VTime temporary = hidden AVInt public = temporary"
-            AVStr bad_list_out = "List items = [1:ASV] out items"
-            AVStr bad_get_out = "List items = [1:ASV] out get(items, 0)"
-            AVStr bad_self = "ASVInt hidden = 1 out hidden =self="
-            AVStr bad_stop = "ASVInt hidden = 1 stop hidden"
-            AVStr bad_fail = "ASVInt hidden = 1 fail hidden"
-            AVStr bad_secretup_out = "AVInt value = 1 secretup(value) out value"
-            AVStr bad_secretup_limit = "AVInt value = 1 secretup(value) secretup(value) secretup(value)"
-            AVStr bad_add_out = "List items = [1] ASVInt hidden = 2 add(items, hidden) out items"
-            AVStr bad_call_out = "func echo(value) { return value } ASVInt hidden = 1 out echo(hidden)"
+            AVStr bad_tag = "ASVInt hidden = 1 \nList items = [hidden:AV]"
+            AVStr bad_out = "ASVInt hidden = 1 \nout hidden"
+            AVStr bad_derived_out = "ASVInt hidden = 1 \nout hidden + 1"
+            AVStr bad_vtime = "ASVInt hidden = 1 \nVTime temporary = hidden \nAVInt public = temporary"
+            AVStr bad_list_out = "List items = [1:ASV] \nout items"
+            AVStr bad_get_out = "List items = [1:ASV] \nout get(items, 0)"
+            AVStr bad_self = "ASVInt hidden = 1 \nout hidden =self="
+            AVStr bad_stop = "ASVInt hidden = 1 \nstop hidden"
+            AVStr bad_fail = "ASVInt hidden = 1 \nfail hidden"
+            AVStr bad_secretup_out = "AVInt value = 1 \nsecretup(value) \nout value"
+            AVStr bad_secretup_limit = "AVInt value = 1 \nsecretup(value) \nsecretup(value) \nsecretup(value)"
+            AVStr bad_add_out = "List items = [1] \nASVInt hidden = 2 \nadd(items, hidden) \nout items"
+            AVStr bad_call_out = "func echo(value) { \nreturn value \n} \nASVInt hidden = 1 \nout echo(hidden)"
 
             List reports = [
               bootstrap.compile_report(valid_assignments),
@@ -5539,7 +7699,7 @@ mod tests {
 
         assert_eq!(
             output,
-            "OKOKOKFAILsemantic error at 1:19: protection downgrade `public`: source ASV, target AVFAILsemantic error at 1:36: protection downgrade `public`: source ASV, target AVFAILsemantic error at 1:1: secret expression denied `public`FAILsemantic error at 1:1: secret expression denied `vault`FAILsemantic error at 1:1: secret expression denied `vault`FAILsemantic error at 1:19: protection downgrade `list element`: source ASV, target AVFAILsemantic error at 1:19: secret expression denied `out`FAILsemantic error at 1:19: secret expression denied `out`FAILsemantic error at 1:44: protection downgrade `public`: source ASV, target AVFAILsemantic error at 1:22: secret expression denied `out`FAILsemantic error at 1:22: secret expression denied `out`FAILsemantic error at 1:19: secret expression denied `hidden`FAILsemantic error at 1:19: secret expression denied `stop`FAILsemantic error at 1:19: secret expression denied `fail`FAILsemantic error at 1:33: secret expression denied `out`FAILsemantic error at 1:49: invalid secretup target `value`FAILsemantic error at 1:55: secret expression denied `out`FAILsemantic error at 1:53: secret expression denied `out`"
+            "OKOKOKFAILsemantic error at 2:1: protection downgrade `public`: source ASV, target AVFAILsemantic error at 3:1: protection downgrade `public`: source ASV, target AVFAILsemantic error at 1:1: secret expression denied `public`FAILsemantic error at 1:1: secret expression denied `vault`FAILsemantic error at 1:1: secret expression denied `vault`FAILsemantic error at 2:1: protection downgrade `list element`: source ASV, target AVFAILsemantic error at 2:1: secret expression denied `out`FAILsemantic error at 2:1: secret expression denied `out`FAILsemantic error at 3:1: protection downgrade `public`: source ASV, target AVFAILsemantic error at 2:1: secret expression denied `out`FAILsemantic error at 2:1: secret expression denied `out`FAILsemantic error at 2:1: secret expression denied `hidden`FAILsemantic error at 2:1: secret expression denied `stop`FAILsemantic error at 2:1: secret expression denied `fail`FAILsemantic error at 3:1: secret expression denied `out`FAILsemantic error at 4:1: invalid secretup target `value`FAILsemantic error at 4:1: secret expression denied `out`FAILsemantic error at 5:1: secret expression denied `out`"
         );
     }
 
@@ -5547,7 +7707,7 @@ mod tests {
     fn source_runtime_checker_blocks_compound_vtime_laundering_prelude() {
         let output = run_source_with_prelude(
             r#"
-            AVStr source = "List values = [4:SASV] pick(values): item { item += 1 VTime temporary = str(item) AVStr stolen = temporary } out stolen"
+            AVStr source = "List values = [4:SASV] \npick(values): item { \nitem += 1 \nVTime temporary = str(item) \nAVStr stolen = temporary \n} \nout stolen"
             VTime report = bootstrap.compile_report(source)
             out get(report, 0)
             out get(report, 1)
@@ -5557,7 +7717,7 @@ mod tests {
 
         assert_eq!(
             output,
-            "FAILsemantic error at 1:83: protection downgrade `stolen`: source SASV, target AV"
+            "FAILsemantic error at 5:1: protection downgrade `stolen`: source SASV, target AV"
         );
     }
 
@@ -5588,7 +7748,7 @@ mod tests {
     fn source_runtime_uses_apl_vm_typed_input_coercion_prelude() {
         let output = run_source_with_prelude(
             r#"
-            AVStr source = "AVInt good = input AVInt bad = input AVFloat ratio = input AVBool flag = input AVStr text = input AVInt assigned = 0 assigned = input out good out bad out ratio out flag out text out assigned"
+            AVStr source = "AVInt good = input \nAVInt bad = input \nAVFloat ratio = input \nAVBool flag = input \nAVStr text = input \nAVInt assigned = 0 \nassigned = input \nout good \nout bad \nout ratio \nout flag \nout text \nout assigned"
             VTime vm_output = vm.run_source_with_input(source, ["42", "oops", "2.5", "true", "abc", "7"])
 
             out len(vm_output)
@@ -5721,10 +7881,10 @@ mod tests {
             entry_ops[3],
             StatementOp::Jump { target_pc } if target_pc == entry_start + 1
         ));
-        let StatementOp::LoopCheck { exit_pc, .. } = entry_ops[1] else {
+        let StatementOp::LoopCheck { normal_exit_pc, .. } = entry_ops[1] else {
             unreachable!();
         };
-        assert_eq!(exit_pc, entry_start + 4);
+        assert_eq!(normal_exit_pc, entry_start + 4);
         let StatementOp::ExecLoopBody {
             body,
             continue_pc,
@@ -5756,18 +7916,19 @@ mod tests {
             block_id: compiled.entry,
             pc: compiled.blocks[compiled.entry].start,
             loop_iterations: HashMap::new(),
+            loop_limits: HashMap::new(),
         };
         let mut runtime = runtime;
         runtime.program = Some(&compiled);
 
         assert!(matches!(
             runtime.next_statement_op(&mut frame).unwrap(),
-            Some(StatementOp::VariableDecl(_))
+            Some((_, StatementOp::VariableDecl(_)))
         ));
         assert_eq!(frame.pc, compiled.blocks[compiled.entry].start + 1);
         assert!(matches!(
             runtime.next_statement_op(&mut frame).unwrap(),
-            Some(StatementOp::Out(_))
+            Some((_, StatementOp::Out(_)))
         ));
         assert_eq!(frame.pc, compiled.blocks[compiled.entry].start + 2);
         assert_eq!(runtime.next_statement_op(&mut frame).unwrap(), None);

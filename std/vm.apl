@@ -33,7 +33,11 @@ func vm.new_env() {
 }
 
 func vm.new_env_with_input(inputs) {
-  return [[], inputs, 0, 0]
+  return vm.new_env_with_bound_input(inputs, [])
+}
+
+func vm.new_env_with_bound_input(inputs, input_arguments) {
+  return [[], inputs, 0, 0, 0, input_arguments]
 }
 
 func vm.env_bindings(env) {
@@ -98,6 +102,14 @@ func vm.env_input_index(env) {
   return get(env, 2)
 }
 
+func vm.env_stdin_index(env) {
+  return get(env, 4)
+}
+
+func vm.env_input_arguments(env) {
+  return get(env, 5)
+}
+
 func vm.env_depths(env) {
   VTime depths = []
 
@@ -113,18 +125,33 @@ func vm.env_scope_depth(env) {
 }
 
 func vm.env_with_input_index(env, input_index) {
-  return [vm.env_bindings(env), vm.env_inputs(env), input_index, vm.env_scope_depth(env)]
+  return [vm.env_bindings(env), vm.env_inputs(env), input_index, vm.env_scope_depth(env), vm.env_stdin_index(env), vm.env_input_arguments(env)]
 }
 
 func vm.env_read_input(env) {
   VTime inputs = vm.env_inputs(env)
   VTime input_index = vm.env_input_index(env)
+  VTime stdin_index = vm.env_stdin_index(env)
+  VTime slot = input_index + 1
+  VTime value = NONE
+  VTime from_argument = false
 
-  if input_index >= len(inputs) {
-    return [NONE, env]
+  pick(vm.env_input_arguments(env)): input_argument {
+    if get(input_argument, 0) == slot {
+      value = get(input_argument, 1)
+      from_argument = true
+    }
   }
 
-  return [get(inputs, input_index), vm.env_with_input_index(env, input_index + 1)]
+  if from_argument == false {
+    if stdin_index < len(inputs) {
+      value = get(inputs, stdin_index)
+      stdin_index += 1
+    }
+  }
+
+  VTime next_env = [vm.env_bindings(env), inputs, input_index + 1, vm.env_scope_depth(env), stdin_index, vm.env_input_arguments(env)]
+  return [value, next_env, from_argument, slot]
 }
 
 func vm.env_put(env, name, value) {
@@ -171,7 +198,7 @@ func vm.env_bind(env, name, value, kind, value_type, initial, depth) {
   }
 
   add(bindings, [name, value, kind, value_type, initial, depth])
-  return [bindings, vm.env_inputs(env), vm.env_input_index(env), vm.env_scope_depth(env)]
+  return [bindings, vm.env_inputs(env), vm.env_input_index(env), vm.env_scope_depth(env), vm.env_stdin_index(env), vm.env_input_arguments(env)]
 }
 
 func vm.env_binding_index(env, name) {
@@ -268,7 +295,7 @@ func vm.env_initial_or_value(env, name, value) {
 }
 
 func vm.env_begin_scope(env) {
-  return [vm.env_bindings(env), vm.env_inputs(env), vm.env_input_index(env), vm.env_scope_depth(env) + 1]
+  return [vm.env_bindings(env), vm.env_inputs(env), vm.env_input_index(env), vm.env_scope_depth(env) + 1, vm.env_stdin_index(env), vm.env_input_arguments(env)]
 }
 
 func vm.env_end_scope(env) {
@@ -281,7 +308,7 @@ func vm.env_end_scope(env) {
     }
   }
 
-  return [bindings, vm.env_inputs(env), vm.env_input_index(env), scope_depth - 1]
+  return [bindings, vm.env_inputs(env), vm.env_input_index(env), scope_depth - 1, vm.env_stdin_index(env), vm.env_input_arguments(env)]
 }
 
 func vm.state_end_scope(state) {
@@ -499,7 +526,7 @@ func vm.env_without(env, name) {
     }
   }
 
-  return [bindings, vm.env_inputs(env), vm.env_input_index(env), scope_depth]
+  return [bindings, vm.env_inputs(env), vm.env_input_index(env), scope_depth, vm.env_stdin_index(env), vm.env_input_arguments(env)]
 }
 
 func vm.new_functions() {
@@ -628,6 +655,11 @@ func vm.eval_expr(expression, env, output, functions) {
 
   if opcode == ir.EXPR_SECRET_INPUT {
     VTime input_state = vm.env_read_input(env)
+    if get(input_state, 2) {
+      VTime failed_output = output[:]
+      add(failed_output, join(["secret input cannot be supplied by process argument `-", str(get(input_state, 3)), "`"], ""))
+      return vm.expr_flow(vm.FLOW_FAIL, get(input_state, 1), failed_output)
+    }
     return vm.expr_ok(get(input_state, 0), get(input_state, 1), output, "ASV")
   }
 
@@ -730,6 +762,12 @@ func vm.eval_slice_expr(expression, env, output, functions) {
 
   VTime step = get(step_state, 0)
 
+  if step == 0 {
+    VTime failed_output = output[:]
+    add(failed_output, "zero slice step")
+    return vm.expr_flow(vm.FLOW_FAIL, env, failed_output)
+  }
+
   if start == NONE {
     if end == NONE {
       if step == NONE {
@@ -762,6 +800,25 @@ func vm.eval_slice_expr(expression, env, output, functions) {
 }
 
 func vm.is_builtin_call(name) {
+  if contains(name, "raw_") {
+    return verifier.builtin_arity(name) >= 0
+  }
+
+  if name == "timer_start" {
+    return true
+  }
+
+  if name == "timer_stop" {
+    return true
+  }
+
+  if name == "timer_elapsed" {
+    return true
+  }
+  if name == "now_utc" {
+    return true
+  }
+
   if name == "get" {
     return true
   }
@@ -826,6 +883,78 @@ func vm.is_builtin_call(name) {
     return true
   }
 
+  if name == "sha1" {
+    return true
+  }
+
+  if name == "sha256" {
+    return true
+  }
+
+  if name == "sha512" {
+    return true
+  }
+  if name == "sha3_384" {
+    return true
+  }
+  if (((name == "windows_available") or (name == "windows_load_library")) or (name == "windows_get_procedure")) or (name == "windows_call") {
+    return true
+  }
+  if (((name == "windows_close_library") or (name == "windows_last_error")) or (name == "windows_utf16")) or (name == "windows_message_box") {
+    return true
+  }
+  if (((name == "windows_create_window") or (name == "windows_show_window")) or (name == "windows_destroy_window")) or (name == "windows_run_message_loop") {
+    return true
+  }
+  if name == "windows_pump_messages" {
+    return true
+  }
+  if name == "windows_next_event" {
+    return true
+  }
+  if (((name == "windows_create_control") or (name == "windows_set_window_text")) or (name == "windows_window_text")) or (name == "windows_move_window") {
+    return true
+  }
+  if (((name == "windows_selection") or (name == "windows_set_selection")) or (name == "windows_replace_selection")) or (name == "windows_line_count") {
+    return true
+  }
+  if (name == "windows_set_text_color") or (name == "windows_find_text") {
+    return true
+  }
+  if (((name == "windows_set_background_color") or (name == "windows_set_text_bold")) or (name == "windows_can_undo")) or (name == "windows_undo") {
+    return true
+  }
+  if name == "windows_set_text_font" {
+    return true
+  }
+  if name == "windows_run_process" {
+    return true
+  }
+  if (name == "windows_open_file_dialog") or (name == "windows_save_file_dialog") {
+    return true
+  }
+  if (((name == "windows_create_menu") or (name == "windows_append_menu_item")) or (name == "windows_append_submenu")) or (name == "windows_append_menu_separator") {
+    return true
+  }
+  if (((name == "windows_set_menu") or (name == "windows_set_menu_item_enabled")) or (name == "windows_set_menu_item_checked")) or (name == "windows_destroy_menu") {
+    return true
+  }
+  if (((name == "windows_wait_event") or (name == "windows_load_icon")) or (name == "windows_set_window_icon")) or (name == "windows_destroy_icon") {
+    return true
+  }
+  if name == "windows_set_deferred_close" {
+    return true
+  }
+  if ((name == "windows_create_accelerators") or (name == "windows_set_accelerators")) or (name == "windows_destroy_accelerators") {
+    return true
+  }
+  if (((name == "windows_can_redo") or (name == "windows_redo")) or (name == "windows_clear_history")) or (name == "windows_event_mask") {
+    return true
+  }
+  if (((name == "windows_set_event_mask") or (name == "windows_first_visible_line")) or (name == "windows_scroll_lines")) or (name == "windows_focus") {
+    return true
+  }
+
   if name == "json" {
     return true
   }
@@ -854,6 +983,63 @@ func vm.eval_arg_values(arg_exprs, env, output, functions) {
 }
 
 func vm.call_builtin(name, arg_exprs, env, output, functions) {
+  if name == "raw_free" {
+    return vm.expr_ok(raw_free(), env, output, "AV")
+  }
+
+  if name == "raw_scope_exit" {
+    return vm.expr_ok(raw_scope_exit(), env, output, "AV")
+  }
+
+  if contains(name, "raw_") {
+    VTime arg_state = vm.eval_arg_values(arg_exprs, env, output, functions)
+    VTime args = get(arg_state, 0)
+    env = get(arg_state, 1)
+    output = get(arg_state, 2)
+    if get(arg_state, 4) != vm.FLOW_OK {
+      return vm.expr_flow(get(arg_state, 4), env, output)
+    }
+
+    if name == "raw_malloc" {
+      return vm.expr_ok(raw_malloc(get(args, 0)), env, output, "AV")
+    }
+    if name == "raw_load" {
+      return vm.expr_ok(raw_load(get(args, 0), get(args, 1), get(args, 2), get(args, 3)), env, output, "AV")
+    }
+    if name == "raw_mark" {
+      return vm.expr_ok(raw_mark(get(args, 0)), env, output, "AV")
+    }
+    if name == "raw_where" {
+      VTime selector = get(args, 1)
+      if selector == 2 {
+        VTime source_expr = get(arg_exprs, 0)
+        if ir.expr_opcode(source_expr) == ir.EXPR_LOAD {
+          return vm.expr_ok(ir.expr_value(source_expr), env, output, "AV")
+        }
+        return vm.expr_ok(NONE, env, output, "AV")
+      }
+      if selector == 3 {
+        return vm.expr_ok(get(args, 0), env, output, get(get(arg_state, 3), 0))
+      }
+      return vm.expr_ok(raw_where(get(args, 0), selector), env, output, "AV")
+    }
+    if name == "raw_read" {
+      return vm.expr_ok(raw_read(get(args, 0), get(args, 1), get(args, 2)), env, output, "AV")
+    }
+    if name == "raw_write" {
+      return vm.expr_ok(raw_write(get(args, 0), get(args, 1), get(args, 2)), env, output, "AV")
+    }
+    if name == "raw_call" {
+      return vm.expr_ok(raw_call(get(args, 0), get(args, 1)), env, output, "AV")
+    }
+    if name == "raw_scope_enter" {
+      return vm.expr_ok(raw_scope_enter(get(args, 0)), env, output, "AV")
+    }
+    if name == "raw_scope_leave" {
+      return vm.expr_ok(raw_scope_leave(get(args, 0)), env, output, get(get(arg_state, 3), 0))
+    }
+  }
+
   if name == "add" {
     VTime list_expr = get(arg_exprs, 0)
 
@@ -945,6 +1131,21 @@ func vm.call_builtin(name, arg_exprs, env, output, functions) {
 
   VTime args = get(args_state, 0)
 
+  if name == "timer_start" {
+    return vm.expr_ok(std::timer_start(), env, output, "AV")
+  }
+
+  if name == "timer_stop" {
+    return vm.expr_ok(std::timer_stop(), env, output, "AV")
+  }
+
+  if name == "timer_elapsed" {
+    return vm.expr_ok(std::timer_elapsed(), env, output, "AV")
+  }
+  if name == "now_utc" {
+    return vm.expr_ok(std::now_utc(), env, output, "AV")
+  }
+
   if name == "get" {
     return vm.expr_ok(get(get(args, 0), get(args, 1)), env, output, vm.max_kind(vm.list_item_kind(get(get(args_state, 3), 0), get(args, 1)), get(get(args_state, 3), 1)))
   }
@@ -1011,6 +1212,187 @@ func vm.call_builtin(name, arg_exprs, env, output, functions) {
 
   if name == "bytes" {
     return vm.expr_ok(bytes(get(args, 0)), env, output, get(get(args_state, 3), 0))
+  }
+
+  if (((name == "sha1") or (name == "sha256")) or (name == "sha512")) or (name == "sha3_384") {
+    if name == "sha1" {
+      return vm.expr_ok(std::sha1(get(args, 0)), env, output, get(get(args_state, 3), 0))
+    }
+    if name == "sha256" {
+      return vm.expr_ok(std::sha256(get(args, 0)), env, output, get(get(args_state, 3), 0))
+    }
+    if name == "sha512" {
+      return vm.expr_ok(std::sha512(get(args, 0)), env, output, get(get(args_state, 3), 0))
+    }
+    return vm.expr_ok(std::sha3_384(get(args, 0)), env, output, get(get(args_state, 3), 0))
+  }
+  if name == "windows_available" {
+    return vm.expr_ok(std::windows_available(), env, output, "AV")
+  }
+  if name == "windows_load_library" {
+    return vm.expr_ok(std::windows_load_library(get(args, 0)), env, output, "AV")
+  }
+  if name == "windows_get_procedure" {
+    return vm.expr_ok(std::windows_get_procedure(get(args, 0), get(args, 1), get(args, 2), get(args, 3)), env, output, "AV")
+  }
+  if name == "windows_call" {
+    return vm.expr_ok(std::windows_call(get(args, 0), get(args, 1)), env, output, "AV")
+  }
+  if name == "windows_close_library" {
+    return vm.expr_ok(std::windows_close_library(get(args, 0)), env, output, "AV")
+  }
+  if name == "windows_last_error" {
+    return vm.expr_ok(std::windows_last_error(), env, output, "AV")
+  }
+  if name == "windows_utf16" {
+    return vm.expr_ok(std::windows_utf16(get(args, 0)), env, output, get(get(args_state, 3), 0))
+  }
+  if name == "windows_message_box" {
+    return vm.expr_ok(std::windows_message_box(get(args, 0), get(args, 1), get(args, 2)), env, output, "AV")
+  }
+  if name == "windows_create_window" {
+    return vm.expr_ok(std::windows_create_window(get(args, 0), get(args, 1), get(args, 2)), env, output, "AV")
+  }
+  if name == "windows_show_window" {
+    return vm.expr_ok(std::windows_show_window(get(args, 0)), env, output, "AV")
+  }
+  if name == "windows_destroy_window" {
+    return vm.expr_ok(std::windows_destroy_window(get(args, 0)), env, output, "AV")
+  }
+  if name == "windows_run_message_loop" {
+    return vm.expr_ok(std::windows_run_message_loop(), env, output, "AV")
+  }
+  if name == "windows_pump_messages" {
+    return vm.expr_ok(std::windows_pump_messages(), env, output, "AV")
+  }
+  if name == "windows_next_event" {
+    return vm.expr_ok(std::windows_next_event(), env, output, "AV")
+  }
+  if name == "windows_create_control" {
+    return vm.expr_ok(std::windows_create_control(get(args, 0), get(args, 1), get(args, 2), get(args, 3), get(args, 4), get(args, 5), get(args, 6), get(args, 7), get(args, 8), get(args, 9)), env, output, "AV")
+  }
+  if name == "windows_set_window_text" {
+    return vm.expr_ok(std::windows_set_window_text(get(args, 0), get(args, 1)), env, output, "AV")
+  }
+  if name == "windows_window_text" {
+    return vm.expr_ok(std::windows_window_text(get(args, 0)), env, output, "AV")
+  }
+  if name == "windows_move_window" {
+    return vm.expr_ok(std::windows_move_window(get(args, 0), get(args, 1), get(args, 2), get(args, 3), get(args, 4), get(args, 5)), env, output, "AV")
+  }
+  if name == "windows_selection" {
+    return vm.expr_ok(std::windows_selection(get(args, 0)), env, output, "AV")
+  }
+  if name == "windows_set_selection" {
+    return vm.expr_ok(std::windows_set_selection(get(args, 0), get(args, 1), get(args, 2)), env, output, "AV")
+  }
+  if name == "windows_replace_selection" {
+    return vm.expr_ok(std::windows_replace_selection(get(args, 0), get(args, 1), get(args, 2)), env, output, "AV")
+  }
+  if name == "windows_line_count" {
+    return vm.expr_ok(std::windows_line_count(get(args, 0)), env, output, "AV")
+  }
+  if name == "windows_set_text_color" {
+    return vm.expr_ok(std::windows_set_text_color(get(args, 0), get(args, 1), get(args, 2), get(args, 3)), env, output, "AV")
+  }
+  if name == "windows_set_background_color" {
+    return vm.expr_ok(std::windows_set_background_color(get(args, 0), get(args, 1), get(args, 2), get(args, 3)), env, output, "AV")
+  }
+  if name == "windows_set_text_bold" {
+    return vm.expr_ok(std::windows_set_text_bold(get(args, 0), get(args, 1), get(args, 2), get(args, 3)), env, output, "AV")
+  }
+  if name == "windows_set_text_font" {
+    return vm.expr_ok(std::windows_set_text_font(get(args, 0), get(args, 1), get(args, 2), get(args, 3), get(args, 4)), env, output, "AV")
+  }
+  if name == "windows_run_process" {
+    return vm.expr_ok(std::windows_run_process(get(args, 0), get(args, 1), get(args, 2), get(args, 3)), env, output, "AV")
+  }
+  if name == "windows_open_file_dialog" {
+    return vm.expr_ok(std::windows_open_file_dialog(get(args, 0), get(args, 1), get(args, 2), get(args, 3), get(args, 4), get(args, 5), get(args, 6)), env, output, "AV")
+  }
+  if name == "windows_save_file_dialog" {
+    return vm.expr_ok(std::windows_save_file_dialog(get(args, 0), get(args, 1), get(args, 2), get(args, 3), get(args, 4), get(args, 5), get(args, 6)), env, output, "AV")
+  }
+  if name == "windows_create_menu" {
+    return vm.expr_ok(std::windows_create_menu(get(args, 0)), env, output, "AV")
+  }
+  if name == "windows_append_menu_item" {
+    return vm.expr_ok(std::windows_append_menu_item(get(args, 0), get(args, 1), get(args, 2)), env, output, "AV")
+  }
+  if name == "windows_append_submenu" {
+    return vm.expr_ok(std::windows_append_submenu(get(args, 0), get(args, 1), get(args, 2)), env, output, "AV")
+  }
+  if name == "windows_append_menu_separator" {
+    return vm.expr_ok(std::windows_append_menu_separator(get(args, 0)), env, output, "AV")
+  }
+  if name == "windows_set_menu" {
+    return vm.expr_ok(std::windows_set_menu(get(args, 0), get(args, 1)), env, output, "AV")
+  }
+  if name == "windows_set_menu_item_enabled" {
+    return vm.expr_ok(std::windows_set_menu_item_enabled(get(args, 0), get(args, 1), get(args, 2)), env, output, "AV")
+  }
+  if name == "windows_set_menu_item_checked" {
+    return vm.expr_ok(std::windows_set_menu_item_checked(get(args, 0), get(args, 1), get(args, 2)), env, output, "AV")
+  }
+  if name == "windows_destroy_menu" {
+    return vm.expr_ok(std::windows_destroy_menu(get(args, 0)), env, output, "AV")
+  }
+  if name == "windows_wait_event" {
+    return vm.expr_ok(std::windows_wait_event(), env, output, "AV")
+  }
+  if name == "windows_load_icon" {
+    return vm.expr_ok(std::windows_load_icon(get(args, 0), get(args, 1), get(args, 2)), env, output, "AV")
+  }
+  if name == "windows_set_window_icon" {
+    return vm.expr_ok(std::windows_set_window_icon(get(args, 0), get(args, 1)), env, output, "AV")
+  }
+  if name == "windows_destroy_icon" {
+    return vm.expr_ok(std::windows_destroy_icon(get(args, 0)), env, output, "AV")
+  }
+  if name == "windows_set_deferred_close" {
+    return vm.expr_ok(std::windows_set_deferred_close(get(args, 0), get(args, 1)), env, output, "AV")
+  }
+  if name == "windows_create_accelerators" {
+    return vm.expr_ok(std::windows_create_accelerators(get(args, 0)), env, output, "AV")
+  }
+  if name == "windows_set_accelerators" {
+    return vm.expr_ok(std::windows_set_accelerators(get(args, 0), get(args, 1)), env, output, "AV")
+  }
+  if name == "windows_destroy_accelerators" {
+    return vm.expr_ok(std::windows_destroy_accelerators(get(args, 0)), env, output, "AV")
+  }
+  if name == "windows_can_undo" {
+    return vm.expr_ok(std::windows_can_undo(get(args, 0)), env, output, "AV")
+  }
+  if name == "windows_undo" {
+    return vm.expr_ok(std::windows_undo(get(args, 0)), env, output, "AV")
+  }
+  if name == "windows_can_redo" {
+    return vm.expr_ok(std::windows_can_redo(get(args, 0)), env, output, "AV")
+  }
+  if name == "windows_redo" {
+    return vm.expr_ok(std::windows_redo(get(args, 0)), env, output, "AV")
+  }
+  if name == "windows_clear_history" {
+    return vm.expr_ok(std::windows_clear_history(get(args, 0)), env, output, "AV")
+  }
+  if name == "windows_event_mask" {
+    return vm.expr_ok(std::windows_event_mask(get(args, 0)), env, output, "AV")
+  }
+  if name == "windows_set_event_mask" {
+    return vm.expr_ok(std::windows_set_event_mask(get(args, 0), get(args, 1)), env, output, "AV")
+  }
+  if name == "windows_first_visible_line" {
+    return vm.expr_ok(std::windows_first_visible_line(get(args, 0)), env, output, "AV")
+  }
+  if name == "windows_scroll_lines" {
+    return vm.expr_ok(std::windows_scroll_lines(get(args, 0), get(args, 1)), env, output, "AV")
+  }
+  if name == "windows_focus" {
+    return vm.expr_ok(std::windows_focus(get(args, 0)), env, output, "AV")
+  }
+  if name == "windows_find_text" {
+    return vm.expr_ok(std::windows_find_text(get(args, 0), get(args, 1), get(args, 2), get(args, 3), get(args, 4), get(args, 5)), env, output, "AV")
   }
 
   if name == "json" {
@@ -1517,6 +1899,27 @@ func vm.exec_instruction(instruction, env, output, functions) {
     return [vm.FLOW_FAIL, env, vm.add_public_reason(output, value_state, "FAIL")]
   }
 
+  if opcode == ir.OP_ERR_RETURN {
+    VTime message_state = vm.eval_expr(get(instruction, 1), env, output, functions)
+    env = get(message_state, 1)
+    output = get(message_state, 2)
+    if vm.expr_is_ok(message_state) != true {
+      return vm.state_from_expr(message_state)
+    }
+    VTime code_state = vm.eval_expr(get(instruction, 2), env, output, functions)
+    env = get(code_state, 1)
+    output = get(code_state, 2)
+    if vm.expr_is_ok(code_state) != true {
+      return vm.state_from_expr(code_state)
+    }
+    if (vm.kind_is_public(get(message_state, 3)) != true) or (vm.kind_is_public(get(code_state, 3)) != true) {
+      add(output, "DENIED")
+      return [vm.FLOW_FAIL, env, output]
+    }
+    add(output, get(message_state, 0))
+    return [join(["ERR:", str(get(code_state, 0))], ""), env, output]
+  }
+
   if opcode == ir.OP_BREAK {
     return [vm.FLOW_BREAK, env, output]
   }
@@ -1577,9 +1980,29 @@ func vm.exec_instruction(instruction, env, output, functions) {
 
   if opcode == ir.OP_WHILE {
     VTime condition = get(instruction, 1)
-    VTime limit = get(instruction, 2)
+    VTime limit_state = vm.eval_expr(get(instruction, 2), env, output, functions)
+    env = get(limit_state, 1)
+    output = get(limit_state, 2)
+
+    if vm.expr_is_ok(limit_state) != true {
+      return vm.state_from_expr(limit_state)
+    }
+
+    VTime limit = get(limit_state, 0)
     VTime body = get(instruction, 3)
+    VTime limit_body = get(instruction, 4)
+    VTime else_body = get(instruction, 5)
     VTime iterations = 0
+
+    if verifier.is_int(limit) != true {
+      add(output, "while limit must evaluate to Int")
+      return [vm.FLOW_FAIL, env, output]
+    }
+
+    if limit < -1 {
+      add(output, join(["invalid loop limit `", str(limit), "`"], ""))
+      return [vm.FLOW_FAIL, env, output]
+    }
 
     while (true) (-1) {
       VTime condition_state = vm.eval_expr(condition, env, output, functions)
@@ -1591,15 +2014,16 @@ func vm.exec_instruction(instruction, env, output, functions) {
       }
 
       if get(condition_state, 0) != true {
+        if iterations == 0 {
+          VTime else_state = vm.run_ir_state(else_body, vm.env_begin_scope(env), output, functions)
+          return vm.state_end_scope(else_state)
+        }
         break
       }
 
-      if limit < -1 {
-        return [vm.FLOW_OK, env, output]
-      }
-
       if (limit != -1) and (iterations >= limit) {
-        return [vm.FLOW_OK, env, output]
+        VTime limit_result = vm.run_ir_state(limit_body, vm.env_begin_scope(env), output, functions)
+        return vm.state_end_scope(limit_result)
       }
 
       VTime state = vm.run_ir_state(body, vm.env_begin_scope(env), output, functions)
@@ -1626,6 +2050,54 @@ func vm.exec_instruction(instruction, env, output, functions) {
     }
 
     return [vm.FLOW_OK, env, output]
+  }
+
+  if opcode == ir.OP_MATCH {
+    VTime value_state = vm.eval_expr(get(instruction, 1), env, output, functions)
+    env = get(value_state, 1)
+    output = get(value_state, 2)
+    if vm.expr_is_ok(value_state) != true {
+      return vm.state_from_expr(value_state)
+    }
+
+    VTime value = get(value_state, 0)
+    pick(get(instruction, 2)): case_entry {
+      VTime matched = false
+      pick(get(case_entry, 0)): pattern {
+        VTime start_state = vm.eval_expr(get(pattern, 1), env, output, functions)
+        env = get(start_state, 1)
+        output = get(start_state, 2)
+        if vm.expr_is_ok(start_state) != true {
+          return vm.state_from_expr(start_state)
+        }
+
+        if get(pattern, 0) == parser.MATCH_VALUE {
+          matched = value == get(start_state, 0)
+        } else {
+          if value >= get(start_state, 0) {
+            VTime end_state = vm.eval_expr(get(pattern, 2), env, output, functions)
+            env = get(end_state, 1)
+            output = get(end_state, 2)
+            if vm.expr_is_ok(end_state) != true {
+              return vm.state_from_expr(end_state)
+            }
+            matched = value <= get(end_state, 0)
+          }
+        }
+
+        if matched {
+          break
+        }
+      }
+
+      if matched {
+        VTime case_state = vm.run_ir_state(get(case_entry, 1), vm.env_begin_scope(env), output, functions)
+        return vm.state_end_scope(case_state)
+      }
+    }
+
+    VTime default_state = vm.run_ir_state(get(instruction, 3), vm.env_begin_scope(env), output, functions)
+    return vm.state_end_scope(default_state)
   }
 
   if opcode == ir.OP_PICK {
@@ -1756,6 +2228,21 @@ func vm.run_loaded_with_input_report(loaded, inputs) {
   }
 
   VTime state = vm.run_ir_state(vm.loaded_program(loaded), vm.new_env_with_input(inputs), [], functions)
+  return [get(state, 0), get(state, 2)]
+}
+
+func vm.run_loaded_with_bound_input_report(loaded, inputs, input_arguments) {
+  if vm.loaded_image_is_valid(loaded) != true {
+    return [vm.FLOW_FAIL, ["invalid loaded image"]]
+  }
+
+  VTime functions = vm.loaded_functions(loaded)
+
+  if vm.functions_ok(functions) != true {
+    return [vm.FLOW_FAIL, []]
+  }
+
+  VTime state = vm.run_ir_state(vm.loaded_program(loaded), vm.new_env_with_bound_input(inputs, input_arguments), [], functions)
   return [get(state, 0), get(state, 2)]
 }
 

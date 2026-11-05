@@ -1,0 +1,5 @@
+format = 1
+name = "windows"
+namespace = "windows"
+description = "Win32 system boundary and ergonomic Windows API."
+dependencies = ["classes"]

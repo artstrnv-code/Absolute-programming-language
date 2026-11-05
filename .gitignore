@@ -1,6 +1,8 @@
 /target/
 /build/
+/dist/
+/.verification-target/
 /.apl_gui_run.apl
 *.bak*
-/fix.ps1
 /examples/libraries/*.aplmod
+/libraries/*.aplmod

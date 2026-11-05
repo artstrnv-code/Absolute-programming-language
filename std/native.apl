@@ -30,6 +30,7 @@ AVStr native.OP_SECRETUP = "SECRETUP"
 AVStr native.OP_OUT = "OUT"
 AVStr native.OP_STOP = "STOP"
 AVStr native.OP_FAIL = "FAIL"
+AVStr native.OP_ERR_RETURN = "ERR_RETURN"
 AVStr native.OP_RETURN = "RETURN"
 
 AVStr native.OP_LABEL = "LABEL"
@@ -219,6 +220,12 @@ func native.lower_instruction(instruction, state, loops, scope_depth) {
     return native.emit(state, [native.OP_FAIL])
   }
 
+  if opcode == ir.OP_ERR_RETURN {
+    state = native.lower_expr(get(instruction, 1), state)
+    state = native.lower_expr(get(instruction, 2), state)
+    return native.emit(state, [native.OP_ERR_RETURN])
+  }
+
   if opcode == ir.OP_RETURN {
     state = native.lower_expr(get(instruction, 1), state)
     return native.emit(state, [native.OP_RETURN, scope_depth])
@@ -264,21 +271,109 @@ func native.lower_instruction(instruction, state, loops, scope_depth) {
     VTime condition_label = get(reserved, 1)
     reserved = native.reserve_id(state)
     state = get(reserved, 0)
-    VTime exit_label = get(reserved, 1)
+    VTime check_label = get(reserved, 1)
+    reserved = native.reserve_id(state)
+    state = get(reserved, 0)
+    VTime normal_label = get(reserved, 1)
+    reserved = native.reserve_id(state)
+    state = get(reserved, 0)
+    VTime limit_label = get(reserved, 1)
+    reserved = native.reserve_id(state)
+    state = get(reserved, 0)
+    VTime else_label = get(reserved, 1)
+    reserved = native.reserve_id(state)
+    state = get(reserved, 0)
+    VTime end_label = get(reserved, 1)
     VTime inner_loops = loops[:]
-    add(inner_loops, [condition_label, exit_label, scope_depth])
+    add(inner_loops, [condition_label, normal_label, scope_depth])
 
-    state = native.emit(state, [native.OP_LOOP_ENTER, loop_id, get(instruction, 2)])
-    state = native.emit(state, [native.OP_LABEL, condition_label])
+    state = native.lower_expr(get(instruction, 2), state)
+    state = native.emit(state, [native.OP_LOOP_ENTER, loop_id])
     state = native.lower_expr(get(instruction, 1), state)
-    state = native.emit(state, [native.OP_JUMP_IF_FALSE, exit_label])
-    state = native.emit(state, [native.OP_LOOP_CHECK, loop_id, exit_label])
+    state = native.emit(state, [native.OP_JUMP_IF_FALSE, else_label])
+    state = native.emit(state, [native.OP_LABEL, check_label])
+    state = native.emit(state, [native.OP_LOOP_CHECK, loop_id, limit_label])
     state = native.emit(state, [native.OP_SCOPE_ENTER])
     state = native.lower_program(get(instruction, 3), state, inner_loops, scope_depth + 1)
     state = native.emit(state, [native.OP_SCOPE_EXIT])
-    state = native.emit(state, [native.OP_JUMP, condition_label])
-    state = native.emit(state, [native.OP_LABEL, exit_label])
-    return native.emit(state, [native.OP_LOOP_EXIT, loop_id])
+    state = native.emit(state, [native.OP_LABEL, condition_label])
+    state = native.lower_expr(get(instruction, 1), state)
+    state = native.emit(state, [native.OP_JUMP_IF_FALSE, normal_label])
+    state = native.emit(state, [native.OP_JUMP, check_label])
+    state = native.emit(state, [native.OP_LABEL, limit_label])
+    state = native.emit(state, [native.OP_LOOP_EXIT, loop_id])
+    state = native.emit(state, [native.OP_SCOPE_ENTER])
+    state = native.lower_program(get(instruction, 4), state, loops, scope_depth + 1)
+    state = native.emit(state, [native.OP_SCOPE_EXIT])
+    state = native.emit(state, [native.OP_JUMP, end_label])
+    state = native.emit(state, [native.OP_LABEL, else_label])
+    state = native.emit(state, [native.OP_LOOP_EXIT, loop_id])
+    state = native.emit(state, [native.OP_SCOPE_ENTER])
+    state = native.lower_program(get(instruction, 5), state, loops, scope_depth + 1)
+    state = native.emit(state, [native.OP_SCOPE_EXIT])
+    state = native.emit(state, [native.OP_JUMP, end_label])
+    state = native.emit(state, [native.OP_LABEL, normal_label])
+    state = native.emit(state, [native.OP_LOOP_EXIT, loop_id])
+    return native.emit(state, [native.OP_LABEL, end_label])
+  }
+
+  if opcode == ir.OP_MATCH {
+    VTime reserved = native.reserve_id(state)
+    state = get(reserved, 0)
+    VTime match_id = get(reserved, 1)
+    reserved = native.reserve_id(state)
+    state = get(reserved, 0)
+    VTime cleanup_label = get(reserved, 1)
+    reserved = native.reserve_id(state)
+    state = get(reserved, 0)
+    VTime end_label = get(reserved, 1)
+    VTime value_name = join(["@match_", str(match_id)], "")
+
+    state = native.emit(state, [native.OP_SCOPE_ENTER])
+    state = native.lower_expr(get(instruction, 1), state)
+    state = native.emit(state, [native.OP_DECLARE_VTIME, value_name])
+
+    pick(get(instruction, 2)): case_entry {
+      reserved = native.reserve_id(state)
+      state = get(reserved, 0)
+      VTime body_label = get(reserved, 1)
+      reserved = native.reserve_id(state)
+      state = get(reserved, 0)
+      VTime next_case_label = get(reserved, 1)
+
+      pick(get(case_entry, 0)): pattern {
+        reserved = native.reserve_id(state)
+        state = get(reserved, 0)
+        VTime next_pattern_label = get(reserved, 1)
+        state = native.lower_expr([ir.EXPR_LOAD, parser.EXPR_VAR, value_name], state)
+        state = native.lower_expr(get(pattern, 1), state)
+        if get(pattern, 0) == parser.MATCH_VALUE {
+          state = native.emit(state, [native.OP_BINARY, "=="])
+          state = native.emit(state, [native.OP_JUMP_IF_FALSE, next_pattern_label])
+        } else {
+          state = native.emit(state, [native.OP_BINARY, ">="])
+          state = native.emit(state, [native.OP_JUMP_IF_FALSE, next_pattern_label])
+          state = native.lower_expr([ir.EXPR_LOAD, parser.EXPR_VAR, value_name], state)
+          state = native.lower_expr(get(pattern, 2), state)
+          state = native.emit(state, [native.OP_BINARY, "<="])
+          state = native.emit(state, [native.OP_JUMP_IF_FALSE, next_pattern_label])
+        }
+        state = native.emit(state, [native.OP_JUMP, body_label])
+        state = native.emit(state, [native.OP_LABEL, next_pattern_label])
+      }
+
+      state = native.emit(state, [native.OP_JUMP, next_case_label])
+      state = native.emit(state, [native.OP_LABEL, body_label])
+      state = native.lower_program(get(case_entry, 1), state, loops, scope_depth + 1)
+      state = native.emit(state, [native.OP_JUMP, cleanup_label])
+      state = native.emit(state, [native.OP_LABEL, next_case_label])
+    }
+
+    state = native.lower_program(get(instruction, 3), state, loops, scope_depth + 1)
+    state = native.emit(state, [native.OP_LABEL, cleanup_label])
+    state = native.emit(state, [native.OP_SCOPE_EXIT])
+    state = native.emit(state, [native.OP_LABEL, end_label])
+    return state
   }
 
   if opcode == ir.OP_PICK {
@@ -396,7 +491,7 @@ func native.instruction_is_valid(instruction, function_arities) {
     return (len(instruction) == 3) and (verifier.literal_is_valid(get(instruction, 1), get(instruction, 2)))
   }
 
-  VTime no_arg = [native.OP_NONE, native.OP_INPUT, native.OP_SECRET_INPUT, native.OP_INDEX, native.OP_SLICE, native.OP_DROP, native.OP_OUT, native.OP_STOP, native.OP_FAIL, native.OP_SCOPE_ENTER, native.OP_SCOPE_EXIT]
+  VTime no_arg = [native.OP_NONE, native.OP_INPUT, native.OP_SECRET_INPUT, native.OP_INDEX, native.OP_SLICE, native.OP_DROP, native.OP_OUT, native.OP_STOP, native.OP_FAIL, native.OP_ERR_RETURN, native.OP_SCOPE_ENTER, native.OP_SCOPE_EXIT]
 
   if checker.value_exists(no_arg, opcode) {
     return len(instruction) == 1
@@ -500,7 +595,7 @@ func native.instruction_is_valid(instruction, function_arities) {
   }
 
   if opcode == native.OP_LOOP_ENTER {
-    return (((len(instruction) == 3) and (native.nonnegative_int(get(instruction, 1)))) and (verifier.is_int(get(instruction, 2)))) and (get(instruction, 2) >= -1)
+    return (len(instruction) == 2) and (native.nonnegative_int(get(instruction, 1)))
   }
 
   if opcode == native.OP_LOOP_CHECK {
@@ -547,6 +642,10 @@ func native.stack_requirement(instruction) {
     return 4
   }
 
+  if opcode == native.OP_ERR_RETURN {
+    return 2
+  }
+
   if (opcode == native.OP_CALL_BUILTIN) or (opcode == native.OP_CALL_SLOT) {
     return get(instruction, 2)
   }
@@ -555,7 +654,7 @@ func native.stack_requirement(instruction) {
     return get(instruction, 1)
   }
 
-  VTime consumers = [native.OP_DECLARE, native.OP_DECLARE_LIST, native.OP_DECLARE_VTIME, native.OP_ASSIGN, native.OP_DROP, native.OP_OUT, native.OP_STOP, native.OP_FAIL, native.OP_RETURN, native.OP_JUMP_IF_FALSE, native.OP_PICK_ENTER]
+  VTime consumers = [native.OP_DECLARE, native.OP_DECLARE_LIST, native.OP_DECLARE_VTIME, native.OP_ASSIGN, native.OP_DROP, native.OP_OUT, native.OP_STOP, native.OP_FAIL, native.OP_RETURN, native.OP_JUMP_IF_FALSE, native.OP_LOOP_ENTER, native.OP_PICK_ENTER]
 
   if checker.value_exists(consumers, opcode) {
     return 1
@@ -576,7 +675,7 @@ func native.stack_production(instruction) {
 }
 
 func native.ends_stack_expression(opcode) {
-  VTime boundaries = [native.OP_DECLARE, native.OP_DECLARE_LIST, native.OP_DECLARE_VTIME, native.OP_ASSIGN, native.OP_INFO_ASSIGN, native.OP_DROP, native.OP_SECRETUP, native.OP_OUT, native.OP_STOP, native.OP_FAIL, native.OP_RETURN, native.OP_LABEL, native.OP_JUMP, native.OP_JUMP_IF_FALSE, native.OP_SCOPE_ENTER, native.OP_SCOPE_EXIT, native.OP_UNWIND_JUMP, native.OP_LOOP_ENTER, native.OP_LOOP_CHECK, native.OP_LOOP_EXIT, native.OP_PICK_ENTER, native.OP_PICK_NEXT, native.OP_PICK_EXIT]
+  VTime boundaries = [native.OP_DECLARE, native.OP_DECLARE_LIST, native.OP_DECLARE_VTIME, native.OP_ASSIGN, native.OP_INFO_ASSIGN, native.OP_DROP, native.OP_SECRETUP, native.OP_OUT, native.OP_STOP, native.OP_FAIL, native.OP_ERR_RETURN, native.OP_RETURN, native.OP_LABEL, native.OP_JUMP, native.OP_JUMP_IF_FALSE, native.OP_SCOPE_ENTER, native.OP_SCOPE_EXIT, native.OP_UNWIND_JUMP, native.OP_LOOP_ENTER, native.OP_LOOP_CHECK, native.OP_LOOP_EXIT, native.OP_PICK_ENTER, native.OP_PICK_NEXT, native.OP_PICK_EXIT]
   return checker.value_exists(boundaries, opcode)
 }
 
