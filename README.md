@@ -44,9 +44,9 @@ powershell -ExecutionPolicy Bypass -File .\tools\build_studio.ps1
 .\dist\package\apl_studio.exe
 ```
 
-Everything under `target/` is Cargo cache and may contain debug, release, and
-internal dependency copies with different sizes. Do not select a Studio binary
-there. `dist\package\apl_studio.exe` is the single user-facing release build.
+Everything under `target/` or `build/` is internal cache and may contain
+development copies with different sizes. Do not select a Studio binary there.
+`dist\package\apl_studio.exe` is the single user-facing release build.
 
 Build the portable Windows package, all standard modules, and its checksum:
 
