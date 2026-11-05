@@ -35,6 +35,19 @@ Build the binaries, modules, documentation bundle, ZIP archive, and checksum:
 powershell -ExecutionPolicy Bypass -File .\tools\build_release.ps1
 ```
 
+The script builds through the ignored `build/release-target/` Cargo directory,
+not `target/release/`, so an open developer copy cannot lock the release
+binary. Standard modules are rebuilt into an isolated compiler library
+directory, and native runtime dependencies are vendored offline from its
+checked-in standalone lockfile. CI and verification jobs may isolate all
+output without touching the canonical package:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\tools\build_release.ps1 `
+  -DistDirectory "$env:TEMP\apl-release" `
+  -CargoTargetDirectory "$env:TEMP\apl-release-target"
+```
+
 Results are written under `dist/`:
 
 - `package/` - unpacked installer payload;
