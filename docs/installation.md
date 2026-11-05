@@ -56,6 +56,15 @@ Results are written under `dist/`:
 - `package/apl_studio.exe` - the single canonical Studio binary, already beside
   its CLI, compiler components, and libraries.
 
+Before an archive is created, the release script validates the distribution
+manifest, compiler/runtime payload, source/artifact pairs, and packaged CLI.
+The same verifier can exercise the complete offline native path explicitly:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\tools\verify_package.ps1 `
+  -PackageDirectory .\dist\package -NativeSmoke
+```
+
 ## Installer Build
 
 Install Inno Setup 6, then run:
@@ -66,7 +75,8 @@ powershell -ExecutionPolicy Bypass -File .\tools\build_installer.ps1
 
 The installer is emitted to `dist/installer/`. The recipe is maintained in
 `installer/windows/apl.iss`. Release executables are not code-signed yet, so
-Windows may show an unknown-publisher warning.
+Windows may show an unknown-publisher warning. Even with `-SkipRelease`, the
+installer script refuses to consume a payload that fails package verification.
 
 ## Library Resolution
 

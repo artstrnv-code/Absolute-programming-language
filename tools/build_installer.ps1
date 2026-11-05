@@ -22,6 +22,15 @@ if ([string]::IsNullOrWhiteSpace($Version)) {
 
 if (-not $SkipRelease) {
     & (Join-Path $root "tools\build_release.ps1") -Version $Version
+    if ($LASTEXITCODE -ne 0) {
+        throw "APL release build failed."
+    }
+}
+
+$package = Join-Path $root "dist\package"
+& (Join-Path $root "tools\verify_package.ps1") -PackageDirectory $package
+if ($LASTEXITCODE -ne 0) {
+    throw "APL package verification failed."
 }
 
 $candidates = @(

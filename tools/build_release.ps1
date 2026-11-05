@@ -178,6 +178,11 @@ source = "libraries/source"
 "@
 Set-Content -LiteralPath (Join-Path $stage "apl-distribution.toml") -Value $distributionManifest -Encoding ascii
 
+& (Join-Path $root "tools\verify_package.ps1") -PackageDirectory $stage
+if ($LASTEXITCODE -ne 0) {
+    throw "APL package verification failed."
+}
+
 if (Test-Path -LiteralPath $archive) {
     Remove-Item -LiteralPath $archive -Force
 }

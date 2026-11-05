@@ -10,8 +10,11 @@
   the selected internal CLI instead of source-adjacent or previously generated
   artifacts.
 - `build_release.ps1` creates the complete `dist/package/` payload, portable
-  Windows ZIP, and SHA-256 checksum.
+  Windows ZIP, and SHA-256 checksum, after verifying the staged payload.
 - `build_installer.ps1` builds the Inno Setup installer from that payload.
+- `verify_package.ps1` validates the portable tree and exercises its packaged
+  CLI. Add `-NativeSmoke` to compile and run a standalone EXE through the
+  packaged offline native runtime.
 - `clean_workspace.ps1` removes only ignored, reproducible `build/`, `target/`,
   and the temporary PowerShell GUI source.
 - `legacy/` contains the old PowerShell GUI, batch wrappers, and one-off
