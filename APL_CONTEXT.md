@@ -58,9 +58,9 @@ Library modules remain entrypoint-free.
 
 The postfix increment/decrement, Float-to-Int, expression-valued `while`
 limit, shortened `main`, `match`/loop-handler, and explicit-error regressions
-are repaired. Their minimized sources live in `tests/regressions/fixed/`;
-`tests/regressions/open/` is currently empty apart from its README. The Rust
-compiler/runtime suites nevertheless have 22 diagnostic-contract failures:
+are repaired. Their minimized sources live in `tests/regressions/fixed/`.
+`tests/regressions/open/` currently contains the minimized missing-position
+P1. The Rust compiler/runtime suites have 22 diagnostic-contract failures:
 two compiler tests and twenty runtime tests expect `semantic error at
 line:column`, while the portable checker currently emits only the semantic
 message. Functional core, parser, IR, native-runtime, raw-memory, crypto, and

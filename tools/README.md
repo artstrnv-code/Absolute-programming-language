@@ -15,6 +15,9 @@
 - `verify_package.ps1` validates the portable tree and exercises its packaged
   CLI. Add `-NativeSmoke` to compile and run a standalone EXE through the
   packaged offline native runtime.
+- `verify_repository.ps1` rejects tracked build products, source-tree backup
+  files, broken local documentation links, missing library dependencies, and
+  unregistered open regression cases.
 - `clean_workspace.ps1` removes only ignored, reproducible `build/`, `target/`,
   and the temporary PowerShell GUI source.
 - `legacy/` contains the old PowerShell GUI, batch wrappers, and one-off

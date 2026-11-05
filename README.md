@@ -57,6 +57,12 @@ powershell -ExecutionPolicy Bypass -File .\tools\build_release.ps1
 The complete installer recipe and requirements are documented in
 [docs/installation.md](docs/installation.md).
 
+Validate repository hygiene and local documentation links:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\tools\verify_repository.ps1
+```
+
 Studio uses `F5` to run through the portable path, `F6` to start debugging,
 `F7` to save a native Windows executable, `F8` to continue, and `F9` to toggle
 a breakpoint on the current line. See [docs/studio.md](docs/studio.md).
