@@ -64,8 +64,9 @@ compiler/runtime suites nevertheless have 22 diagnostic-contract failures:
 two compiler tests and twenty runtime tests expect `semantic error at
 line:column`, while the portable checker currently emits only the semantic
 message. Functional core, parser, IR, native-runtime, raw-memory, crypto, and
-Windows unit suites remain green. This is one shared stabilization item, not
-22 language-semantics failures.
+Windows unit suites remain green. The shared symptom is minimized in
+`tests/regressions/open/p1_missing_semantic_position.apl`; this is one
+stabilization item, not 22 language-semantics failures.
 
 Implemented control-flow additions are non-fallthrough `match`, `while limit`
 and initial-condition `while else`, plus non-catchable

@@ -127,8 +127,9 @@ expect `semantic error at line:column`, while the portable checker currently
 reports only the semantic message. The failures cover `exclude` and other
 checker diagnostics but share the same missing-position symptom. Functional
 core, parser, IR, native-runtime, raw-memory, crypto, and Windows unit suites
-remain green. No minimized source program is present under
-`tests/regressions/open/` yet.
+remain green. The minimized source
+`tests/regressions/open/p1_missing_semantic_position.apl` reproduces the shared
+symptom.
 
 Several corpus outcomes still require an explicit language decision:
 short-circuit evaluation, out-of-range `set`, empty-string splitting, and
