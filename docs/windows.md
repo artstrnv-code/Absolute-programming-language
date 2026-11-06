@@ -128,6 +128,9 @@ fixed match table is not the final arbitrary-signature FFI.
   `HACCEL` or message-packing details.
 - `windows::show_window(window)` shows and updates a live window.
 - `windows::destroy_window(window)` destroys it and invalidates the identity.
+  Destroying a parent also immediately revokes every child-control identity
+  destroyed by Win32, so a stale control ID cannot be used between destruction
+  and the next message-pump step.
 - `windows::run_message_loop()` blocks on `GetMessageW`, translates and
   dispatches messages, and returns the `WM_QUIT` exit code.
 - `windows::pump_messages()` performs a nonblocking `PeekMessageW` pass and

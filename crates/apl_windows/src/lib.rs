@@ -235,27 +235,10 @@ impl WindowsHost {
     }
 
     pub fn destroy_window(&mut self, window: i64) -> Result<bool, String> {
-        let (handle, menu, icon, accelerators) = self
-            .windows
-            .get(&window)
-            .map(|record| (record.handle, record.menu, record.icon, record.accelerators))
-            .ok_or_else(|| format!("unknown Windows window identity `{window}`"))?;
+        let handle = self.window_handle(window)?;
         platform::destroy_window(handle)?;
         self.capture_events();
-        self.windows.remove(&window);
-        if let Some(menu) = menu {
-            for identity in self.menu_subtree(menu) {
-                self.menus.remove(&identity);
-            }
-        }
-        if let Some(icon) = icon.and_then(|icon| self.icons.get_mut(&icon)) {
-            icon.windows.remove(&window);
-        }
-        if let Some(accelerators) =
-            accelerators.and_then(|accelerators| self.accelerators.get_mut(&accelerators))
-        {
-            accelerators.windows.remove(&window);
-        }
+        self.remove_closed_windows();
         Ok(true)
     }
 
@@ -604,6 +587,7 @@ impl WindowsHost {
 
     pub fn next_event(&mut self) -> Option<WindowEvent> {
         self.capture_events();
+        self.remove_closed_windows();
         self.events.pop_front()
     }
 
@@ -3129,6 +3113,39 @@ mod tests {
                 && event.control_id == 101
                 && event.lparam == 0
         }));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn destroying_a_parent_revokes_its_child_identities() {
+        let mut host = WindowsHost::default();
+        let window = host
+            .create_window("APL parent lifecycle test", 320, 200)
+            .unwrap();
+        let control = host
+            .create_control(
+                window,
+                "STATIC",
+                "child",
+                101,
+                0,
+                0,
+                120,
+                28,
+                0x5000_0000,
+                0,
+            )
+            .unwrap();
+
+        assert!(host.destroy_window(window).unwrap());
+        assert_eq!(
+            host.window_handle(window).unwrap_err(),
+            format!("unknown Windows window identity `{window}`")
+        );
+        assert_eq!(
+            host.window_handle(control).unwrap_err(),
+            format!("unknown Windows window identity `{control}`")
+        );
     }
 
     #[test]

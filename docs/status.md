@@ -1,6 +1,6 @@
 # Implementation Status
 
-Updated: 2026-11-05.
+Updated: 2026-11-06.
 
 ## Implemented
 
@@ -72,6 +72,8 @@ Updated: 2026-11-05.
   `ControlConfig`. Static, button, edit, and RichEdit classes can be created;
   text and geometry can be updated, and `WM_COMMAND`/`WM_NOTIFY` events resolve
   their originating control to a stable identity instead of exposing `HWND`.
+  Destroying a parent immediately revokes the identities of every child that
+  Win32 destroys with it.
 - Edit/RichEdit controls expose safe selection ranges, selection replacement,
   and line counts in portable and native execution. UTF-16 buffers and
   `SendMessageW` pointers remain inside the Windows host boundary.
