@@ -103,6 +103,11 @@ pub struct NativeBuildOutput {
     pub target: String,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct WindowsResourceConfig {
+    icon_path: Option<PathBuf>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkedRunStatus {
     Ok,
@@ -985,6 +990,9 @@ fn build_native_package(
     let generated_source_path = src_dir.join("main.rs");
     let assembly_path = package_dir.join("program.s");
     let runtime_root = native_runtime_root(identity_path)?;
+    if target == WINDOWS_X64_TARGET {
+        stage_windows_resources(identity_path, &package_dir)?;
+    }
     let package_name = format!(
         "{}_native",
         compiled_package_name(identity_path.file_stem().and_then(|name| name.to_str()))
@@ -997,6 +1005,12 @@ fn build_native_package(
     write_native_cargo_config(&package_dir, &runtime_root)?;
     fs::write(&assembly_path, assembly)?;
     fs::write(&generated_source_path, render_native_main())?;
+    if target == WINDOWS_X64_TARGET {
+        fs::write(
+            package_dir.join("build.rs"),
+            render_windows_resource_build_script(),
+        )?;
+    }
 
     Ok(NativeBuildOutput {
         package_dir,
@@ -1006,6 +1020,271 @@ fn build_native_package(
         source_path: generated_source_path,
         target: target.to_owned(),
     })
+}
+
+fn stage_windows_resources(
+    source_path: &Path,
+    package_dir: &Path,
+) -> Result<WindowsResourceConfig, CompileError> {
+    let config = read_windows_resource_config(source_path)?;
+    let resource_dir = package_dir.join("resources");
+    fs::create_dir_all(&resource_dir)?;
+    let staged = if let Some(icon_path) = config.icon_path.as_ref() {
+        let staged_icon = resource_dir.join("app.ico");
+        fs::copy(icon_path, &staged_icon)?;
+        WindowsResourceConfig {
+            icon_path: Some(staged_icon),
+        }
+    } else {
+        config
+    };
+    fs::write(
+        resource_dir.join("app.res"),
+        build_windows_resource_file(&staged).map_err(CompileError::Bootstrap)?,
+    )?;
+    Ok(staged)
+}
+
+fn render_windows_resource_build_script() -> &'static str {
+    r#"use std::{env, path::PathBuf};
+
+fn main() {
+    let resource = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap())
+        .join("resources")
+        .join("app.res");
+    println!("cargo:rerun-if-changed={}", resource.display());
+    println!("cargo:rustc-link-arg={}", resource.display());
+}
+"#
+}
+
+fn read_windows_resource_config(source_path: &Path) -> Result<WindowsResourceConfig, CompileError> {
+    let config_path = source_path.with_extension("build.toml");
+    let source = match fs::read_to_string(&config_path) {
+        Ok(source) => source,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(WindowsResourceConfig::default())
+        }
+        Err(error) => return Err(CompileError::Io(error)),
+    };
+    let config = source.parse::<toml::Table>().map_err(|error| {
+        CompileError::Bootstrap(format!(
+            "invalid native build config `{}`: {error}",
+            config_path.display()
+        ))
+    })?;
+    if config.get("format").and_then(toml::Value::as_integer) != Some(1) {
+        return Err(CompileError::Bootstrap(format!(
+            "native build config `{}` must declare `format = 1`",
+            config_path.display()
+        )));
+    }
+    let Some(windows) = config.get("windows") else {
+        return Ok(WindowsResourceConfig::default());
+    };
+    let windows = windows.as_table().ok_or_else(|| {
+        CompileError::Bootstrap(format!(
+            "native build config `{}` must declare `[windows]` as a table",
+            config_path.display()
+        ))
+    })?;
+    let Some(icon) = windows.get("icon") else {
+        return Ok(WindowsResourceConfig::default());
+    };
+    let icon = icon
+        .as_str()
+        .filter(|icon| !icon.is_empty())
+        .ok_or_else(|| {
+            CompileError::Bootstrap(format!(
+                "native build config `{}` requires a nonempty Windows icon path",
+                config_path.display()
+            ))
+        })?;
+    let icon_path = PathBuf::from(icon);
+    let icon_path = if icon_path.is_absolute() {
+        icon_path
+    } else {
+        source_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(icon_path)
+    };
+    if !icon_path.is_file() {
+        return Err(CompileError::Bootstrap(format!(
+            "Windows icon was not found at `{}`",
+            icon_path.display()
+        )));
+    }
+    Ok(WindowsResourceConfig {
+        icon_path: Some(icon_path),
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IconResources {
+    images: Vec<(u16, Vec<u8>)>,
+    group: Vec<u8>,
+}
+
+const WINDOWS_BUILD_METADATA: &[u8] = br#"{"producer":"APL","message":"Made with APL","format":1}"#;
+
+fn build_windows_resource_file(config: &WindowsResourceConfig) -> Result<Vec<u8>, String> {
+    let mut resources = Vec::new();
+    write_windows_resource(
+        &mut resources,
+        ResourceIdentifier::Numeric(0),
+        ResourceIdentifier::Numeric(0),
+        &[],
+    )?;
+    write_windows_resource(
+        &mut resources,
+        ResourceIdentifier::Numeric(10),
+        ResourceIdentifier::Text("APL_BUILD_METADATA"),
+        WINDOWS_BUILD_METADATA,
+    )?;
+    if let Some(icon_path) = &config.icon_path {
+        let icon = fs::read(icon_path).map_err(|error| {
+            format!(
+                "could not read Windows icon `{}`: {error}",
+                icon_path.display()
+            )
+        })?;
+        let icon = parse_icon_resources(&icon)?;
+        for (resource_id, image) in icon.images {
+            write_windows_resource(
+                &mut resources,
+                ResourceIdentifier::Numeric(3),
+                ResourceIdentifier::Numeric(resource_id),
+                &image,
+            )?;
+        }
+        write_windows_resource(
+            &mut resources,
+            ResourceIdentifier::Numeric(14),
+            ResourceIdentifier::Numeric(1),
+            &icon.group,
+        )?;
+    }
+    Ok(resources)
+}
+
+#[derive(Clone, Copy)]
+enum ResourceIdentifier<'a> {
+    Numeric(u16),
+    Text(&'a str),
+}
+
+fn write_windows_resource(
+    output: &mut Vec<u8>,
+    resource_type: ResourceIdentifier<'_>,
+    name: ResourceIdentifier<'_>,
+    data: &[u8],
+) -> Result<(), String> {
+    let data_size = u32::try_from(data.len()).map_err(|_| "PE resource is too large".to_owned())?;
+    let mut header = Vec::new();
+    write_resource_identifier(&mut header, resource_type)?;
+    write_resource_identifier(&mut header, name)?;
+    pad_to_dword(&mut header);
+    header.extend_from_slice(&0_u32.to_le_bytes());
+    header.extend_from_slice(&0_u16.to_le_bytes());
+    header.extend_from_slice(&0_u16.to_le_bytes());
+    header.extend_from_slice(&0_u32.to_le_bytes());
+    header.extend_from_slice(&0_u32.to_le_bytes());
+    let header_size = u32::try_from(8 + header.len())
+        .map_err(|_| "PE resource header is too large".to_owned())?;
+
+    output.extend_from_slice(&data_size.to_le_bytes());
+    output.extend_from_slice(&header_size.to_le_bytes());
+    output.extend_from_slice(&header);
+    output.extend_from_slice(data);
+    pad_to_dword(output);
+    Ok(())
+}
+
+fn write_resource_identifier(
+    output: &mut Vec<u8>,
+    identifier: ResourceIdentifier<'_>,
+) -> Result<(), String> {
+    match identifier {
+        ResourceIdentifier::Numeric(value) => {
+            output.extend_from_slice(&0xffff_u16.to_le_bytes());
+            output.extend_from_slice(&value.to_le_bytes());
+        }
+        ResourceIdentifier::Text(value) => {
+            if value.contains('\0') {
+                return Err("PE resource name must not contain NUL".to_owned());
+            }
+            for unit in value.encode_utf16().chain(Some(0)) {
+                output.extend_from_slice(&unit.to_le_bytes());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn pad_to_dword(output: &mut Vec<u8>) {
+    while output.len() % 4 != 0 {
+        output.push(0);
+    }
+}
+
+fn parse_icon_resources(bytes: &[u8]) -> Result<IconResources, String> {
+    if bytes.len() < 6 || read_u16(bytes, 0)? != 0 || read_u16(bytes, 2)? != 1 {
+        return Err("Windows icon must start with a valid ICO header".to_owned());
+    }
+    let count = usize::from(read_u16(bytes, 4)?);
+    if count == 0 {
+        return Err("Windows icon must contain at least one image".to_owned());
+    }
+    let directory_end = 6_usize
+        .checked_add(
+            count
+                .checked_mul(16)
+                .ok_or_else(|| "ICO directory is too large".to_owned())?,
+        )
+        .ok_or_else(|| "ICO directory is too large".to_owned())?;
+    if directory_end > bytes.len() {
+        return Err("Windows icon has a truncated image directory".to_owned());
+    }
+
+    let mut group = bytes[..6].to_vec();
+    let mut images = Vec::with_capacity(count);
+    for index in 0..count {
+        let entry = 6 + index * 16;
+        let image_size = usize::try_from(read_u32(bytes, entry + 8)?)
+            .map_err(|_| "ICO image size does not fit this host".to_owned())?;
+        let image_offset = usize::try_from(read_u32(bytes, entry + 12)?)
+            .map_err(|_| "ICO image offset does not fit this host".to_owned())?;
+        if image_size == 0 {
+            return Err(format!("Windows icon image {} is empty", index + 1));
+        }
+        let image_end = image_offset
+            .checked_add(image_size)
+            .ok_or_else(|| format!("Windows icon image {} range overflows", index + 1))?;
+        let image = bytes
+            .get(image_offset..image_end)
+            .ok_or_else(|| format!("Windows icon image {} extends beyond the file", index + 1))?;
+        let resource_id = u16::try_from(index + 1)
+            .map_err(|_| "Windows icon contains too many images".to_owned())?;
+        group.extend_from_slice(&bytes[entry..entry + 12]);
+        group.extend_from_slice(&resource_id.to_le_bytes());
+        images.push((resource_id, image.to_vec()));
+    }
+    Ok(IconResources { images, group })
+}
+
+fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, String> {
+    let value = bytes
+        .get(offset..offset + 2)
+        .ok_or_else(|| "Windows icon is truncated".to_owned())?;
+    Ok(u16::from_le_bytes([value[0], value[1]]))
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, String> {
+    let value = bytes
+        .get(offset..offset + 4)
+        .ok_or_else(|| "Windows icon is truncated".to_owned())?;
+    Ok(u32::from_le_bytes([value[0], value[1], value[2], value[3]]))
 }
 
 pub fn build_executable_package(
@@ -2022,6 +2301,78 @@ fn sanitize_package_name(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn minimal_icon() -> Vec<u8> {
+        let mut bytes = vec![
+            0, 0, 1, 0, 1, 0, 1, 1, 0, 0, 1, 0, 32, 0, 48, 0, 0, 0, 22, 0, 0, 0,
+        ];
+        bytes.extend_from_slice(&40_u32.to_le_bytes());
+        bytes.extend_from_slice(&1_i32.to_le_bytes());
+        bytes.extend_from_slice(&2_i32.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&32_u16.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&4_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_i32.to_le_bytes());
+        bytes.extend_from_slice(&0_i32.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&[0x00, 0x80, 0xff, 0xff, 0, 0, 0, 0]);
+        bytes
+    }
+
+    #[test]
+    fn ico_images_are_lowered_to_pe_icon_resources() {
+        let icon = parse_icon_resources(&minimal_icon()).unwrap();
+        assert_eq!(icon.images.len(), 1);
+        assert_eq!(icon.images[0].0, 1);
+        assert_eq!(icon.images[0].1.len(), 48);
+        assert_eq!(icon.group.len(), 20);
+        assert_eq!(&icon.group[..6], &[0, 0, 1, 0, 1, 0]);
+        assert_eq!(&icon.group[18..], &1_u16.to_le_bytes());
+
+        let mut truncated = minimal_icon();
+        truncated.truncate(30);
+        assert_eq!(
+            parse_icon_resources(&truncated).unwrap_err(),
+            "Windows icon image 1 extends beyond the file"
+        );
+    }
+
+    #[test]
+    fn native_build_config_stages_a_relative_windows_icon() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "apl_windows_resources_{}_{}",
+            std::process::id(),
+            unique
+        ));
+        let source = directory.join("editor.apl");
+        let icon = directory.join("assets").join("editor.ico");
+        let package = directory.join("package");
+        fs::create_dir_all(icon.parent().unwrap()).unwrap();
+        fs::write(&source, "AVInt std::main() { return 0 }").unwrap();
+        fs::write(&icon, minimal_icon()).unwrap();
+        fs::write(
+            source.with_extension("build.toml"),
+            "format = 1\n\n[windows]\nicon = \"assets/editor.ico\"\n",
+        )
+        .unwrap();
+
+        let config = stage_windows_resources(&source, &package).unwrap();
+        let staged = config.icon_path.unwrap();
+        assert_eq!(staged, package.join("resources").join("app.ico"));
+        assert_eq!(fs::read(staged).unwrap(), minimal_icon());
+        let resource = fs::read(package.join("resources").join("app.res")).unwrap();
+        assert!(resource.len() > WINDOWS_BUILD_METADATA.len());
+        assert!(resource
+            .windows(WINDOWS_BUILD_METADATA.len())
+            .any(|window| window == WINDOWS_BUILD_METADATA));
+        let _ = fs::remove_dir_all(directory);
+    }
 
     #[cfg(windows)]
     unsafe extern "system" fn raw_memory_test_add(left: i64, right: i64) -> i64 {

@@ -189,7 +189,7 @@ func verifier.builtin_arity(name) {
   if name == "windows_set_window_icon" {
     return 2
   }
-  if name == "windows_load_icon" {
+  if (name == "windows_load_icon") or (name == "windows_load_resource_icon") {
     return 3
   }
   if name == "windows_set_deferred_close" {

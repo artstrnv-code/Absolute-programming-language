@@ -105,6 +105,19 @@ Generated native packages contain a local Cargo source configuration. Build
 one manually from inside its directory so Cargo discovers that configuration;
 Studio and `compile-native` set this working directory automatically.
 
+A source-specific Windows icon can be declared beside `program.apl` in
+`program.build.toml`:
+
+```toml
+format = 1
+
+[windows]
+icon = "assets/program.ico"
+```
+
+The native package embeds the icon during the final link. The path is resolved
+relative to the source file, and an absent or invalid icon fails the build.
+
 Removing the final Cargo requirement depends on native object emission and a
 platform linker; it is a compiler milestone, not an installer workaround.
 

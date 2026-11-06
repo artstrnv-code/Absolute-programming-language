@@ -31,9 +31,10 @@ counter and tainting effects performed under it.
    RichEdit text/search, foreground/background/bold formatting with preserved
    undo, fonts, notification masks, scrolling, and focus. Menus, external
    icons, accelerators, configured file dialogs, synchronous/asynchronous
-   process capture and cancellation, and an overridable `WindowApplication`
-   loop are also implemented. Low-level callback registration and embedded PE
-   resources remain.
+    process capture and cancellation, and an overridable `WindowApplication`
+    loop are also implemented. Native PE metadata and configurable application
+    icons are linked into generated executables. Low-level callback registration
+    remains.
 5. After the Windows acceptance layer, remove the Rust bridge from the
    APL-written compiler path, then implement the Linux system backend.
 

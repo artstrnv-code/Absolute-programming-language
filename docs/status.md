@@ -119,8 +119,9 @@ Updated: 2026-11-06.
   capture and cancellation, configured native open/save file dialogs, stable
   owned native menus, owned
   external icons, owned accelerator tables, blocking decoded event retrieval,
-  and an overridable `WindowApplication` loop. Low-level callback registration,
-  and embedded PE resources remain. Its current FFI supports integer/pointer
+  an overridable `WindowApplication` loop, and linked PE build metadata with an
+  optional application icon. Low-level callback registration remains. Its
+  current FFI supports integer/pointer
   signatures only and uses a fixed sixteen-argument bootstrap dispatcher.
 
 ## Open Regressions

@@ -1479,6 +1479,7 @@ impl Checker {
             | "windows_destroy_menu"
             | "windows_wait_event"
             | "windows_load_icon"
+            | "windows_load_resource_icon"
             | "windows_set_window_icon"
             | "windows_destroy_icon"
             | "windows_set_deferred_close"
@@ -1544,7 +1545,7 @@ impl Checker {
                     | "windows_append_submenu"
                     | "windows_set_menu_item_enabled"
                     | "windows_set_menu_item_checked" => 3,
-                    "windows_load_icon" => 3,
+                    "windows_load_icon" | "windows_load_resource_icon" => 3,
                     "windows_get_procedure"
                     | "windows_set_text_color"
                     | "windows_set_background_color"
@@ -2468,6 +2469,7 @@ const STANDARD_EXPORTS: &[&str] = &[
     "windows_poll_process",
     "windows_wait_process",
     "windows_terminate_process",
+    "windows_load_resource_icon",
 ];
 
 fn is_base_export(name: &str) -> bool {

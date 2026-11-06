@@ -12,8 +12,9 @@ The DLL/typed Win64 call foundation, default window creation, pointer-free
 message dispatch, editable window/control configurations, editor-grade
 RichEdit support, menus, icons, accelerators, dialogs, synchronous processes,
 asynchronous process streaming/cancellation, and the overridable
-`WindowApplication` loop are implemented. Remaining Windows work is low-level
-callback registration and embedded PE resources.
+`WindowApplication` loop are implemented. Native builds also link APL metadata
+and an optional application icon. Remaining Windows work is low-level callback
+registration.
 
 Current priorities:
 
@@ -116,6 +117,9 @@ and initial-condition `while else`, plus non-catchable
   `WindowApplication` class routes blocking decoded events through overridable
   handlers, and application-defined subclasses retain polymorphism across the
   `.aplmod` boundary.
+- A sibling `<source>.build.toml` can declare a Windows `.ico`. Native packages
+  link it as group icon resource 1 together with `APL_BUILD_METADATA`; the
+  runtime exposes it through `windows::load_resource_icon`.
 - Windows owns asynchronous child-process identities as well. Polling exposes
   accumulated stdout/stderr without blocking; wait and terminate consume the
   identity and return the same `ProcessResult` shape as synchronous execution.

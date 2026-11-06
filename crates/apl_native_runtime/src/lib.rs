@@ -1358,6 +1358,23 @@ pub unsafe extern "C" fn apl_rt_builtin_windows_load_icon(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn apl_rt_builtin_windows_load_resource_icon(
+    context: *mut NativeContext,
+    _targets: *const *const AbiRecord,
+) -> i32 {
+    builtin(context, 3, |context, args| {
+        Ok(Value::new(
+            Data::Int(context.windows.load_resource_icon(
+                native_int(&args[0], "windows::load_resource_icon resource")?,
+                native_int(&args[1], "windows::load_resource_icon width")?,
+                native_int(&args[2], "windows::load_resource_icon height")?,
+            )?),
+            Protection::Av,
+        ))
+    })
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn apl_rt_builtin_windows_create_accelerators(
     context: *mut NativeContext,
     _targets: *const *const AbiRecord,

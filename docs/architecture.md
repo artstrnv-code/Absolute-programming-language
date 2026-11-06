@@ -60,8 +60,9 @@ remain authoritative while release packages can ship a shared standard set.
 
 Studio F5 uses the same linked portable compiler and VM path as normal source
 execution. F7 invokes native lowering, builds the generated release package,
-copies the chosen `.exe`, and adds `APL_BUILD_METADATA` as PE `RCDATA` plus a
-plain `Made with APL` marker.
+and copies the chosen `.exe`. The generated package links `APL_BUILD_METADATA`
+as PE `RCDATA` and, when declared by the sibling source build manifest, embeds
+the application icon before Studio copies the final executable.
 
 Debug parsing produces structural statement paths and source coordinates.
 `apl_runtime` carries those coordinates beside compiled statement opcodes and

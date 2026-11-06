@@ -942,7 +942,7 @@ func vm.is_builtin_call(name) {
   if (((name == "windows_set_menu") or (name == "windows_set_menu_item_enabled")) or (name == "windows_set_menu_item_checked")) or (name == "windows_destroy_menu") {
     return true
   }
-  if (((name == "windows_wait_event") or (name == "windows_load_icon")) or (name == "windows_set_window_icon")) or (name == "windows_destroy_icon") {
+  if ((((name == "windows_wait_event") or (name == "windows_load_icon")) or (name == "windows_load_resource_icon")) or (name == "windows_set_window_icon")) or (name == "windows_destroy_icon") {
     return true
   }
   if name == "windows_set_deferred_close" {
@@ -1357,6 +1357,9 @@ func vm.call_builtin(name, arg_exprs, env, output, functions) {
   }
   if name == "windows_load_icon" {
     return vm.expr_ok(std::windows_load_icon(get(args, 0), get(args, 1), get(args, 2)), env, output, "AV")
+  }
+  if name == "windows_load_resource_icon" {
+    return vm.expr_ok(std::windows_load_resource_icon(get(args, 0), get(args, 1), get(args, 2)), env, output, "AV")
   }
   if name == "windows_set_window_icon" {
     return vm.expr_ok(std::windows_set_window_icon(get(args, 0), get(args, 1)), env, output, "AV")

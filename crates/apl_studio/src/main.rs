@@ -11,7 +11,6 @@ mod windows_app {
         collections::HashSet,
         ffi::{c_int, c_void, OsStr},
         fs,
-        io::Write,
         mem::{size_of, zeroed},
         os::windows::ffi::OsStrExt,
         os::windows::process::CommandExt,
@@ -177,18 +176,8 @@ mod windows_app {
 
     #[link(name = "kernel32")]
     extern "system" {
-        fn BeginUpdateResourceW(file_name: *const u16, delete_existing: Bool) -> *mut c_void;
-        fn EndUpdateResourceW(update: *mut c_void, discard: Bool) -> Bool;
         fn GetModuleHandleW(module_name: *const u16) -> Hinstance;
         fn LoadLibraryW(file_name: *const u16) -> Hinstance;
-        fn UpdateResourceW(
-            update: *mut c_void,
-            resource_type: *const u16,
-            name: *const u16,
-            language: u16,
-            data: *mut c_void,
-            size: Dword,
-        ) -> Bool;
     }
 
     #[link(name = "user32")]
@@ -2338,14 +2327,6 @@ mod windows_app {
                     destination.display()
                 )
             })?;
-            brand_executable(destination)?;
-            let mut executable = fs::OpenOptions::new()
-                .append(true)
-                .open(destination)
-                .map_err(|error| error.to_string())?;
-            executable
-                .write_all(b"\0APLBUILD1:Made with APL\0")
-                .map_err(|error| error.to_string())?;
             Ok(format!(
                 "Native executable built successfully.\r\n{}\r\n\r\nMade with APL",
                 destination.display()
@@ -2363,35 +2344,6 @@ mod windows_app {
                 diagnostic: None,
             },
         }
-    }
-
-    fn brand_executable(path: &Path) -> Result<(), String> {
-        let path = wide(&path.to_string_lossy());
-        let name = wide("APL_BUILD_METADATA");
-        let mut metadata =
-            br#"{"producer":"APL Studio","message":"Made with APL","format":1}"#.to_vec();
-        unsafe {
-            let update = BeginUpdateResourceW(path.as_ptr(), 0);
-            if update.is_null() {
-                return Err("Could not open the executable for PE branding".to_owned());
-            }
-            let updated = UpdateResourceW(
-                update,
-                10usize as *const u16,
-                name.as_ptr(),
-                0,
-                metadata.as_mut_ptr().cast(),
-                metadata.len() as Dword,
-            );
-            if updated == 0 {
-                EndUpdateResourceW(update, 1);
-                return Err("Could not write the APL_BUILD_METADATA PE resource".to_owned());
-            }
-            if EndUpdateResourceW(update, 0) == 0 {
-                return Err("Could not commit the APL_BUILD_METADATA PE resource".to_owned());
-            }
-        }
-        Ok(())
     }
 
     fn source_diagnostic(source: &str) -> Option<(usize, usize)> {

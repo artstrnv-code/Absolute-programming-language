@@ -83,6 +83,25 @@ fn apl() -> Command {
     command
 }
 
+fn minimal_icon() -> Vec<u8> {
+    let mut bytes = vec![
+        0, 0, 1, 0, 1, 0, 1, 1, 0, 0, 1, 0, 32, 0, 48, 0, 0, 0, 22, 0, 0, 0,
+    ];
+    bytes.extend_from_slice(&40_u32.to_le_bytes());
+    bytes.extend_from_slice(&1_i32.to_le_bytes());
+    bytes.extend_from_slice(&2_i32.to_le_bytes());
+    bytes.extend_from_slice(&1_u16.to_le_bytes());
+    bytes.extend_from_slice(&32_u16.to_le_bytes());
+    bytes.extend_from_slice(&0_u32.to_le_bytes());
+    bytes.extend_from_slice(&4_u32.to_le_bytes());
+    bytes.extend_from_slice(&0_i32.to_le_bytes());
+    bytes.extend_from_slice(&0_i32.to_le_bytes());
+    bytes.extend_from_slice(&0_u32.to_le_bytes());
+    bytes.extend_from_slice(&0_u32.to_le_bytes());
+    bytes.extend_from_slice(&[0x00, 0x80, 0xff, 0xff, 0, 0, 0, 0]);
+    bytes
+}
+
 const WINDOWS_PROGRAM: &str = r#"include >> classes
 include >> windows
 
@@ -318,6 +337,78 @@ fn windows_library_runs_through_portable_and_native_paths() {
         String::from_utf8_lossy(&native.stderr)
     );
     assert_eq!(String::from_utf8(native.stdout).unwrap(), expected);
+}
+
+#[test]
+#[cfg(windows)]
+fn native_executable_embeds_and_loads_its_configured_icon() {
+    let project = TestProject::new();
+    project.build_module();
+    let source = project.write_program(
+        "resource_icon.apl",
+        r#"include >> windows
+AVInt std::main() {
+  VTime icon = windows::load_resource_icon(1, 16, 16)
+  WindowConfig config = WindowConfig()
+  config.title = "APL resource icon"
+  config.width = 320
+  config.height = 200
+  config.icon = icon
+  VTime window = config.create()
+  AVBool created = window > 0
+  windows::destroy_window(window)
+  AVBool released = windows::destroy_icon(icon)
+  out created and released
+  return 0
+}
+"#,
+    );
+    fs::write(project.path("resource_icon.ico"), minimal_icon()).unwrap();
+    fs::write(
+        project.path("resource_icon.build.toml"),
+        "format = 1\n\n[windows]\nicon = \"resource_icon.ico\"\n",
+    )
+    .unwrap();
+
+    let package = project.path("resource_icon_package");
+    let generated = apl()
+        .current_dir(&project.root)
+        .arg("build-native")
+        .arg(&source)
+        .arg(&package)
+        .output()
+        .unwrap();
+    assert!(
+        generated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&generated.stderr)
+    );
+    let built = Command::new("cargo")
+        .env_remove("CARGO_TARGET_DIR")
+        .arg("build")
+        .arg("--offline")
+        .arg("--manifest-path")
+        .arg(package.join("Cargo.toml"))
+        .current_dir(&package)
+        .output()
+        .unwrap();
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+
+    let executable = package.join("target").join("debug").join(format!(
+        "resource_icon_compiled_native{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    let output = Command::new(executable).output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), "true");
 }
 
 #[test]

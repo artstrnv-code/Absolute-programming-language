@@ -2070,6 +2070,20 @@ impl<'a, 'debug> Runtime<'a, 'debug> {
                     ProtectionLevel::Av,
                 ))
             }
+            "windows_load_resource_icon" => {
+                let icon = self
+                    .windows
+                    .load_resource_icon(
+                        runtime_int(&args[0], "windows::load_resource_icon resource")?,
+                        runtime_int(&args[1], "windows::load_resource_icon width")?,
+                        runtime_int(&args[2], "windows::load_resource_icon height")?,
+                    )
+                    .map_err(RuntimeError::Message)?;
+                Ok(RuntimeValue::new(
+                    RuntimeData::Int(icon),
+                    ProtectionLevel::Av,
+                ))
+            }
             "windows_create_accelerators" => {
                 let entries = runtime_accelerator_entries(&args[0])?;
                 let accelerators = self

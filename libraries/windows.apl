@@ -494,6 +494,10 @@ func windows.load_icon(path, width, height) {
   return std::windows_load_icon(path, width, height)
 }
 
+func windows.load_resource_icon(resource, width, height) {
+  return std::windows_load_resource_icon(resource, width, height)
+}
+
 func windows.set_window_icon(window, icon) {
   return std::windows_set_window_icon(window, icon)
 }

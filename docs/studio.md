@@ -37,8 +37,9 @@ thread. Registry or Windows Shell delays therefore cannot block editor startup.
 - Named `.aplmod` libraries from the source file's `libraries/` directory are
   linked into the native code during F7 compilation. The resulting executable
   does not need the module files at runtime.
-- Built executables contain an `APL_BUILD_METADATA` PE resource and the marker
-  `Made with APL`.
+- Built executables contain an `APL_BUILD_METADATA` PE resource. A sibling
+  `<source>.build.toml` may also embed an application `.ico`; Studio copies the
+  already linked executable without modifying it after Cargo finishes.
 
 The build requires the host Rust/Cargo toolchain while native lowering remains
 a bootstrap backend. The resulting program runs as a standalone executable and

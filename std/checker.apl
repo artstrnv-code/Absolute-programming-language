@@ -4,7 +4,7 @@
 
 AVStr checker.STATUS_OK = "OK"
 AVStr checker.STATUS_FAIL = "FAIL"
-List checker.STANDARD_EXPORTS = ["pick", "add", "set", "get", "pop", "int", "float", "bool", "str", "bytes", "json", "split", "join", "len", "contains", "ord", "char", "pow", "timer_start", "timer_stop", "timer_elapsed", "now_utc", "sha1", "sha256", "sha512", "sha3_384", "windows_available", "windows_load_library", "windows_get_procedure", "windows_call", "windows_close_library", "windows_last_error", "windows_utf16", "windows_message_box", "windows_create_window", "windows_show_window", "windows_destroy_window", "windows_run_message_loop", "windows_pump_messages", "windows_next_event", "windows_create_control", "windows_set_window_text", "windows_window_text", "windows_move_window", "windows_selection", "windows_set_selection", "windows_replace_selection", "windows_line_count", "windows_set_text_color", "windows_find_text", "windows_set_background_color", "windows_set_text_bold", "windows_can_undo", "windows_undo", "windows_can_redo", "windows_clear_history", "windows_event_mask", "windows_set_event_mask", "windows_first_visible_line", "windows_scroll_lines", "windows_focus", "windows_set_text_font", "windows_run_process", "windows_open_file_dialog", "windows_save_file_dialog", "windows_create_menu", "windows_append_menu_item", "windows_append_submenu", "windows_append_menu_separator", "windows_set_menu", "windows_set_menu_item_enabled", "windows_set_menu_item_checked", "windows_destroy_menu", "windows_wait_event", "windows_load_icon", "windows_set_window_icon", "windows_destroy_icon", "windows_set_deferred_close", "windows_create_accelerators", "windows_set_accelerators", "windows_destroy_accelerators", "windows_start_process", "windows_poll_process", "windows_wait_process", "windows_terminate_process"]
+List checker.STANDARD_EXPORTS = ["pick", "add", "set", "get", "pop", "int", "float", "bool", "str", "bytes", "json", "split", "join", "len", "contains", "ord", "char", "pow", "timer_start", "timer_stop", "timer_elapsed", "now_utc", "sha1", "sha256", "sha512", "sha3_384", "windows_available", "windows_load_library", "windows_get_procedure", "windows_call", "windows_close_library", "windows_last_error", "windows_utf16", "windows_message_box", "windows_create_window", "windows_show_window", "windows_destroy_window", "windows_run_message_loop", "windows_pump_messages", "windows_next_event", "windows_create_control", "windows_set_window_text", "windows_window_text", "windows_move_window", "windows_selection", "windows_set_selection", "windows_replace_selection", "windows_line_count", "windows_set_text_color", "windows_find_text", "windows_set_background_color", "windows_set_text_bold", "windows_can_undo", "windows_undo", "windows_can_redo", "windows_clear_history", "windows_event_mask", "windows_set_event_mask", "windows_first_visible_line", "windows_scroll_lines", "windows_focus", "windows_set_text_font", "windows_run_process", "windows_open_file_dialog", "windows_save_file_dialog", "windows_create_menu", "windows_append_menu_item", "windows_append_submenu", "windows_append_menu_separator", "windows_set_menu", "windows_set_menu_item_enabled", "windows_set_menu_item_checked", "windows_destroy_menu", "windows_wait_event", "windows_load_icon", "windows_set_window_icon", "windows_destroy_icon", "windows_set_deferred_close", "windows_create_accelerators", "windows_set_accelerators", "windows_destroy_accelerators", "windows_start_process", "windows_poll_process", "windows_wait_process", "windows_terminate_process", "windows_load_resource_icon"]
 
 func checker.entry_name(entry) {
   return get(entry, 0)
@@ -902,7 +902,7 @@ func checker.builtin_arity(name) {
   if name == "windows_set_window_icon" {
     return 2
   }
-  if name == "windows_load_icon" {
+  if (name == "windows_load_icon") or (name == "windows_load_resource_icon") {
     return 3
   }
   if name == "windows_set_deferred_close" {
@@ -1279,7 +1279,7 @@ func checker.call_result_type(name, args, names) {
   if ((((name == "windows_next_event") or (name == "windows_find_text")) or (name == "windows_open_file_dialog")) or (name == "windows_save_file_dialog")) or (name == "windows_wait_event") {
     return "VTime"
   }
-  if name == "windows_load_icon" {
+  if (name == "windows_load_icon") or (name == "windows_load_resource_icon") {
     return "Int"
   }
   if name == "windows_create_accelerators" {
@@ -2582,6 +2582,16 @@ func checker.validate_builtin_argument_types(expression, names) {
       return checker.validate_public_expressions(args, names, "windows::load_icon")
     }
     return checker.fail(names, "windows::load_icon(path, width, height) requires Str, Int, and Int")
+  }
+  if name == "windows_load_resource_icon" {
+    VTime index = 0
+    while (index < 3) (-1) {
+      if checker.type_allows(checker.expr_type(get(args, index), names), "Int") != true {
+        return checker.fail(names, "windows::load_resource_icon requires Int resource, width, and height")
+      }
+      index += 1
+    }
+    return checker.validate_public_expressions(args, names, "windows::load_resource_icon")
   }
   if name == "windows_set_window_icon" {
     if (checker.type_allows(checker.expr_type(get(args, 0), names), "Int")) and (checker.type_allows(checker.expr_type(get(args, 1), names), "Int")) {

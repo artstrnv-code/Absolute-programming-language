@@ -406,6 +406,35 @@ impl WindowsHost {
         Ok(id)
     }
 
+    pub fn load_resource_icon(
+        &mut self,
+        resource: i64,
+        width: i64,
+        height: i64,
+    ) -> Result<i64, String> {
+        let resource = u16::try_from(resource)
+            .ok()
+            .filter(|resource| *resource != 0)
+            .ok_or_else(|| "icon resource id must be between 1 and 65535".to_owned())?;
+        let width =
+            i32::try_from(width).map_err(|_| "icon width must fit signed 32-bit".to_owned())?;
+        let height =
+            i32::try_from(height).map_err(|_| "icon height must fit signed 32-bit".to_owned())?;
+        if width < 0 || height < 0 {
+            return Err("icon width and height must be nonnegative".to_owned());
+        }
+        let id = self.allocate_id()?;
+        let handle = platform::load_resource_icon(resource, width, height)?;
+        self.icons.insert(
+            id,
+            Icon {
+                handle,
+                windows: BTreeSet::new(),
+            },
+        );
+        Ok(id)
+    }
+
     pub fn set_window_icon(&mut self, window: i64, icon: i64) -> Result<bool, String> {
         let (window_handle, previous) = self
             .windows
@@ -2184,6 +2213,38 @@ mod platform {
         Ok(icon as usize)
     }
 
+    pub fn load_resource_icon(resource: u16, width: i32, height: i32) -> Result<usize, String> {
+        let instance = unsafe { GetModuleHandleW(null()) };
+        if instance.is_null() {
+            return Err(format!(
+                "GetModuleHandleW failed with Windows error {}",
+                last_error()
+            ));
+        }
+        let flags = if width == 0 || height == 0 {
+            LR_DEFAULTSIZE
+        } else {
+            0
+        };
+        let icon = unsafe {
+            LoadImageW(
+                instance,
+                usize::from(resource) as *const u16,
+                IMAGE_ICON,
+                width,
+                height,
+                flags,
+            )
+        };
+        if icon.is_null() {
+            return Err(format!(
+                "LoadImageW failed for icon resource {resource} with Windows error {}",
+                last_error()
+            ));
+        }
+        Ok(icon as usize)
+    }
+
     pub fn create_accelerators(entries: &[(u8, u16, u16)]) -> Result<usize, String> {
         let entries = entries
             .iter()
@@ -3100,6 +3161,10 @@ mod platform {
     }
 
     pub fn load_icon(_path: &str, _width: i32, _height: i32) -> Result<usize, String> {
+        Err(unavailable())
+    }
+
+    pub fn load_resource_icon(_resource: u16, _width: i32, _height: i32) -> Result<usize, String> {
         Err(unavailable())
     }
 
