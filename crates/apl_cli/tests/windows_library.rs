@@ -142,6 +142,16 @@ AVInt std::main() {
     out windows::call(procedure, []) > 0
     out ":"
     out windows::close_library(library)
+    VTime callback = windows::create_callback(windows::CALLBACK_WNDPROC, 73)
+    out ":"
+    out windows::call(callback, [0, 12, 34, -5]) == 73
+    VTime callback_event = windows::next_callback(callback)
+    out ":"
+    out (std::len(callback_event) == 4) and (std::get(callback_event, 1) == 12)
+    out ":"
+    out windows::next_callback(callback) == NONE
+    out ":"
+    out windows::destroy_callback(callback)
     ProcessResult child = ProcessResult(windows::run_process("cmd.exe", ["/D", "/V:ON", "/S", "/C", "set /p value=& <nul set /p =OUT:!value!& echo ERR>&2& exit /b 7"], "hello\n", ""))
     out ":"
     out child.exit_code == 7
@@ -301,7 +311,7 @@ fn windows_library_runs_through_portable_and_native_paths() {
     let expected = if cfg!(windows) {
         std::iter::once("true")
             .chain(std::iter::once("4"))
-            .chain(std::iter::repeat("true").take(47))
+            .chain(std::iter::repeat("true").take(51))
             .collect::<Vec<_>>()
             .join(":")
     } else {
@@ -413,7 +423,7 @@ AVInt std::main() {
 
 #[test]
 #[cfg(windows)]
-fn closing_a_library_revokes_its_procedure_capabilities() {
+fn destroyed_windows_capabilities_cannot_be_called_again() {
     let project = TestProject::new();
     project.build_module();
     let source = project.write_program(
@@ -429,6 +439,30 @@ AVInt std::main() {
 "#,
     );
 
+    let output = apl()
+        .current_dir(&project.root)
+        .arg("run")
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("is unloaded"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let source = project.write_program(
+        "revoked_callback.apl",
+        r#"include >> windows
+AVInt std::main() {
+  VTime callback = windows::create_callback(windows::CALLBACK_WNDPROC, 0)
+  windows::destroy_callback(callback)
+  windows::call(callback, [0, 0, 0, 0])
+  return 0
+}
+"#,
+    );
     let output = apl()
         .current_dir(&project.root)
         .arg("run")

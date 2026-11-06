@@ -1985,6 +1985,82 @@ impl<'a, 'debug> Runtime<'a, 'debug> {
                     .map_err(RuntimeError::Message)?;
                 Ok(runtime_descriptor(descriptor))
             }
+            "windows_create_callback" => {
+                let kind = runtime_str(&args[0], "windows::create_callback kind")?;
+                let result = runtime_int(&args[1], "windows::create_callback result")?;
+                let registration = self
+                    .windows
+                    .create_callback(&kind, result)
+                    .map_err(RuntimeError::Message)?;
+                let descriptor = match self.raw_memory.register_runtime(
+                    registration.address,
+                    1,
+                    "rx",
+                    Some(AbiSignature {
+                        convention: "win64".to_owned(),
+                        argument_types: registration.argument_types,
+                        result_type: registration.result_type,
+                    }),
+                ) {
+                    Ok(descriptor) => descriptor,
+                    Err(error) => {
+                        self.windows.discard_callback(registration.identity);
+                        return Err(RuntimeError::Message(error));
+                    }
+                };
+                if let Err(error) = self
+                    .windows
+                    .attach_callback(registration.identity, descriptor.id)
+                {
+                    let _ = self.raw_memory.release_runtime(descriptor.id);
+                    self.windows.discard_callback(registration.identity);
+                    return Err(RuntimeError::Message(error));
+                }
+                Ok(runtime_descriptor(descriptor))
+            }
+            "windows_next_callback" => {
+                let id = runtime_pointer_id(&self.raw_memory, &args[0])?;
+                if self.raw_memory.state(id).map_err(RuntimeError::Message)? != RawMemoryState::Live
+                {
+                    return Err(RuntimeError::Message(format!(
+                        "Windows callback pointer `{id}` is not live"
+                    )));
+                }
+                Ok(
+                    match self
+                        .windows
+                        .next_callback(id)
+                        .map_err(RuntimeError::Message)?
+                    {
+                        Some(arguments) => RuntimeValue::list(
+                            arguments
+                                .into_iter()
+                                .map(|value| {
+                                    RuntimeValue::new(RuntimeData::Int(value), ProtectionLevel::Av)
+                                })
+                                .collect(),
+                        ),
+                        None => RuntimeValue::none(ProtectionLevel::Av),
+                    },
+                )
+            }
+            "windows_destroy_callback" => {
+                let id = runtime_pointer_id(&self.raw_memory, &args[0])?;
+                self.windows
+                    .callback_identity(id)
+                    .map_err(RuntimeError::Message)?;
+                self.raw_memory
+                    .release_runtime(id)
+                    .map_err(RuntimeError::Message)?;
+                Ok(RuntimeValue::new(
+                    RuntimeData::Bool(
+                        self.windows
+                            .destroy_callback(id)
+                            .map_err(RuntimeError::Message)?,
+                    ),
+                    ProtectionLevel::Av,
+                ))
+            }
             "windows_call" => {
                 let id = runtime_pointer_id(&self.raw_memory, &args[0])?;
                 let call_args = runtime_call_arguments(&self.raw_memory, &args[1])?;

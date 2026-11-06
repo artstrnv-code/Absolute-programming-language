@@ -25,8 +25,8 @@ Current modules:
   `ControlConfig`, including pointer-free decoded notifications, safe
   Edit/RichEdit selection, foreground/background/bold formatting with
   preserved undo history, scrolling, focus, Unicode range search, menus,
-  external icons, accelerators, file dialogs, process capture, and the
-  overridable `WindowApplication` loop.
+  external icons, accelerators, file dialogs, process capture, fixed-signature
+  queued callback endpoints, and the overridable `WindowApplication` loop.
 
 `.aplmod` files are generated artifacts. Build them with:
 

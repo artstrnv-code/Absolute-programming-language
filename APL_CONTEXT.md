@@ -13,8 +13,9 @@ message dispatch, editable window/control configurations, editor-grade
 RichEdit support, menus, icons, accelerators, dialogs, synchronous processes,
 asynchronous process streaming/cancellation, and the overridable
 `WindowApplication` loop are implemented. Native builds also link APL metadata
-and an optional application icon. Remaining Windows work is low-level callback
-registration.
+and an optional application icon. Fixed Win32 callback trampolines can safely
+queue WNDPROC, enumeration, timer, and thread invocations. Remaining Windows
+work is synchronous callback dispatch into arbitrary APL functions.
 
 Current priorities:
 
@@ -120,6 +121,11 @@ and initial-condition `while else`, plus non-catchable
 - A sibling `<source>.build.toml` can declare a Windows `.ico`. Native packages
   link it as group icon resource 1 together with `APL_BUILD_METADATA`; the
   runtime exposes it through `windows::load_resource_icon`.
+- `windows::create_callback` creates a runtime-owned, fixed-signature callback
+  capability. Invocations queue their arguments and return a configured value;
+  destroyed trampoline slots are never reused. Direct reentry into an APL
+  function remains intentionally unfinished until executable capability leases
+  can survive nested VM execution without permitting DLL-unload use-after-free.
 - Windows owns asynchronous child-process identities as well. Polling exposes
   accumulated stdout/stderr without blocking; wait and terminate consume the
   identity and return the same `ProcessResult` shape as synchronous execution.

@@ -17,7 +17,8 @@ tables translate keys in every blocking and nonblocking message-loop path.
 `WindowApplication` supplies an overridable APL event-dispatch loop, including
 subclasses declared outside the precompiled Windows module. Native builds embed
 APL build metadata and may embed an application icon. Low-level callback
-registration remains the next layer.
+endpoints are available for four fixed Win32 signatures; synchronous reentry
+into an APL function remains a later VM/runtime layer.
 
 The module metadata declares `windows -> classes`. The compiler resolves this
 dependency transitively and independently of source `include` order. Class
@@ -64,9 +65,43 @@ The current bootstrap dispatcher supports up to sixteen integer/pointer
 arguments on Windows. It follows the platform `system` convention, which on
 x86-64 places the first four integer/pointer arguments in RCX, RDX, R8, and R9
 and the remainder in stack slots with the required shadow space. Floating
-point, vector, aggregate-by-value, and callback signatures are not implemented
-yet. Sixteen arguments are enough for the immediate Win32 bootstrap, but this
-fixed match table is not the final arbitrary-signature FFI.
+point, vector, and aggregate-by-value signatures are not implemented yet.
+Sixteen arguments are enough for the immediate Win32 bootstrap, but this fixed
+match table is not the final arbitrary-signature FFI.
+
+## Foreign Callback Endpoints
+
+`windows::create_callback(kind, result)` creates a runtime-owned executable
+capability with a statically typed Win32 trampoline. Supported kinds are
+`CALLBACK_WNDPROC`, `CALLBACK_ENUM_WINDOWS`, `CALLBACK_TIMER`, and
+`CALLBACK_THREAD`. Their signatures are, respectively:
+
+```text
+(Ptr, U32, U64, I64) -> I64
+(Ptr, I64) -> I32
+(Ptr, U32, U64, U32) -> Void
+(Ptr) -> U32
+```
+
+The descriptor can be passed wherever a Win32 API expects that callback type.
+Each native invocation queues its public integer arguments and immediately
+returns the fixed `result`; timer callbacks require zero because their result is
+`Void`. `windows::next_callback(callback)` removes the oldest argument list or
+returns `NONE`. `ForeignCallback(kind, result)` wraps the same lifecycle.
+
+`windows::destroy_callback(callback)` revokes the raw-memory capability and
+retires its trampoline permanently. A DLL retaining the old address therefore
+receives zero rather than reaching freed state or a later callback. Each kind
+currently has 64 process-lifetime slots, and each live endpoint buffers at most
+4096 pending invocations before reporting overflow. Callback pointers are owned
+by the runtime and cannot be revoked through ordinary `memory::mark`.
+
+The endpoint deliberately does not reenter the APL VM. Synchronous APL-function
+callbacks require a VM entry contract that can keep the called DLL capability
+alive across nested execution; detaching the executable address would permit a
+DLL-unload use-after-free. Until that contract exists, callbacks that need an
+argument-dependent immediate result must use a dedicated high-level Windows
+wrapper instead of pretending that queued dispatch is synchronous.
 
 ## Public Helpers
 
@@ -297,7 +332,8 @@ Windows behavior.
 The default window procedure records the public event subset, delegates normal
 handling to `DefWindowProcW`, and posts
 `WM_QUIT` after the last APL window on the current thread is destroyed.
-Low-level callback registration is not implemented.
+Fixed-signature low-level callback endpoints use the bounded queue described
+above; direct synchronous dispatch into arbitrary APL functions is not implemented.
 High-level APL handlers use `WindowApplication` over the safe event queue;
 child-process streaming and cancellation use opaque owned process identities.
 

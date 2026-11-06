@@ -900,6 +900,9 @@ func vm.is_builtin_call(name) {
   if (((name == "windows_available") or (name == "windows_load_library")) or (name == "windows_get_procedure")) or (name == "windows_call") {
     return true
   }
+  if ((name == "windows_create_callback") or (name == "windows_next_callback")) or (name == "windows_destroy_callback") {
+    return true
+  }
   if (((name == "windows_close_library") or (name == "windows_last_error")) or (name == "windows_utf16")) or (name == "windows_message_box") {
     return true
   }
@@ -1237,6 +1240,15 @@ func vm.call_builtin(name, arg_exprs, env, output, functions) {
   }
   if name == "windows_get_procedure" {
     return vm.expr_ok(std::windows_get_procedure(get(args, 0), get(args, 1), get(args, 2), get(args, 3)), env, output, "AV")
+  }
+  if name == "windows_create_callback" {
+    return vm.expr_ok(std::windows_create_callback(get(args, 0), get(args, 1)), env, output, "AV")
+  }
+  if name == "windows_next_callback" {
+    return vm.expr_ok(std::windows_next_callback(get(args, 0)), env, output, "AV")
+  }
+  if name == "windows_destroy_callback" {
+    return vm.expr_ok(std::windows_destroy_callback(get(args, 0)), env, output, "AV")
   }
   if name == "windows_call" {
     return vm.expr_ok(std::windows_call(get(args, 0), get(args, 1)), env, output, "AV")

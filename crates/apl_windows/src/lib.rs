@@ -33,6 +33,63 @@ pub struct AcceleratorEntry {
     pub modifiers: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallbackRegistration {
+    pub identity: i64,
+    pub address: i64,
+    pub argument_types: Vec<String>,
+    pub result_type: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CallbackKind {
+    WindowProcedure,
+    EnumWindows,
+    Timer,
+    Thread,
+}
+
+impl CallbackKind {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "WNDPROC" => Ok(Self::WindowProcedure),
+            "ENUM_WINDOWS" => Ok(Self::EnumWindows),
+            "TIMER" => Ok(Self::Timer),
+            "THREAD" => Ok(Self::Thread),
+            _ => Err(format!("unknown Windows callback kind `{value}`")),
+        }
+    }
+
+    fn signature(self) -> (Vec<String>, String) {
+        let (arguments, result): (&[&str], &str) = match self {
+            Self::WindowProcedure => (&["Ptr", "U32", "U64", "I64"], "I64"),
+            Self::EnumWindows => (&["Ptr", "I64"], "I32"),
+            Self::Timer => (&["Ptr", "U32", "U64", "U32"], "Void"),
+            Self::Thread => (&["Ptr"], "U32"),
+        };
+        (
+            arguments.iter().map(|value| (*value).to_owned()).collect(),
+            result.to_owned(),
+        )
+    }
+
+    fn validate_result(self, result: i64) -> Result<i64, String> {
+        match self {
+            Self::WindowProcedure => Ok(result),
+            Self::EnumWindows => i32::try_from(result)
+                .map(i64::from)
+                .map_err(|_| "ENUM_WINDOWS callback result must fit I32".to_owned()),
+            Self::Timer if result == 0 => Ok(0),
+            Self::Timer => {
+                Err("TIMER callback result must be 0 because TIMER returns Void".to_owned())
+            }
+            Self::Thread => u32::try_from(result)
+                .map(i64::from)
+                .map_err(|_| "THREAD callback result must fit U32".to_owned()),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Module {
     handle: usize,
@@ -68,6 +125,12 @@ struct Accelerators {
 }
 
 #[derive(Debug)]
+struct OwnedCallback {
+    pointer_id: Option<i64>,
+    callback: platform::Callback,
+}
+
+#[derive(Debug)]
 pub struct WindowsHost {
     next_id: i64,
     modules: BTreeMap<i64, Module>,
@@ -75,6 +138,7 @@ pub struct WindowsHost {
     menus: BTreeMap<i64, Menu>,
     icons: BTreeMap<i64, Icon>,
     accelerators: BTreeMap<i64, Accelerators>,
+    callbacks: BTreeMap<i64, OwnedCallback>,
     processes: BTreeMap<i64, platform::AsyncProcess>,
     events: VecDeque<WindowEvent>,
     support_modules: Vec<usize>,
@@ -89,6 +153,7 @@ impl Default for WindowsHost {
             menus: BTreeMap::new(),
             icons: BTreeMap::new(),
             accelerators: BTreeMap::new(),
+            callbacks: BTreeMap::new(),
             processes: BTreeMap::new(),
             events: VecDeque::new(),
             support_modules: Vec::new(),
@@ -142,6 +207,77 @@ impl WindowsHost {
         platform::free_library(handle)?;
         let module = self.modules.remove(&library).expect("module was checked");
         Ok(module.procedures)
+    }
+
+    pub fn create_callback(
+        &mut self,
+        kind: &str,
+        result: i64,
+    ) -> Result<CallbackRegistration, String> {
+        let kind = CallbackKind::parse(kind)?;
+        let result = kind.validate_result(result)?;
+        let identity = self.allocate_id()?;
+        let callback = platform::Callback::new(kind, result)?;
+        let address = i64::try_from(callback.address())
+            .map_err(|_| "Windows callback address does not fit APL Int".to_owned())?;
+        let (argument_types, result_type) = kind.signature();
+        self.callbacks.insert(
+            identity,
+            OwnedCallback {
+                pointer_id: None,
+                callback,
+            },
+        );
+        Ok(CallbackRegistration {
+            identity,
+            address,
+            argument_types,
+            result_type,
+        })
+    }
+
+    pub fn attach_callback(&mut self, identity: i64, pointer_id: i64) -> Result<(), String> {
+        let callback = self
+            .callbacks
+            .get_mut(&identity)
+            .ok_or_else(|| format!("unknown Windows callback identity `{identity}`"))?;
+        if callback.pointer_id.replace(pointer_id).is_some() {
+            return Err(format!(
+                "Windows callback identity `{identity}` already has a pointer capability"
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn discard_callback(&mut self, identity: i64) {
+        self.callbacks.remove(&identity);
+    }
+
+    pub fn callback_identity(&self, pointer_id: i64) -> Result<i64, String> {
+        self.callbacks
+            .iter()
+            .find_map(|(identity, callback)| {
+                (callback.pointer_id == Some(pointer_id)).then_some(*identity)
+            })
+            .ok_or_else(|| format!("unknown Windows callback pointer `{pointer_id}`"))
+    }
+
+    pub fn next_callback(&self, pointer_id: i64) -> Result<Option<Vec<i64>>, String> {
+        self.callback_for_pointer(pointer_id)
+            .and_then(|callback| callback.callback.next())
+    }
+
+    pub fn destroy_callback(&mut self, pointer_id: i64) -> Result<bool, String> {
+        let identity = self.callback_identity(pointer_id)?;
+        self.callbacks.remove(&identity);
+        Ok(true)
+    }
+
+    fn callback_for_pointer(&self, pointer_id: i64) -> Result<&OwnedCallback, String> {
+        self.callbacks
+            .values()
+            .find(|callback| callback.pointer_id == Some(pointer_id))
+            .ok_or_else(|| format!("unknown Windows callback pointer `{pointer_id}`"))
     }
 
     pub fn create_window(&mut self, title: &str, width: i64, height: i64) -> Result<i64, String> {
@@ -1139,6 +1275,7 @@ fn validate_file_dialog_options(
 impl Drop for WindowsHost {
     fn drop(&mut self) {
         drop(std::mem::take(&mut self.processes));
+        drop(std::mem::take(&mut self.callbacks));
         for window in std::mem::take(&mut self.windows).into_values() {
             let _ = platform::destroy_window(window.handle);
         }
@@ -1204,17 +1341,302 @@ mod platform {
         os::windows::{io::AsRawHandle, process::CommandExt},
         process::{Child, Command, ExitStatus, Stdio},
         ptr::{null, null_mut},
-        sync::mpsc::{self, Receiver},
+        sync::{
+            mpsc::{self, Receiver},
+            Arc, Mutex, OnceLock,
+        },
         thread,
         thread::JoinHandle,
     };
 
-    use super::{ProcessOutput, ProcessSnapshot};
+    use super::{CallbackKind, ProcessOutput, ProcessSnapshot};
 
     type Handle = *mut core::ffi::c_void;
     type WParam = usize;
     type LParam = isize;
     type LResult = isize;
+
+    const CALLBACK_SLOTS_PER_KIND: usize = 64;
+    const CALLBACK_KIND_COUNT: usize = 4;
+    const CALLBACK_QUEUE_LIMIT: usize = 4096;
+
+    type WindowCallback = unsafe extern "system" fn(Handle, u32, WParam, LParam) -> LResult;
+    type EnumWindowsCallback = unsafe extern "system" fn(Handle, LParam) -> i32;
+    type TimerCallback = unsafe extern "system" fn(Handle, u32, usize, u32);
+    type ThreadCallback = unsafe extern "system" fn(Handle) -> u32;
+
+    #[derive(Debug)]
+    struct CallbackQueue {
+        events: VecDeque<Vec<i64>>,
+        overflowed: bool,
+    }
+
+    #[derive(Debug)]
+    struct CallbackState {
+        result: i64,
+        queue: Mutex<CallbackQueue>,
+    }
+
+    enum CallbackSlot {
+        Vacant,
+        Active(Arc<CallbackState>),
+        Retired,
+    }
+
+    static CALLBACK_REGISTRY: OnceLock<Mutex<Vec<CallbackSlot>>> = OnceLock::new();
+
+    fn callback_registry() -> &'static Mutex<Vec<CallbackSlot>> {
+        CALLBACK_REGISTRY.get_or_init(|| {
+            Mutex::new(
+                (0..CALLBACK_SLOTS_PER_KIND * CALLBACK_KIND_COUNT)
+                    .map(|_| CallbackSlot::Vacant)
+                    .collect(),
+            )
+        })
+    }
+
+    fn callback_kind_index(kind: CallbackKind) -> usize {
+        match kind {
+            CallbackKind::WindowProcedure => 0,
+            CallbackKind::EnumWindows => 1,
+            CallbackKind::Timer => 2,
+            CallbackKind::Thread => 3,
+        }
+    }
+
+    fn callback_registry_index(kind: CallbackKind, slot: usize) -> usize {
+        callback_kind_index(kind) * CALLBACK_SLOTS_PER_KIND + slot
+    }
+
+    fn callback_state(kind: CallbackKind, slot: usize) -> Option<Arc<CallbackState>> {
+        let registry = callback_registry()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match registry.get(callback_registry_index(kind, slot)) {
+            Some(CallbackSlot::Active(state)) => Some(Arc::clone(state)),
+            Some(CallbackSlot::Vacant | CallbackSlot::Retired) | None => None,
+        }
+    }
+
+    fn dispatch_callback(kind: CallbackKind, slot: usize, arguments: Vec<i64>) -> i64 {
+        let Some(state) = callback_state(kind, slot) else {
+            return 0;
+        };
+        let result = state.result;
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut queue = state
+                .queue
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if queue.events.len() == CALLBACK_QUEUE_LIMIT {
+                queue.overflowed = true;
+            } else {
+                queue.events.push_back(arguments);
+            }
+        }));
+        result
+    }
+
+    unsafe extern "system" fn window_callback<const SLOT: usize>(
+        window: Handle,
+        message: u32,
+        wparam: WParam,
+        lparam: LParam,
+    ) -> LResult {
+        dispatch_callback(
+            CallbackKind::WindowProcedure,
+            SLOT,
+            vec![
+                window as usize as i64,
+                i64::from(message),
+                wparam as i64,
+                lparam as i64,
+            ],
+        ) as LResult
+    }
+
+    unsafe extern "system" fn enum_windows_callback<const SLOT: usize>(
+        window: Handle,
+        lparam: LParam,
+    ) -> i32 {
+        dispatch_callback(
+            CallbackKind::EnumWindows,
+            SLOT,
+            vec![window as usize as i64, lparam as i64],
+        ) as i32
+    }
+
+    unsafe extern "system" fn timer_callback<const SLOT: usize>(
+        window: Handle,
+        message: u32,
+        timer: usize,
+        milliseconds: u32,
+    ) {
+        dispatch_callback(
+            CallbackKind::Timer,
+            SLOT,
+            vec![
+                window as usize as i64,
+                i64::from(message),
+                timer as i64,
+                i64::from(milliseconds),
+            ],
+        );
+    }
+
+    unsafe extern "system" fn thread_callback<const SLOT: usize>(parameter: Handle) -> u32 {
+        dispatch_callback(CallbackKind::Thread, SLOT, vec![parameter as usize as i64]) as u32
+    }
+
+    macro_rules! callback_array {
+        ($callback:ident) => {
+            [
+                $callback::<0>,
+                $callback::<1>,
+                $callback::<2>,
+                $callback::<3>,
+                $callback::<4>,
+                $callback::<5>,
+                $callback::<6>,
+                $callback::<7>,
+                $callback::<8>,
+                $callback::<9>,
+                $callback::<10>,
+                $callback::<11>,
+                $callback::<12>,
+                $callback::<13>,
+                $callback::<14>,
+                $callback::<15>,
+                $callback::<16>,
+                $callback::<17>,
+                $callback::<18>,
+                $callback::<19>,
+                $callback::<20>,
+                $callback::<21>,
+                $callback::<22>,
+                $callback::<23>,
+                $callback::<24>,
+                $callback::<25>,
+                $callback::<26>,
+                $callback::<27>,
+                $callback::<28>,
+                $callback::<29>,
+                $callback::<30>,
+                $callback::<31>,
+                $callback::<32>,
+                $callback::<33>,
+                $callback::<34>,
+                $callback::<35>,
+                $callback::<36>,
+                $callback::<37>,
+                $callback::<38>,
+                $callback::<39>,
+                $callback::<40>,
+                $callback::<41>,
+                $callback::<42>,
+                $callback::<43>,
+                $callback::<44>,
+                $callback::<45>,
+                $callback::<46>,
+                $callback::<47>,
+                $callback::<48>,
+                $callback::<49>,
+                $callback::<50>,
+                $callback::<51>,
+                $callback::<52>,
+                $callback::<53>,
+                $callback::<54>,
+                $callback::<55>,
+                $callback::<56>,
+                $callback::<57>,
+                $callback::<58>,
+                $callback::<59>,
+                $callback::<60>,
+                $callback::<61>,
+                $callback::<62>,
+                $callback::<63>,
+            ]
+        };
+    }
+
+    const WINDOW_CALLBACKS: [WindowCallback; CALLBACK_SLOTS_PER_KIND] =
+        callback_array!(window_callback);
+    const ENUM_WINDOWS_CALLBACKS: [EnumWindowsCallback; CALLBACK_SLOTS_PER_KIND] =
+        callback_array!(enum_windows_callback);
+    const TIMER_CALLBACKS: [TimerCallback; CALLBACK_SLOTS_PER_KIND] =
+        callback_array!(timer_callback);
+    const THREAD_CALLBACKS: [ThreadCallback; CALLBACK_SLOTS_PER_KIND] =
+        callback_array!(thread_callback);
+
+    fn callback_address(kind: CallbackKind, slot: usize) -> usize {
+        match kind {
+            CallbackKind::WindowProcedure => WINDOW_CALLBACKS[slot] as usize,
+            CallbackKind::EnumWindows => ENUM_WINDOWS_CALLBACKS[slot] as usize,
+            CallbackKind::Timer => TIMER_CALLBACKS[slot] as usize,
+            CallbackKind::Thread => THREAD_CALLBACKS[slot] as usize,
+        }
+    }
+
+    #[derive(Debug)]
+    pub struct Callback {
+        kind: CallbackKind,
+        slot: usize,
+        state: Arc<CallbackState>,
+    }
+
+    impl Callback {
+        pub fn new(kind: CallbackKind, result: i64) -> Result<Self, String> {
+            let mut registry = callback_registry()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let base = callback_registry_index(kind, 0);
+            let slot = (0..CALLBACK_SLOTS_PER_KIND)
+                .find(|slot| matches!(registry[base + slot], CallbackSlot::Vacant))
+                .ok_or_else(|| {
+                    format!(
+                        "Windows callback kind has exhausted its {} non-reusable slots",
+                        CALLBACK_SLOTS_PER_KIND
+                    )
+                })?;
+            let state = Arc::new(CallbackState {
+                result,
+                queue: Mutex::new(CallbackQueue {
+                    events: VecDeque::new(),
+                    overflowed: false,
+                }),
+            });
+            registry[base + slot] = CallbackSlot::Active(Arc::clone(&state));
+            Ok(Self { kind, slot, state })
+        }
+
+        pub fn address(&self) -> usize {
+            callback_address(self.kind, self.slot)
+        }
+
+        pub fn next(&self) -> Result<Option<Vec<i64>>, String> {
+            let mut queue = self
+                .state
+                .queue
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if queue.overflowed {
+                queue.overflowed = false;
+                return Err(format!(
+                    "Windows callback queue exceeded {CALLBACK_QUEUE_LIMIT} pending invocations"
+                ));
+            }
+            Ok(queue.events.pop_front())
+        }
+    }
+
+    impl Drop for Callback {
+        fn drop(&mut self) {
+            let mut registry = callback_registry()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            registry[callback_registry_index(self.kind, self.slot)] = CallbackSlot::Retired;
+        }
+    }
 
     const CLASS_NAME: &str = "APL.Runtime.Window.1";
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -3071,7 +3493,24 @@ mod platform {
 
 #[cfg(not(windows))]
 mod platform {
-    use super::{ProcessOutput, ProcessSnapshot};
+    use super::{CallbackKind, ProcessOutput, ProcessSnapshot};
+
+    #[derive(Debug)]
+    pub struct Callback;
+
+    impl Callback {
+        pub fn new(_kind: CallbackKind, _result: i64) -> Result<Self, String> {
+            Err(unavailable())
+        }
+
+        pub fn address(&self) -> usize {
+            0
+        }
+
+        pub fn next(&self) -> Result<Option<Vec<i64>>, String> {
+            Err(unavailable())
+        }
+    }
 
     #[derive(Debug)]
     pub struct AsyncProcess;
@@ -3456,6 +3895,30 @@ mod tests {
                 > 0
         );
         assert!(host.close_library(library).unwrap().is_empty());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn callback_capabilities_queue_arguments_and_retire_their_trampoline() {
+        type Callback =
+            unsafe extern "system" fn(*mut core::ffi::c_void, u32, usize, isize) -> isize;
+
+        let mut host = WindowsHost::default();
+        let registration = host.create_callback("WNDPROC", 73).unwrap();
+        host.attach_callback(registration.identity, 9001).unwrap();
+        let callback: Callback =
+            unsafe { std::mem::transmute::<usize, Callback>(registration.address as usize) };
+
+        assert_eq!(unsafe { callback(std::ptr::null_mut(), 12, 34, -5) }, 73);
+        assert_eq!(host.next_callback(9001).unwrap(), Some(vec![0, 12, 34, -5]));
+        assert_eq!(host.next_callback(9001).unwrap(), None);
+        assert!(host.destroy_callback(9001).unwrap());
+
+        let replacement = host.create_callback("WNDPROC", 99).unwrap();
+        assert_ne!(replacement.address, registration.address);
+        assert_eq!(unsafe { callback(std::ptr::null_mut(), 1, 2, 3) }, 0);
+        assert!(host.next_callback(9001).is_err());
+        host.discard_callback(replacement.identity);
     }
 
     #[test]

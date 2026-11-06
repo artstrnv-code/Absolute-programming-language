@@ -1251,6 +1251,81 @@ pub unsafe extern "C" fn apl_rt_builtin_windows_get_procedure(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn apl_rt_builtin_windows_create_callback(
+    context: *mut NativeContext,
+    _targets: *const *const AbiRecord,
+) -> i32 {
+    builtin(context, 2, |context, args| {
+        let kind = native_str(&args[0], "windows::create_callback kind")?;
+        let result = native_int(&args[1], "windows::create_callback result")?;
+        let registration = context.windows.create_callback(&kind, result)?;
+        let descriptor = match context.raw_memory.register_runtime(
+            registration.address,
+            1,
+            "rx",
+            Some(AbiSignature {
+                convention: "win64".to_owned(),
+                argument_types: registration.argument_types,
+                result_type: registration.result_type,
+            }),
+        ) {
+            Ok(descriptor) => descriptor,
+            Err(error) => {
+                context.windows.discard_callback(registration.identity);
+                return Err(error);
+            }
+        };
+        if let Err(error) = context
+            .windows
+            .attach_callback(registration.identity, descriptor.id)
+        {
+            let _ = context.raw_memory.release_runtime(descriptor.id);
+            context.windows.discard_callback(registration.identity);
+            return Err(error);
+        }
+        Ok(native_descriptor(descriptor))
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn apl_rt_builtin_windows_next_callback(
+    context: *mut NativeContext,
+    _targets: *const *const AbiRecord,
+) -> i32 {
+    builtin(context, 1, |context, args| {
+        let id = native_pointer_id(&context.raw_memory, &args[0])?;
+        if context.raw_memory.state(id)? != RawMemoryState::Live {
+            return Err(format!("Windows callback pointer `{id}` is not live"));
+        }
+        Ok(match context.windows.next_callback(id)? {
+            Some(arguments) => Value::list(
+                arguments
+                    .into_iter()
+                    .map(|value| Value::new(Data::Int(value), Protection::Av))
+                    .collect(),
+            ),
+            None => Value::none(Protection::Av),
+        })
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn apl_rt_builtin_windows_destroy_callback(
+    context: *mut NativeContext,
+    _targets: *const *const AbiRecord,
+) -> i32 {
+    builtin(context, 1, |context, args| {
+        let id = native_pointer_id(&context.raw_memory, &args[0])?;
+        context.windows.callback_identity(id)?;
+        context.raw_memory.release_runtime(id)?;
+        Ok(Value::new(
+            Data::Bool(context.windows.destroy_callback(id)?),
+            Protection::Av,
+        ))
+    })
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn apl_rt_builtin_windows_call(
     context: *mut NativeContext,
     _targets: *const *const AbiRecord,

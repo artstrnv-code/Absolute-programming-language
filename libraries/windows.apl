@@ -20,6 +20,11 @@ AVStr windows.PTR = "Ptr"
 AVStr windows.BOOL = "Bool"
 AVStr windows.VOID = "Void"
 
+AVStr windows.CALLBACK_WNDPROC = "WNDPROC"
+AVStr windows.CALLBACK_ENUM_WINDOWS = "ENUM_WINDOWS"
+AVStr windows.CALLBACK_TIMER = "TIMER"
+AVStr windows.CALLBACK_THREAD = "THREAD"
+
 AVInt windows.MB_OK = 0
 AVInt windows.MB_OKCANCEL = 1
 AVInt windows.MB_ABORTRETRYIGNORE = 2
@@ -302,6 +307,28 @@ class Accelerators {
   }
 }
 
+class ForeignCallback {
+  List identity = []
+  AVStr kind = ""
+  AVInt result = 0
+
+  func __init__(kind, result) {
+    self.kind = kind
+    self.result = result
+    self.identity = windows.create_callback(kind, result)
+  }
+
+  func next() {
+    return windows.next_callback(self.identity)
+  }
+
+  func destroy() {
+    VTime destroyed = windows.destroy_callback(self.identity)
+    self.identity = []
+    return destroyed
+  }
+}
+
 class WindowApplication {
   AVInt window = 0
   AVBool running = true
@@ -408,6 +435,18 @@ func windows.load_library(name) {
 
 func windows.get_procedure(library, name, argument_types, result_type) {
   return std::windows_get_procedure(library, name, argument_types, result_type)
+}
+
+func windows.create_callback(kind, result) {
+  return std::windows_create_callback(kind, result)
+}
+
+func windows.next_callback(callback) {
+  return std::windows_next_callback(callback)
+}
+
+func windows.destroy_callback(callback) {
+  return std::windows_destroy_callback(callback)
 }
 
 func windows.call(procedure, arguments) {

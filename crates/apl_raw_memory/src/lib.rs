@@ -145,6 +145,27 @@ impl RawMemoryTable {
         permissions: &str,
         signature: Option<AbiSignature>,
     ) -> Result<Descriptor, String> {
+        self.register(address, size, permissions, signature, Origin::Load)
+    }
+
+    pub fn register_runtime(
+        &mut self,
+        address: i64,
+        size: i64,
+        permissions: &str,
+        signature: Option<AbiSignature>,
+    ) -> Result<Descriptor, String> {
+        self.register(address, size, permissions, signature, Origin::Runtime)
+    }
+
+    fn register(
+        &mut self,
+        address: i64,
+        size: i64,
+        permissions: &str,
+        signature: Option<AbiSignature>,
+        origin: Origin,
+    ) -> Result<Descriptor, String> {
         let address = usize::try_from(address)
             .ok()
             .filter(|address| *address != 0)
@@ -178,7 +199,7 @@ impl RawMemoryTable {
                 id,
                 address,
                 size,
-                origin: Origin::Load,
+                origin,
                 state: State::Live,
                 readable,
                 writable,
@@ -188,6 +209,26 @@ impl RawMemoryTable {
             },
         );
         self.descriptor(id)
+    }
+
+    pub fn release_runtime(&mut self, id: i64) -> Result<(), String> {
+        let record = self
+            .records
+            .get_mut(&id)
+            .ok_or_else(|| format!("unknown raw-memory identity `{id}`"))?;
+        if record.origin != Origin::Runtime {
+            return Err(format!(
+                "raw-memory identity `{id}` is not owned by the runtime"
+            ));
+        }
+        if record.state != State::Live {
+            return Err(format!(
+                "raw-memory identity `{id}` is already {}",
+                record.state.name()
+            ));
+        }
+        record.state = State::Unloaded;
+        Ok(())
     }
 
     pub fn descriptor(&self, id: i64) -> Result<Descriptor, String> {
@@ -1075,6 +1116,34 @@ mod tests {
 
         table.load(4096, 16, "r", None).unwrap();
         assert!(table.resolve_number(4096).is_err());
+    }
+
+    #[test]
+    fn runtime_capabilities_can_only_be_released_by_their_owner() {
+        let mut table = RawMemoryTable::new();
+        let convention = if cfg!(windows) { "win64" } else { "sysv64" };
+        let descriptor = table
+            .register_runtime(
+                add as *const () as usize as i64,
+                1,
+                "rx",
+                Some(AbiSignature {
+                    convention: convention.to_owned(),
+                    argument_types: vec!["Int".to_owned(), "Int".to_owned()],
+                    result_type: "Int".to_owned(),
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(descriptor.origin, Origin::Runtime);
+        assert_eq!(table.call(descriptor.id, &[19, 23]), Ok(42));
+        assert_eq!(
+            table.mark(descriptor.id).unwrap_err(),
+            "runtime memory can only be marked by its owner"
+        );
+        table.release_runtime(descriptor.id).unwrap();
+        assert_eq!(table.state(descriptor.id), Ok(State::Unloaded));
+        assert!(table.call(descriptor.id, &[19, 23]).is_err());
     }
 
     #[test]

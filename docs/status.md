@@ -120,8 +120,9 @@ Updated: 2026-11-06.
   owned native menus, owned
   external icons, owned accelerator tables, blocking decoded event retrieval,
   an overridable `WindowApplication` loop, and linked PE build metadata with an
-  optional application icon. Low-level callback registration remains. Its
-  current FFI supports integer/pointer
+  optional application icon. Four statically typed Win32 callback endpoints
+  queue foreign invocations without reentering the VM; direct synchronous APL
+  function callbacks remain. Its current FFI supports integer/pointer
   signatures only and uses a fixed sixteen-argument bootstrap dispatcher.
 
 ## Open Regressions

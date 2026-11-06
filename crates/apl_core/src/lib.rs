@@ -1439,6 +1439,9 @@ impl Checker {
             "windows_available"
             | "windows_load_library"
             | "windows_get_procedure"
+            | "windows_create_callback"
+            | "windows_next_callback"
+            | "windows_destroy_callback"
             | "windows_call"
             | "windows_close_library"
             | "windows_last_error"
@@ -1526,10 +1529,12 @@ impl Checker {
                     | "windows_poll_process"
                     | "windows_wait_process"
                     | "windows_terminate_process" => 1,
+                    "windows_next_callback" | "windows_destroy_callback" => 1,
                     "windows_destroy_icon"
                     | "windows_create_accelerators"
                     | "windows_destroy_accelerators" => 1,
                     "windows_call"
+                    | "windows_create_callback"
                     | "windows_set_window_text"
                     | "windows_set_event_mask"
                     | "windows_scroll_lines"
@@ -1574,6 +1579,7 @@ impl Checker {
                     || name == "windows_open_file_dialog"
                     || name == "windows_save_file_dialog"
                     || name == "windows_wait_event"
+                    || name == "windows_next_callback"
                 {
                     return Ok(ExpressionInfo {
                         value_type: DynamicType::VTime,
@@ -1608,12 +1614,14 @@ impl Checker {
                     | "windows_set_menu_item_enabled"
                     | "windows_set_menu_item_checked"
                     | "windows_destroy_menu" => ValueType::Bool,
+                    "windows_destroy_callback" => ValueType::Bool,
                     "windows_set_window_icon"
                     | "windows_destroy_icon"
                     | "windows_set_deferred_close"
                     | "windows_set_accelerators"
                     | "windows_destroy_accelerators" => ValueType::Bool,
                     "windows_get_procedure"
+                    | "windows_create_callback"
                     | "windows_selection"
                     | "windows_run_process"
                     | "windows_poll_process"
@@ -2412,6 +2420,9 @@ const STANDARD_EXPORTS: &[&str] = &[
     "windows_available",
     "windows_load_library",
     "windows_get_procedure",
+    "windows_create_callback",
+    "windows_next_callback",
+    "windows_destroy_callback",
     "windows_call",
     "windows_close_library",
     "windows_last_error",

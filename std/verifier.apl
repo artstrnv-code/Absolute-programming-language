@@ -126,6 +126,12 @@ func verifier.builtin_arity(name) {
   if name == "windows_call" {
     return 2
   }
+  if name == "windows_create_callback" {
+    return 2
+  }
+  if (name == "windows_next_callback") or (name == "windows_destroy_callback") {
+    return 1
+  }
   if (name == "windows_message_box") or (name == "windows_create_window") {
     return 3
   }
