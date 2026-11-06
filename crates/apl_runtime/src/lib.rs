@@ -1179,6 +1179,26 @@ fn runtime_string_list(value: &RuntimeValue, label: &str) -> Result<Vec<String>,
         .collect()
 }
 
+fn runtime_process_output(output: apl_windows::ProcessOutput) -> RuntimeValue {
+    RuntimeValue::list(vec![
+        RuntimeValue::new(RuntimeData::Int(output.exit_code), ProtectionLevel::Av),
+        RuntimeValue::str(output.stdout),
+        RuntimeValue::str(output.stderr),
+    ])
+}
+
+fn runtime_process_snapshot(snapshot: apl_windows::ProcessSnapshot) -> RuntimeValue {
+    RuntimeValue::list(vec![
+        RuntimeValue::new(RuntimeData::Bool(snapshot.running), ProtectionLevel::Av),
+        snapshot
+            .exit_code
+            .map(|code| RuntimeValue::new(RuntimeData::Int(code), ProtectionLevel::Av))
+            .unwrap_or_else(|| RuntimeValue::none(ProtectionLevel::Av)),
+        RuntimeValue::str(snapshot.stdout),
+        RuntimeValue::str(snapshot.stderr),
+    ])
+}
+
 fn runtime_accelerator_entries(
     value: &RuntimeValue,
 ) -> Result<Vec<apl_windows::AcceleratorEntry>, RuntimeError> {
@@ -2473,11 +2493,39 @@ impl<'a, 'debug> Runtime<'a, 'debug> {
                     &runtime_str(&args[3], "windows::run_process working_directory")?,
                 )
                 .map_err(RuntimeError::Message)?;
-                Ok(RuntimeValue::list(vec![
-                    RuntimeValue::new(RuntimeData::Int(output.exit_code), ProtectionLevel::Av),
-                    RuntimeValue::str(output.stdout),
-                    RuntimeValue::str(output.stderr),
-                ]))
+                Ok(runtime_process_output(output))
+            }
+            "windows_start_process" => {
+                let process = self
+                    .windows
+                    .start_process(
+                        &runtime_str(&args[0], "windows::start_process program")?,
+                        &runtime_string_list(&args[1], "windows::start_process arguments")?,
+                        &runtime_str(&args[2], "windows::start_process input")?,
+                        &runtime_str(&args[3], "windows::start_process working_directory")?,
+                    )
+                    .map_err(RuntimeError::Message)?;
+                Ok(RuntimeValue::new(
+                    RuntimeData::Int(process),
+                    ProtectionLevel::Av,
+                ))
+            }
+            "windows_poll_process" => {
+                let snapshot = self
+                    .windows
+                    .poll_process(runtime_int(&args[0], "windows::poll_process process")?)
+                    .map_err(RuntimeError::Message)?;
+                Ok(runtime_process_snapshot(snapshot))
+            }
+            "windows_wait_process" | "windows_terminate_process" => {
+                let process = runtime_int(&args[0], "Windows process identity")?;
+                let output = if name == "windows_wait_process" {
+                    self.windows.wait_process(process)
+                } else {
+                    self.windows.terminate_process(process)
+                }
+                .map_err(RuntimeError::Message)?;
+                Ok(runtime_process_output(output))
             }
             "windows_open_file_dialog" | "windows_save_file_dialog" => {
                 let owner = runtime_int(&args[0], "Windows file dialog owner")?;

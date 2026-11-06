@@ -162,8 +162,11 @@ func verifier.builtin_arity(name) {
   if name == "windows_set_text_font" {
     return 5
   }
-  if name == "windows_run_process" {
+  if (name == "windows_run_process") or (name == "windows_start_process") {
     return 4
+  }
+  if ((name == "windows_poll_process") or (name == "windows_wait_process")) or (name == "windows_terminate_process") {
+    return 1
   }
   if (name == "windows_open_file_dialog") or (name == "windows_save_file_dialog") {
     return 7

@@ -4,7 +4,7 @@
 
 AVStr checker.STATUS_OK = "OK"
 AVStr checker.STATUS_FAIL = "FAIL"
-List checker.STANDARD_EXPORTS = ["pick", "add", "set", "get", "pop", "int", "float", "bool", "str", "bytes", "json", "split", "join", "len", "contains", "ord", "char", "pow", "timer_start", "timer_stop", "timer_elapsed", "now_utc", "sha1", "sha256", "sha512", "sha3_384", "windows_available", "windows_load_library", "windows_get_procedure", "windows_call", "windows_close_library", "windows_last_error", "windows_utf16", "windows_message_box", "windows_create_window", "windows_show_window", "windows_destroy_window", "windows_run_message_loop", "windows_pump_messages", "windows_next_event", "windows_create_control", "windows_set_window_text", "windows_window_text", "windows_move_window", "windows_selection", "windows_set_selection", "windows_replace_selection", "windows_line_count", "windows_set_text_color", "windows_find_text", "windows_set_background_color", "windows_set_text_bold", "windows_can_undo", "windows_undo", "windows_can_redo", "windows_clear_history", "windows_event_mask", "windows_set_event_mask", "windows_first_visible_line", "windows_scroll_lines", "windows_focus", "windows_set_text_font", "windows_run_process", "windows_open_file_dialog", "windows_save_file_dialog", "windows_create_menu", "windows_append_menu_item", "windows_append_submenu", "windows_append_menu_separator", "windows_set_menu", "windows_set_menu_item_enabled", "windows_set_menu_item_checked", "windows_destroy_menu", "windows_wait_event", "windows_load_icon", "windows_set_window_icon", "windows_destroy_icon", "windows_set_deferred_close", "windows_create_accelerators", "windows_set_accelerators", "windows_destroy_accelerators"]
+List checker.STANDARD_EXPORTS = ["pick", "add", "set", "get", "pop", "int", "float", "bool", "str", "bytes", "json", "split", "join", "len", "contains", "ord", "char", "pow", "timer_start", "timer_stop", "timer_elapsed", "now_utc", "sha1", "sha256", "sha512", "sha3_384", "windows_available", "windows_load_library", "windows_get_procedure", "windows_call", "windows_close_library", "windows_last_error", "windows_utf16", "windows_message_box", "windows_create_window", "windows_show_window", "windows_destroy_window", "windows_run_message_loop", "windows_pump_messages", "windows_next_event", "windows_create_control", "windows_set_window_text", "windows_window_text", "windows_move_window", "windows_selection", "windows_set_selection", "windows_replace_selection", "windows_line_count", "windows_set_text_color", "windows_find_text", "windows_set_background_color", "windows_set_text_bold", "windows_can_undo", "windows_undo", "windows_can_redo", "windows_clear_history", "windows_event_mask", "windows_set_event_mask", "windows_first_visible_line", "windows_scroll_lines", "windows_focus", "windows_set_text_font", "windows_run_process", "windows_open_file_dialog", "windows_save_file_dialog", "windows_create_menu", "windows_append_menu_item", "windows_append_submenu", "windows_append_menu_separator", "windows_set_menu", "windows_set_menu_item_enabled", "windows_set_menu_item_checked", "windows_destroy_menu", "windows_wait_event", "windows_load_icon", "windows_set_window_icon", "windows_destroy_icon", "windows_set_deferred_close", "windows_create_accelerators", "windows_set_accelerators", "windows_destroy_accelerators", "windows_start_process", "windows_poll_process", "windows_wait_process", "windows_terminate_process"]
 
 func checker.entry_name(entry) {
   return get(entry, 0)
@@ -875,8 +875,11 @@ func checker.builtin_arity(name) {
   if name == "windows_set_text_font" {
     return 5
   }
-  if name == "windows_run_process" {
+  if (name == "windows_run_process") or (name == "windows_start_process") {
     return 4
+  }
+  if ((name == "windows_poll_process") or (name == "windows_wait_process")) or (name == "windows_terminate_process") {
+    return 1
   }
   if (name == "windows_open_file_dialog") or (name == "windows_save_file_dialog") {
     return 7
@@ -1270,7 +1273,7 @@ func checker.call_result_type(name, args, names) {
   if (((((((name == "windows_available") or (name == "windows_close_library")) or (name == "windows_show_window")) or (name == "windows_destroy_window")) or (name == "windows_pump_messages")) or ((name == "windows_set_window_text") or (name == "windows_move_window"))) or ((name == "windows_set_selection") or (name == "windows_replace_selection"))) or (name == "windows_set_text_color") {
     return "Bool"
   }
-  if ((name == "windows_get_procedure") or (name == "windows_selection")) or (name == "windows_run_process") {
+  if (((((name == "windows_get_procedure") or (name == "windows_selection")) or (name == "windows_run_process")) or (name == "windows_poll_process")) or (name == "windows_wait_process")) or (name == "windows_terminate_process") {
     return "List"
   }
   if ((((name == "windows_next_event") or (name == "windows_find_text")) or (name == "windows_open_file_dialog")) or (name == "windows_save_file_dialog")) or (name == "windows_wait_event") {
@@ -2502,6 +2505,27 @@ func checker.validate_builtin_argument_types(expression, names) {
       return checker.fail(names, "windows::run_process working_directory must be Str")
     }
     return checker.validate_public_expressions(args, names, "windows::run_process")
+  }
+  if name == "windows_start_process" {
+    if checker.type_allows(checker.expr_type(get(args, 0), names), "Str") != true {
+      return checker.fail(names, "windows::start_process program must be Str")
+    }
+    if checker.type_allows(checker.expr_type(get(args, 1), names), "List") != true {
+      return checker.fail(names, "windows::start_process arguments must be List")
+    }
+    if checker.type_allows(checker.expr_type(get(args, 2), names), "Str") != true {
+      return checker.fail(names, "windows::start_process input must be Str")
+    }
+    if checker.type_allows(checker.expr_type(get(args, 3), names), "Str") != true {
+      return checker.fail(names, "windows::start_process working_directory must be Str")
+    }
+    return checker.validate_public_expressions(args, names, "windows::start_process")
+  }
+  if ((name == "windows_poll_process") or (name == "windows_wait_process")) or (name == "windows_terminate_process") {
+    if checker.type_allows(checker.expr_type(get(args, 0), names), "Int") != true {
+      return checker.fail(names, join([name, " process must be Int"], ""))
+    }
+    return checker.validate_public_expressions(args, names, name)
   }
   if (name == "windows_open_file_dialog") or (name == "windows_save_file_dialog") {
     if checker.type_allows(checker.expr_type(get(args, 0), names), "Int") != true {

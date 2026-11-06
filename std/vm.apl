@@ -930,6 +930,9 @@ func vm.is_builtin_call(name) {
   if name == "windows_run_process" {
     return true
   }
+  if (((name == "windows_start_process") or (name == "windows_poll_process")) or (name == "windows_wait_process")) or (name == "windows_terminate_process") {
+    return true
+  }
   if (name == "windows_open_file_dialog") or (name == "windows_save_file_dialog") {
     return true
   }
@@ -1306,6 +1309,18 @@ func vm.call_builtin(name, arg_exprs, env, output, functions) {
   }
   if name == "windows_run_process" {
     return vm.expr_ok(std::windows_run_process(get(args, 0), get(args, 1), get(args, 2), get(args, 3)), env, output, "AV")
+  }
+  if name == "windows_start_process" {
+    return vm.expr_ok(std::windows_start_process(get(args, 0), get(args, 1), get(args, 2), get(args, 3)), env, output, "AV")
+  }
+  if name == "windows_poll_process" {
+    return vm.expr_ok(std::windows_poll_process(get(args, 0)), env, output, "AV")
+  }
+  if name == "windows_wait_process" {
+    return vm.expr_ok(std::windows_wait_process(get(args, 0)), env, output, "AV")
+  }
+  if name == "windows_terminate_process" {
+    return vm.expr_ok(std::windows_terminate_process(get(args, 0)), env, output, "AV")
   }
   if name == "windows_open_file_dialog" {
     return vm.expr_ok(std::windows_open_file_dialog(get(args, 0), get(args, 1), get(args, 2), get(args, 3), get(args, 4), get(args, 5), get(args, 6)), env, output, "AV")

@@ -130,6 +130,21 @@ AVInt std::main() {
     out child.stdout == "OUT:hello"
     out ":"
     out std::contains(child.stderr, "ERR")
+    VTime async_child = windows::start_process("cmd.exe", ["/D", "/S", "/C", "echo READY& ping -n 2 127.0.0.1 >nul & echo DONE"], "", "")
+    ProcessSnapshot live_child = ProcessSnapshot(windows::poll_process(async_child))
+    out ":"
+    out live_child.running
+    ProcessResult async_result = ProcessResult(windows::wait_process(async_child))
+    out ":"
+    out async_result.exit_code == 0
+    out ":"
+    out std::contains(async_result.stdout, "READY")
+    out ":"
+    out std::contains(async_result.stdout, "DONE")
+    VTime terminated_child = windows::start_process("cmd.exe", ["/D", "/S", "/C", "ping -n 30 127.0.0.1 >nul"], "", "")
+    ProcessResult terminated_result = ProcessResult(windows::terminate_process(terminated_child))
+    out ":"
+    out terminated_result.exit_code != 0
     Accelerators shortcuts = Accelerators([[78, 203, 0]])
     WindowConfig config = WindowConfig()
     config.title = "APL test"
@@ -267,7 +282,7 @@ fn windows_library_runs_through_portable_and_native_paths() {
     let expected = if cfg!(windows) {
         std::iter::once("true")
             .chain(std::iter::once("4"))
-            .chain(std::iter::repeat("true").take(42))
+            .chain(std::iter::repeat("true").take(47))
             .collect::<Vec<_>>()
             .join(":")
     } else {

@@ -83,8 +83,11 @@ Updated: 2026-11-06.
   behind pointer-free APL contracts.
 - Windows child processes can be run without a console window using a string
   argument list, captured stdin/stdout/stderr, an optional working directory,
-  and an explicit exit code. `ProcessResult` gives the returned list named
-  fields without exposing process or pipe handles.
+  and an explicit exit code. They can also be started asynchronously, polled
+  for accumulated output, waited for, or terminated through stable identities.
+  Win32 Job Objects clean up the owned process tree on termination or host exit.
+  `ProcessResult` and `ProcessSnapshot` provide named fields without exposing
+  process or pipe handles.
 
 ## Partial
 
@@ -112,14 +115,13 @@ Updated: 2026-11-06.
 - The Windows module exports editable `WindowConfig` and `ControlConfig`
   classes through class-aware `.aplmod` metadata. Generic child creation is
   implemented together with editor-grade RichEdit formatting, fonts, undo,
-  event masks, scrolling, focus, search, synchronous process capture, and
-  configured native open/save file dialogs, stable owned native menus, owned
+  event masks, scrolling, focus, search, synchronous/asynchronous process
+  capture and cancellation, configured native open/save file dialogs, stable
+  owned native menus, owned
   external icons, owned accelerator tables, blocking decoded event retrieval,
   and an overridable `WindowApplication` loop. Low-level callback registration,
-  embedded PE resources, and asynchronous process control remain.
-  Its current FFI supports
-  integer/pointer signatures only and uses a fixed sixteen-argument bootstrap
-  dispatcher.
+  and embedded PE resources remain. Its current FFI supports integer/pointer
+  signatures only and uses a fixed sixteen-argument bootstrap dispatcher.
 
 ## Open Regressions
 

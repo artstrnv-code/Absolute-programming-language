@@ -184,6 +184,20 @@ class ProcessResult {
   }
 }
 
+class ProcessSnapshot {
+  AVBool running = false
+  AVInt exit_code = NONE
+  AVStr stdout = ""
+  AVStr stderr = ""
+
+  func __init__(raw) {
+    self.running = std::get(raw, 0)
+    self.exit_code = std::get(raw, 1)
+    self.stdout = std::get(raw, 2)
+    self.stderr = std::get(raw, 3)
+  }
+}
+
 class FileDialogConfig {
   AVStr title = ""
   AVStr initial_directory = ""
@@ -418,6 +432,22 @@ func windows.message_box(text, caption, kind) {
 
 func windows.run_process(program, arguments, stdin_text, working_directory) {
   return std::windows_run_process(program, arguments, stdin_text, working_directory)
+}
+
+func windows.start_process(program, arguments, stdin_text, working_directory) {
+  return std::windows_start_process(program, arguments, stdin_text, working_directory)
+}
+
+func windows.poll_process(process) {
+  return std::windows_poll_process(process)
+}
+
+func windows.wait_process(process) {
+  return std::windows_wait_process(process)
+}
+
+func windows.terminate_process(process) {
+  return std::windows_terminate_process(process)
 }
 
 func windows.open_file_dialog(owner, title, initial_directory, file_name, filter_name, filter_pattern, default_extension) {

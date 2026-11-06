@@ -18,6 +18,14 @@ pub struct ProcessOutput {
     pub stderr: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessSnapshot {
+    pub running: bool,
+    pub exit_code: Option<i64>,
+    pub stdout: String,
+    pub stderr: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AcceleratorEntry {
     pub key: i64,
@@ -67,6 +75,7 @@ pub struct WindowsHost {
     menus: BTreeMap<i64, Menu>,
     icons: BTreeMap<i64, Icon>,
     accelerators: BTreeMap<i64, Accelerators>,
+    processes: BTreeMap<i64, platform::AsyncProcess>,
     events: VecDeque<WindowEvent>,
     support_modules: Vec<usize>,
 }
@@ -80,6 +89,7 @@ impl Default for WindowsHost {
             menus: BTreeMap::new(),
             icons: BTreeMap::new(),
             accelerators: BTreeMap::new(),
+            processes: BTreeMap::new(),
             events: VecDeque::new(),
             support_modules: Vec::new(),
         }
@@ -226,6 +236,45 @@ impl WindowsHost {
             .checked_add(1)
             .ok_or_else(|| "Windows identity counter overflow".to_owned())?;
         Ok(id)
+    }
+
+    pub fn start_process(
+        &mut self,
+        program: &str,
+        arguments: &[String],
+        input: &str,
+        working_directory: &str,
+    ) -> Result<i64, String> {
+        if program.is_empty() {
+            return Err("process program must not be empty".to_owned());
+        }
+        let id = self.allocate_id()?;
+        let process = platform::start_process(program, arguments, input, working_directory)?;
+        self.processes.insert(id, process);
+        Ok(id)
+    }
+
+    pub fn poll_process(&mut self, process: i64) -> Result<ProcessSnapshot, String> {
+        self.processes
+            .get_mut(&process)
+            .ok_or_else(|| format!("unknown Windows process identity `{process}`"))?
+            .snapshot()
+    }
+
+    pub fn wait_process(&mut self, process: i64) -> Result<ProcessOutput, String> {
+        self.processes
+            .remove(&process)
+            .ok_or_else(|| format!("unknown Windows process identity `{process}`"))?
+            .finish()
+    }
+
+    pub fn terminate_process(&mut self, process: i64) -> Result<ProcessOutput, String> {
+        let child = self
+            .processes
+            .get_mut(&process)
+            .ok_or_else(|| format!("unknown Windows process identity `{process}`"))?;
+        child.terminate()?;
+        self.wait_process(process)
     }
 
     pub fn show_window(&mut self, window: i64) -> Result<bool, String> {
@@ -1060,6 +1109,7 @@ fn validate_file_dialog_options(
 
 impl Drop for WindowsHost {
     fn drop(&mut self) {
+        drop(std::mem::take(&mut self.processes));
         for window in std::mem::take(&mut self.windows).into_values() {
             let _ = platform::destroy_window(window.handle);
         }
@@ -1119,15 +1169,18 @@ mod platform {
         cell::{Cell, RefCell},
         collections::{BTreeMap, BTreeSet, VecDeque},
         ffi::CString,
-        io::{ErrorKind, Write},
+        fmt,
+        io::{ErrorKind, Read, Write},
         mem::zeroed,
-        os::windows::process::CommandExt,
-        process::{Command, Stdio},
-        ptr::null_mut,
+        os::windows::{io::AsRawHandle, process::CommandExt},
+        process::{Child, Command, ExitStatus, Stdio},
+        ptr::{null, null_mut},
+        sync::mpsc::{self, Receiver},
         thread,
+        thread::JoinHandle,
     };
 
-    use super::ProcessOutput;
+    use super::{ProcessOutput, ProcessSnapshot};
 
     type Handle = *mut core::ffi::c_void;
     type WParam = usize;
@@ -1136,10 +1189,183 @@ mod platform {
 
     const CLASS_NAME: &str = "APL.Runtime.Window.1";
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: i32 = 9;
+    const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x0000_2000;
     const COLOR_WINDOW: usize = 5;
     const CS_HREDRAW: u32 = 0x0002;
     const CS_VREDRAW: u32 = 0x0001;
     const IDC_ARROW: usize = 32512;
+
+    pub struct AsyncProcess {
+        job: Option<JobObject>,
+        child: Child,
+        input_writer: Option<JoinHandle<Result<(), String>>>,
+        stdout_reader: Option<JoinHandle<Result<(), String>>>,
+        stderr_reader: Option<JoinHandle<Result<(), String>>>,
+        stdout_receiver: Receiver<Vec<u8>>,
+        stderr_receiver: Receiver<Vec<u8>>,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+        exit_code: Option<i64>,
+    }
+
+    impl fmt::Debug for AsyncProcess {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter
+                .debug_struct("AsyncProcess")
+                .field("exit_code", &self.exit_code)
+                .field("stdout_bytes", &self.stdout.len())
+                .field("stderr_bytes", &self.stderr.len())
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl AsyncProcess {
+        pub fn snapshot(&mut self) -> Result<ProcessSnapshot, String> {
+            self.refresh_output();
+            if self.exit_code.is_none() {
+                self.exit_code = self
+                    .child
+                    .try_wait()
+                    .map_err(|error| format!("failed to query Windows process: {error}"))?
+                    .map(exit_code);
+            }
+            self.refresh_output();
+            Ok(ProcessSnapshot {
+                running: self.exit_code.is_none(),
+                exit_code: self.exit_code,
+                stdout: String::from_utf8_lossy(&self.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&self.stderr).into_owned(),
+            })
+        }
+
+        pub fn terminate(&mut self) -> Result<(), String> {
+            if self.exit_code.is_some() {
+                return Ok(());
+            }
+            if let Some(status) = self
+                .child
+                .try_wait()
+                .map_err(|error| format!("failed to query Windows process: {error}"))?
+            {
+                self.exit_code = Some(exit_code(status));
+                return Ok(());
+            }
+            self.job
+                .as_ref()
+                .ok_or_else(|| "Windows process job is no longer available".to_owned())?
+                .terminate(1)
+        }
+
+        pub fn finish(mut self) -> Result<ProcessOutput, String> {
+            let exit_code = match self.exit_code {
+                Some(exit_code) => exit_code,
+                None => exit_code(
+                    self.child
+                        .wait()
+                        .map_err(|error| format!("failed to wait for Windows process: {error}"))?,
+                ),
+            };
+            self.exit_code = Some(exit_code);
+            drop(self.job.take());
+            join_worker(&mut self.input_writer, "stdin writer")?;
+            join_worker(&mut self.stdout_reader, "stdout reader")?;
+            join_worker(&mut self.stderr_reader, "stderr reader")?;
+            self.refresh_output();
+            Ok(ProcessOutput {
+                exit_code,
+                stdout: String::from_utf8_lossy(&self.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&self.stderr).into_owned(),
+            })
+        }
+
+        fn refresh_output(&mut self) {
+            self.stdout
+                .extend(self.stdout_receiver.try_iter().flatten());
+            self.stderr
+                .extend(self.stderr_receiver.try_iter().flatten());
+        }
+    }
+
+    impl Drop for AsyncProcess {
+        fn drop(&mut self) {
+            drop(self.job.take());
+            if self.exit_code.is_none() {
+                let _ = self.child.wait();
+            }
+            let _ = join_worker(&mut self.input_writer, "stdin writer");
+            let _ = join_worker(&mut self.stdout_reader, "stdout reader");
+            let _ = join_worker(&mut self.stderr_reader, "stderr reader");
+        }
+    }
+
+    #[derive(Debug)]
+    struct JobObject {
+        handle: usize,
+    }
+
+    impl JobObject {
+        fn new() -> Result<Self, String> {
+            let handle = unsafe { CreateJobObjectW(null(), null()) };
+            if handle.is_null() {
+                return Err(format!(
+                    "CreateJobObjectW failed with Windows error {}",
+                    unsafe { GetLastError() }
+                ));
+            }
+            let job = Self {
+                handle: handle as usize,
+            };
+            let mut limits: JobObjectExtendedLimitInformation = unsafe { zeroed() };
+            limits.basic_limit_information.limit_flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let configured = unsafe {
+                SetInformationJobObject(
+                    job.handle as Handle,
+                    JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+                    (&limits as *const JobObjectExtendedLimitInformation).cast(),
+                    std::mem::size_of::<JobObjectExtendedLimitInformation>() as u32,
+                )
+            };
+            if configured == 0 {
+                return Err(format!(
+                    "SetInformationJobObject failed with Windows error {}",
+                    unsafe { GetLastError() }
+                ));
+            }
+            Ok(job)
+        }
+
+        fn assign(&self, child: &Child) -> Result<(), String> {
+            let assigned = unsafe {
+                AssignProcessToJobObject(self.handle as Handle, child.as_raw_handle() as Handle)
+            };
+            if assigned == 0 {
+                return Err(format!(
+                    "AssignProcessToJobObject failed with Windows error {}",
+                    unsafe { GetLastError() }
+                ));
+            }
+            Ok(())
+        }
+
+        fn terminate(&self, exit_code: u32) -> Result<(), String> {
+            if unsafe { TerminateJobObject(self.handle as Handle, exit_code) } == 0 {
+                return Err(format!(
+                    "TerminateJobObject failed with Windows error {}",
+                    unsafe { GetLastError() }
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    impl Drop for JobObject {
+        fn drop(&mut self) {
+            unsafe {
+                CloseHandle(self.handle as Handle);
+            }
+        }
+    }
     const EM_GETSEL: u32 = 0x00b0;
     const EM_SETSEL: u32 = 0x00b1;
     const EM_LINESCROLL: u32 = 0x00b6;
@@ -1375,6 +1601,39 @@ mod platform {
         flags_ex: u32,
     }
 
+    #[repr(C)]
+    struct JobObjectBasicLimitInformation {
+        per_process_user_time_limit: i64,
+        per_job_user_time_limit: i64,
+        limit_flags: u32,
+        minimum_working_set_size: usize,
+        maximum_working_set_size: usize,
+        active_process_limit: u32,
+        affinity: usize,
+        priority_class: u32,
+        scheduling_class: u32,
+    }
+
+    #[repr(C)]
+    struct IoCounters {
+        read_operation_count: u64,
+        write_operation_count: u64,
+        other_operation_count: u64,
+        read_transfer_count: u64,
+        write_transfer_count: u64,
+        other_transfer_count: u64,
+    }
+
+    #[repr(C)]
+    struct JobObjectExtendedLimitInformation {
+        basic_limit_information: JobObjectBasicLimitInformation,
+        io_info: IoCounters,
+        process_memory_limit: usize,
+        job_memory_limit: usize,
+        peak_process_memory_used: usize,
+        peak_job_memory_used: usize,
+    }
+
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn LoadLibraryW(name: *const u16) -> Handle;
@@ -1382,6 +1641,16 @@ mod platform {
         fn FreeLibrary(module: Handle) -> i32;
         fn GetLastError() -> u32;
         fn GetModuleHandleW(name: *const u16) -> Handle;
+        fn CreateJobObjectW(job_attributes: *const core::ffi::c_void, name: *const u16) -> Handle;
+        fn SetInformationJobObject(
+            job: Handle,
+            information_class: i32,
+            information: *const core::ffi::c_void,
+            information_length: u32,
+        ) -> i32;
+        fn AssignProcessToJobObject(job: Handle, process: Handle) -> i32;
+        fn TerminateJobObject(job: Handle, exit_code: u32) -> i32;
+        fn CloseHandle(object: Handle) -> i32;
     }
 
     #[link(name = "user32")]
@@ -1756,12 +2025,13 @@ mod platform {
         filter
     }
 
-    pub fn run_process(
+    pub fn start_process(
         program: &str,
         arguments: &[String],
         input: &str,
         working_directory: &str,
-    ) -> Result<ProcessOutput, String> {
+    ) -> Result<AsyncProcess, String> {
+        let job = JobObject::new()?;
         let mut command = Command::new(program);
         command
             .args(arguments)
@@ -1776,30 +2046,93 @@ mod platform {
         let mut child = command
             .spawn()
             .map_err(|error| format!("failed to start Windows process `{program}`: {error}"))?;
+        if let Err(error) = job.assign(&child) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
         let mut stdin = child
             .stdin
             .take()
             .ok_or_else(|| "failed to open child process stdin".to_owned())?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "failed to open child process stdout".to_owned())?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| "failed to open child process stderr".to_owned())?;
         let input = input.as_bytes().to_vec();
-        let writer = thread::spawn(move || -> Result<(), String> {
+        let input_writer = thread::spawn(move || -> Result<(), String> {
             match stdin.write_all(&input) {
                 Ok(()) => Ok(()),
                 Err(error) if error.kind() == ErrorKind::BrokenPipe => Ok(()),
                 Err(error) => Err(format!("failed to write child process stdin: {error}")),
             }
         });
-        let output = child
-            .wait_with_output()
-            .map_err(|error| format!("failed to wait for Windows process `{program}`: {error}"))?;
-        writer
-            .join()
-            .map_err(|_| "child process stdin writer panicked".to_owned())??;
+        let (stdout_receiver, stdout_reader) = spawn_reader(stdout, "stdout");
+        let (stderr_receiver, stderr_reader) = spawn_reader(stderr, "stderr");
 
-        Ok(ProcessOutput {
-            exit_code: output.status.code().map(i64::from).unwrap_or(-1),
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        Ok(AsyncProcess {
+            job: Some(job),
+            child,
+            input_writer: Some(input_writer),
+            stdout_reader: Some(stdout_reader),
+            stderr_reader: Some(stderr_reader),
+            stdout_receiver,
+            stderr_receiver,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            exit_code: None,
         })
+    }
+
+    pub fn run_process(
+        program: &str,
+        arguments: &[String],
+        input: &str,
+        working_directory: &str,
+    ) -> Result<ProcessOutput, String> {
+        start_process(program, arguments, input, working_directory)?.finish()
+    }
+
+    fn spawn_reader(
+        mut reader: impl Read + Send + 'static,
+        stream: &'static str,
+    ) -> (Receiver<Vec<u8>>, JoinHandle<Result<(), String>>) {
+        let (sender, receiver) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let read = reader
+                    .read(&mut buffer)
+                    .map_err(|error| format!("failed to read child process {stream}: {error}"))?;
+                if read == 0 {
+                    return Ok(());
+                }
+                if sender.send(buffer[..read].to_vec()).is_err() {
+                    return Ok(());
+                }
+            }
+        });
+        (receiver, worker)
+    }
+
+    fn join_worker(
+        worker: &mut Option<JoinHandle<Result<(), String>>>,
+        name: &str,
+    ) -> Result<(), String> {
+        if let Some(worker) = worker.take() {
+            worker
+                .join()
+                .map_err(|_| format!("child process {name} panicked"))??;
+        }
+        Ok(())
+    }
+
+    fn exit_code(status: ExitStatus) -> i64 {
+        status.code().map(i64::from).unwrap_or(-1)
     }
 
     pub fn create_window(title: &str, width: i32, height: i32) -> Result<usize, String> {
@@ -2677,7 +3010,24 @@ mod platform {
 
 #[cfg(not(windows))]
 mod platform {
-    use super::ProcessOutput;
+    use super::{ProcessOutput, ProcessSnapshot};
+
+    #[derive(Debug)]
+    pub struct AsyncProcess;
+
+    impl AsyncProcess {
+        pub fn snapshot(&mut self) -> Result<ProcessSnapshot, String> {
+            Err(unavailable())
+        }
+
+        pub fn terminate(&mut self) -> Result<(), String> {
+            Err(unavailable())
+        }
+
+        pub fn finish(self) -> Result<ProcessOutput, String> {
+            Err(unavailable())
+        }
+    }
 
     pub struct RawWindowEvent {
         pub window: usize,
@@ -2733,6 +3083,15 @@ mod platform {
         _input: &str,
         _working_directory: &str,
     ) -> Result<ProcessOutput, String> {
+        Err(unavailable())
+    }
+
+    pub fn start_process(
+        _program: &str,
+        _arguments: &[String],
+        _input: &str,
+        _working_directory: &str,
+    ) -> Result<AsyncProcess, String> {
         Err(unavailable())
     }
 
@@ -3048,6 +3407,59 @@ mod tests {
         assert_eq!(output.exit_code, 7);
         assert_eq!(output.stdout, "OUT:hello");
         assert_eq!(output.stderr, "ERR\r\n");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn streams_and_collects_an_asynchronous_process() {
+        let arguments = [
+            "/D".to_owned(),
+            "/S".to_owned(),
+            "/C".to_owned(),
+            "echo READY& ping -n 2 127.0.0.1 >nul & echo DONE".to_owned(),
+        ];
+        let mut host = WindowsHost::default();
+        let process = host.start_process("cmd.exe", &arguments, "", "").unwrap();
+        let mut observed_streaming_output = false;
+        for _ in 0..200 {
+            let snapshot = host.poll_process(process).unwrap();
+            observed_streaming_output |= snapshot.running && snapshot.stdout.contains("READY");
+            if !snapshot.running {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let output = host.wait_process(process).unwrap();
+        assert!(observed_streaming_output);
+        assert_eq!(output.exit_code, 0);
+        assert_eq!(output.stdout, "READY\r\nDONE\r\n");
+        assert_eq!(output.stderr, "");
+        assert_eq!(
+            host.poll_process(process).unwrap_err(),
+            format!("unknown Windows process identity `{process}`")
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn terminates_and_revokes_an_asynchronous_process() {
+        let arguments = [
+            "/D".to_owned(),
+            "/S".to_owned(),
+            "/C".to_owned(),
+            "ping -n 30 127.0.0.1 >nul".to_owned(),
+        ];
+        let mut host = WindowsHost::default();
+        let process = host.start_process("cmd.exe", &arguments, "", "").unwrap();
+        assert!(host.poll_process(process).unwrap().running);
+
+        let output = host.terminate_process(process).unwrap();
+        assert_ne!(output.exit_code, 0);
+        assert_eq!(
+            host.wait_process(process).unwrap_err(),
+            format!("unknown Windows process identity `{process}`")
+        );
     }
 
     #[test]

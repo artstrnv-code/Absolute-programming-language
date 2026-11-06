@@ -7,15 +7,16 @@ basic window creation, editable window/control configuration, common child
 controls, safe decoded message dispatch, and the RichEdit operations needed by
 an editor: text, selection, search, foreground/background/bold formatting,
 undo/redo, notification masks, scrolling, focus, font face/size management, and
-synchronous child-process execution with captured standard streams. Native
+synchronous or asynchronous child-process execution with captured standard
+streams. Native
 open/save file dialogs are available through a small editable configuration
 class. Stable owned menu trees support native menu bars and decoded commands.
 Owned external `.ico` resources can be attached without exposing `HICON`, and
 `wait_event()` provides an efficient blocking event step. Owned accelerator
 tables translate keys in every blocking and nonblocking message-loop path.
 `WindowApplication` supplies an overridable APL event-dispatch loop, including
-subclasses declared outside the precompiled Windows module. Embedded PE
-resources and asynchronous process control remain the next layer.
+subclasses declared outside the precompiled Windows module. Low-level callback
+registration and embedded PE resources remain the next layer.
 
 The module metadata declares `windows -> classes`. The compiler resolves this
 dependency transitively and independently of source `include` order. Class
@@ -79,6 +80,19 @@ fixed match table is not the final arbitrary-signature FFI.
   supplied as UTF-8 text. An empty working directory inherits the parent
   directory. `ProcessResult(raw)` provides named `exit_code`, `stdout`, and
   `stderr` fields without exposing process or pipe handles.
+- `windows::start_process(program, arguments, stdin_text, working_directory)`
+  starts the same hidden process without waiting and returns a stable opaque
+  process identity. `windows::poll_process(process)` returns
+  `[running, exit_code, stdout, stderr]`; while the process is running,
+  `exit_code` is `NONE` and the two strings contain the output accumulated so
+  far. `ProcessSnapshot(raw)` exposes those values as named fields.
+- `windows::wait_process(process)` waits for an asynchronous process and
+  returns the ordinary process-result list. `windows::terminate_process` stops
+  it and returns the same shape. Both operations consume the identity, so a
+  later poll, wait, or termination fails instead of reaching a stale native
+  process handle. Each process belongs to a Win32 Job Object configured with
+  `KILL_ON_JOB_CLOSE`, so termination and host cleanup stop the owned child
+  process tree rather than only its first PID.
 - `windows::open_file_dialog(owner, title, initial_directory, file_name,
   filter_name, filter_pattern, default_extension)` and the matching
   `save_file_dialog` wrap the Unicode common-dialog API. `owner = 0` creates an
@@ -258,7 +272,7 @@ handling to `DefWindowProcW`, and posts
 `WM_QUIT` after the last APL window on the current thread is destroyed.
 Low-level callback registration and embedded PE resources are not implemented.
 High-level APL handlers use `WindowApplication` over the safe event queue;
-asynchronous process streaming/cancellation also remains future work.
+child-process streaming and cancellation use opaque owned process identities.
 
 The host implementation follows the Win32 `EM_SETCHARFORMAT`/`CHARFORMAT2W`,
 `EM_FINDTEXTEXW`/`FINDTEXTEXW`, and Text Object Model undo contracts. Their

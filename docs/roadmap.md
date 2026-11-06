@@ -30,10 +30,10 @@ counter and tainting effects performed under it.
    defaults, child controls, pointer-free decoded message dispatch, and
    RichEdit text/search, foreground/background/bold formatting with preserved
    undo, fonts, notification masks, scrolling, and focus. Menus, external
-   icons, accelerators, configured file dialogs, synchronous process capture,
-   and an overridable `WindowApplication` loop are also implemented. Low-level
-   callback registration, embedded PE resources, and asynchronous process
-   control remain.
+   icons, accelerators, configured file dialogs, synchronous/asynchronous
+   process capture and cancellation, and an overridable `WindowApplication`
+   loop are also implemented. Low-level callback registration and embedded PE
+   resources remain.
 5. After the Windows acceptance layer, remove the Rust bridge from the
    APL-written compiler path, then implement the Linux system backend.
 

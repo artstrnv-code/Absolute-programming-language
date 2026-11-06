@@ -1463,6 +1463,10 @@ impl Checker {
             | "windows_set_text_bold"
             | "windows_set_text_font"
             | "windows_run_process"
+            | "windows_start_process"
+            | "windows_poll_process"
+            | "windows_wait_process"
+            | "windows_terminate_process"
             | "windows_open_file_dialog"
             | "windows_save_file_dialog"
             | "windows_create_menu"
@@ -1517,7 +1521,10 @@ impl Checker {
                     | "windows_focus"
                     | "windows_create_menu"
                     | "windows_append_menu_separator"
-                    | "windows_destroy_menu" => 1,
+                    | "windows_destroy_menu"
+                    | "windows_poll_process"
+                    | "windows_wait_process"
+                    | "windows_terminate_process" => 1,
                     "windows_destroy_icon"
                     | "windows_create_accelerators"
                     | "windows_destroy_accelerators" => 1,
@@ -1542,7 +1549,8 @@ impl Checker {
                     | "windows_set_text_color"
                     | "windows_set_background_color"
                     | "windows_set_text_bold"
-                    | "windows_run_process" => 4,
+                    | "windows_run_process"
+                    | "windows_start_process" => 4,
                     "windows_set_text_font" => 5,
                     "windows_move_window" | "windows_find_text" => 6,
                     "windows_open_file_dialog" | "windows_save_file_dialog" => 7,
@@ -1604,9 +1612,12 @@ impl Checker {
                     | "windows_set_deferred_close"
                     | "windows_set_accelerators"
                     | "windows_destroy_accelerators" => ValueType::Bool,
-                    "windows_get_procedure" | "windows_selection" | "windows_run_process" => {
-                        ValueType::List
-                    }
+                    "windows_get_procedure"
+                    | "windows_selection"
+                    | "windows_run_process"
+                    | "windows_poll_process"
+                    | "windows_wait_process"
+                    | "windows_terminate_process" => ValueType::List,
                     "windows_utf16" => ValueType::Bytes,
                     "windows_window_text" => ValueType::Str,
                     _ => ValueType::Int,
@@ -2453,6 +2464,10 @@ const STANDARD_EXPORTS: &[&str] = &[
     "windows_scroll_lines",
     "windows_focus",
     "windows_find_text",
+    "windows_start_process",
+    "windows_poll_process",
+    "windows_wait_process",
+    "windows_terminate_process",
 ];
 
 fn is_base_export(name: &str) -> bool {

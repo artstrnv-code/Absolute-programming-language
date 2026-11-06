@@ -11,9 +11,9 @@ copied structures, and raw memory. The initial open P0 regressions are closed.
 The DLL/typed Win64 call foundation, default window creation, pointer-free
 message dispatch, editable window/control configurations, editor-grade
 RichEdit support, menus, icons, accelerators, dialogs, synchronous processes,
-and the overridable `WindowApplication` loop are implemented. Remaining
-Windows work is low-level callback registration, embedded PE resources, and
-asynchronous process control.
+asynchronous process streaming/cancellation, and the overridable
+`WindowApplication` loop are implemented. Remaining Windows work is low-level
+callback registration and embedded PE resources.
 
 Current priorities:
 
@@ -116,6 +116,11 @@ and initial-condition `while else`, plus non-catchable
   `WindowApplication` class routes blocking decoded events through overridable
   handlers, and application-defined subclasses retain polymorphism across the
   `.aplmod` boundary.
+- Windows owns asynchronous child-process identities as well. Polling exposes
+  accumulated stdout/stderr without blocking; wait and terminate consume the
+  identity and return the same `ProcessResult` shape as synchronous execution.
+  A `KILL_ON_JOB_CLOSE` Job Object owns each child tree so Studio cancellation
+  cannot strand compiler subprocesses.
 - Raw memory uses two-phase release: `memory::mark(ptr)` revokes access and queues an
   owned allocation, while parameterless `memory::free()` releases every queued
   allocation. Marking a borrowed `load` record only unregisters it.

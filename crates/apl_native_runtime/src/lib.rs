@@ -377,6 +377,26 @@ fn native_string_list(value: &Value, label: &str) -> Result<Vec<String>, String>
         .collect()
 }
 
+fn native_process_output(output: apl_windows::ProcessOutput) -> Value {
+    Value::list(vec![
+        Value::new(Data::Int(output.exit_code), Protection::Av),
+        Value::str(output.stdout),
+        Value::str(output.stderr),
+    ])
+}
+
+fn native_process_snapshot(snapshot: apl_windows::ProcessSnapshot) -> Value {
+    Value::list(vec![
+        Value::new(Data::Bool(snapshot.running), Protection::Av),
+        snapshot
+            .exit_code
+            .map(|code| Value::new(Data::Int(code), Protection::Av))
+            .unwrap_or_else(|| Value::none(Protection::Av)),
+        Value::str(snapshot.stdout),
+        Value::str(snapshot.stderr),
+    ])
+}
+
 fn native_accelerator_entries(value: &Value) -> Result<Vec<apl_windows::AcceleratorEntry>, String> {
     let Data::List(entries) = &value.data else {
         return Err("windows::create_accelerators entries must be List".to_owned());
@@ -1887,11 +1907,62 @@ pub unsafe extern "C" fn apl_rt_builtin_windows_run_process(
             &native_str(&args[2], "windows::run_process input")?,
             &native_str(&args[3], "windows::run_process working_directory")?,
         )?;
-        Ok(Value::list(vec![
-            Value::new(Data::Int(output.exit_code), Protection::Av),
-            Value::str(output.stdout),
-            Value::str(output.stderr),
-        ]))
+        Ok(native_process_output(output))
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn apl_rt_builtin_windows_start_process(
+    context: *mut NativeContext,
+    _targets: *const *const AbiRecord,
+) -> i32 {
+    builtin(context, 4, |context, args| {
+        let process = context.windows.start_process(
+            &native_str(&args[0], "windows::start_process program")?,
+            &native_string_list(&args[1], "windows::start_process arguments")?,
+            &native_str(&args[2], "windows::start_process input")?,
+            &native_str(&args[3], "windows::start_process working_directory")?,
+        )?;
+        Ok(Value::new(Data::Int(process), Protection::Av))
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn apl_rt_builtin_windows_poll_process(
+    context: *mut NativeContext,
+    _targets: *const *const AbiRecord,
+) -> i32 {
+    builtin(context, 1, |context, args| {
+        let snapshot = context
+            .windows
+            .poll_process(native_int(&args[0], "windows::poll_process process")?)?;
+        Ok(native_process_snapshot(snapshot))
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn apl_rt_builtin_windows_wait_process(
+    context: *mut NativeContext,
+    _targets: *const *const AbiRecord,
+) -> i32 {
+    builtin(context, 1, |context, args| {
+        let output = context
+            .windows
+            .wait_process(native_int(&args[0], "windows::wait_process process")?)?;
+        Ok(native_process_output(output))
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn apl_rt_builtin_windows_terminate_process(
+    context: *mut NativeContext,
+    _targets: *const *const AbiRecord,
+) -> i32 {
+    builtin(context, 1, |context, args| {
+        let output = context
+            .windows
+            .terminate_process(native_int(&args[0], "windows::terminate_process process")?)?;
+        Ok(native_process_output(output))
     })
 }
 
