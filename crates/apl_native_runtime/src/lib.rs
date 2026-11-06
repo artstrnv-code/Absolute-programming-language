@@ -1528,6 +1528,71 @@ pub unsafe extern "C" fn apl_rt_builtin_windows_set_deferred_close(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn apl_rt_builtin_windows_set_timer(
+    context: *mut NativeContext,
+    _targets: *const *const AbiRecord,
+) -> i32 {
+    builtin(context, 3, |context, args| {
+        Ok(Value::new(
+            Data::Bool(context.windows.set_timer(
+                native_int(&args[0], "windows::set_timer window")?,
+                native_int(&args[1], "windows::set_timer timer_id")?,
+                native_int(&args[2], "windows::set_timer interval_ms")?,
+            )?),
+            Protection::Av,
+        ))
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn apl_rt_builtin_windows_kill_timer(
+    context: *mut NativeContext,
+    _targets: *const *const AbiRecord,
+) -> i32 {
+    builtin(context, 2, |context, args| {
+        Ok(Value::new(
+            Data::Bool(context.windows.kill_timer(
+                native_int(&args[0], "windows::kill_timer window")?,
+                native_int(&args[1], "windows::kill_timer timer_id")?,
+            )?),
+            Protection::Av,
+        ))
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn apl_rt_builtin_windows_enable_window(
+    context: *mut NativeContext,
+    _targets: *const *const AbiRecord,
+) -> i32 {
+    builtin(context, 2, |context, args| {
+        Ok(Value::new(
+            Data::Bool(context.windows.enable_window(
+                native_int(&args[0], "windows::enable_window window")?,
+                native_bool(&args[1], "windows::enable_window enabled")?,
+            )?),
+            Protection::Av,
+        ))
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn apl_rt_builtin_windows_invalidate_window(
+    context: *mut NativeContext,
+    _targets: *const *const AbiRecord,
+) -> i32 {
+    builtin(context, 2, |context, args| {
+        Ok(Value::new(
+            Data::Bool(context.windows.invalidate_window(
+                native_int(&args[0], "windows::invalidate_window window")?,
+                native_bool(&args[1], "windows::invalidate_window erase")?,
+            )?),
+            Protection::Av,
+        ))
+    })
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn apl_rt_builtin_windows_destroy_icon(
     context: *mut NativeContext,
     _targets: *const *const AbiRecord,

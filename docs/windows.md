@@ -20,6 +20,19 @@ APL build metadata and may embed an application icon. Low-level callback
 endpoints are available for four fixed Win32 signatures; synchronous reentry
 into an APL function remains a later VM/runtime layer.
 
+Window identities also expose the control-state operations needed by an
+APL-written editor. `windows::enable_window(window, enabled)` changes whether a
+window or control accepts input, and `windows::invalidate_window(window, erase)`
+invalidates its full client area for repainting. Both reject unknown or already
+destroyed identities instead of accepting a numeric HWND.
+
+`windows::set_timer(window, timer_id, interval_ms)` creates or resets a repeating
+window timer. Both numeric arguments must be positive and the interval must fit
+`U32`; Windows may clamp very small intervals to its platform minimum. Timer
+events have message `WM_TIMER`, carry `timer_id` in `wparam`, and are recognized
+by `WindowEvent.is_timer(timer_id)`. `WindowApplication` routes them to
+`on_timer(raw)`. `windows::kill_timer(window, timer_id)` stops the timer.
+
 The module metadata declares `windows -> classes`. The compiler resolves this
 dependency transitively and independently of source `include` order. Class
 surface metadata is carried by `.aplmod`, so `WindowConfig` remains a real

@@ -1486,6 +1486,10 @@ impl Checker {
             | "windows_set_window_icon"
             | "windows_destroy_icon"
             | "windows_set_deferred_close"
+            | "windows_set_timer"
+            | "windows_kill_timer"
+            | "windows_enable_window"
+            | "windows_invalidate_window"
             | "windows_create_accelerators"
             | "windows_set_accelerators"
             | "windows_destroy_accelerators"
@@ -1541,6 +1545,9 @@ impl Checker {
                     | "windows_set_menu" => 2,
                     "windows_set_window_icon"
                     | "windows_set_deferred_close"
+                    | "windows_kill_timer"
+                    | "windows_enable_window"
+                    | "windows_invalidate_window"
                     | "windows_set_accelerators" => 2,
                     "windows_message_box"
                     | "windows_create_window"
@@ -1549,7 +1556,8 @@ impl Checker {
                     | "windows_append_menu_item"
                     | "windows_append_submenu"
                     | "windows_set_menu_item_enabled"
-                    | "windows_set_menu_item_checked" => 3,
+                    | "windows_set_menu_item_checked"
+                    | "windows_set_timer" => 3,
                     "windows_load_icon" | "windows_load_resource_icon" => 3,
                     "windows_get_procedure"
                     | "windows_set_text_color"
@@ -1618,6 +1626,10 @@ impl Checker {
                     "windows_set_window_icon"
                     | "windows_destroy_icon"
                     | "windows_set_deferred_close"
+                    | "windows_set_timer"
+                    | "windows_kill_timer"
+                    | "windows_enable_window"
+                    | "windows_invalidate_window"
                     | "windows_set_accelerators"
                     | "windows_destroy_accelerators" => ValueType::Bool,
                     "windows_get_procedure"
@@ -2462,6 +2474,10 @@ const STANDARD_EXPORTS: &[&str] = &[
     "windows_set_window_icon",
     "windows_destroy_icon",
     "windows_set_deferred_close",
+    "windows_set_timer",
+    "windows_kill_timer",
+    "windows_enable_window",
+    "windows_invalidate_window",
     "windows_create_accelerators",
     "windows_set_accelerators",
     "windows_destroy_accelerators",

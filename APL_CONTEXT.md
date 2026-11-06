@@ -126,6 +126,10 @@ and initial-condition `while else`, plus non-catchable
   destroyed trampoline slots are never reused. Direct reentry into an APL
   function remains intentionally unfinished until executable capability leases
   can survive nested VM execution without permitting DLL-unload use-after-free.
+- Window timers are owned through the same checked window identities and emit
+  decoded `WM_TIMER` events. Enable/disable and whole-client invalidation are
+  exposed without accepting raw HWNDs, covering Studio highlight debounce and
+  repaint scheduling.
 - Windows owns asynchronous child-process identities as well. Polling exposes
   accumulated stdout/stderr without blocking; wait and terminate consume the
   identity and return the same `ProcessResult` shape as synchronous execution.

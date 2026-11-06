@@ -26,7 +26,8 @@ Current modules:
   Edit/RichEdit selection, foreground/background/bold formatting with
   preserved undo history, scrolling, focus, Unicode range search, menus,
   external icons, accelerators, file dialogs, process capture, fixed-signature
-  queued callback endpoints, and the overridable `WindowApplication` loop.
+  queued callback endpoints, owned window timers, control state/repaint helpers,
+  and the overridable `WindowApplication` loop.
 
 `.aplmod` files are generated artifacts. Build them with:
 

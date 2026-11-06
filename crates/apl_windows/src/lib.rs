@@ -827,6 +827,36 @@ impl WindowsHost {
         platform::set_deferred_close(self.window_handle(window)?, enabled)
     }
 
+    pub fn set_timer(&self, window: i64, timer_id: i64, interval_ms: i64) -> Result<bool, String> {
+        let timer_id = usize::try_from(timer_id)
+            .ok()
+            .filter(|timer_id| *timer_id != 0)
+            .ok_or_else(|| "timer id must be positive".to_owned())?;
+        let interval_ms = u32::try_from(interval_ms)
+            .ok()
+            .filter(|interval_ms| *interval_ms != 0)
+            .ok_or_else(|| {
+                "timer interval must be between 1 and 4294967295 milliseconds".to_owned()
+            })?;
+        platform::set_timer(self.window_handle(window)?, timer_id, interval_ms)
+    }
+
+    pub fn kill_timer(&self, window: i64, timer_id: i64) -> Result<bool, String> {
+        let timer_id = usize::try_from(timer_id)
+            .ok()
+            .filter(|timer_id| *timer_id != 0)
+            .ok_or_else(|| "timer id must be positive".to_owned())?;
+        platform::kill_timer(self.window_handle(window)?, timer_id)
+    }
+
+    pub fn enable_window(&self, window: i64, enabled: bool) -> Result<bool, String> {
+        platform::enable_window(self.window_handle(window)?, enabled)
+    }
+
+    pub fn invalidate_window(&self, window: i64, erase: bool) -> Result<bool, String> {
+        platform::invalidate_window(self.window_handle(window)?, erase)
+    }
+
     pub fn set_window_text(&self, window: i64, text: &str) -> Result<bool, String> {
         platform::set_window_text(self.window_handle(window)?, text)
     }
@@ -1875,6 +1905,7 @@ mod platform {
     const WM_NOTIFY: u32 = 0x004e;
     const WM_SETICON: u32 = 0x0080;
     const WM_COMMAND: u32 = 0x0111;
+    const WM_TIMER: u32 = 0x0113;
     const WM_KEYDOWN: u32 = 0x0100;
     const WM_KEYUP: u32 = 0x0101;
     const WM_CHAR: u32 = 0x0102;
@@ -2133,6 +2164,10 @@ mod platform {
         ) -> Handle;
         fn DefWindowProcW(window: Handle, message: u32, wparam: WParam, lparam: LParam) -> LResult;
         fn DestroyWindow(window: Handle) -> i32;
+        fn EnableWindow(window: Handle, enabled: i32) -> i32;
+        fn InvalidateRect(window: Handle, rectangle: *const core::ffi::c_void, erase: i32) -> i32;
+        fn SetTimer(window: Handle, timer_id: usize, interval_ms: u32, callback: Handle) -> usize;
+        fn KillTimer(window: Handle, timer_id: usize) -> i32;
         fn CreateMenu() -> Handle;
         fn CreatePopupMenu() -> Handle;
         fn AppendMenuW(menu: Handle, flags: u32, item: usize, text: *const u16) -> i32;
@@ -2251,6 +2286,7 @@ mod platform {
                 | WM_CLOSE
                 | WM_NOTIFY
                 | WM_COMMAND
+                | WM_TIMER
                 | WM_KEYDOWN
                 | WM_KEYUP
                 | WM_CHAR
@@ -2736,6 +2772,56 @@ mod platform {
                 windows.borrow_mut().remove(&window);
             }
         });
+        Ok(true)
+    }
+
+    pub fn set_timer(window: usize, timer_id: usize, interval_ms: u32) -> Result<bool, String> {
+        if !is_window(window) {
+            return Err("Windows window handle is no longer valid".to_owned());
+        }
+        let timer = unsafe { SetTimer(window as Handle, timer_id, interval_ms, null_mut()) };
+        if timer == 0 {
+            return Err(format!(
+                "SetTimer failed with Windows error {}",
+                last_error()
+            ));
+        }
+        Ok(true)
+    }
+
+    pub fn kill_timer(window: usize, timer_id: usize) -> Result<bool, String> {
+        if !is_window(window) {
+            return Err("Windows window handle is no longer valid".to_owned());
+        }
+        if unsafe { KillTimer(window as Handle, timer_id) } == 0 {
+            return Err(format!(
+                "KillTimer failed with Windows error {}",
+                last_error()
+            ));
+        }
+        Ok(true)
+    }
+
+    pub fn enable_window(window: usize, enabled: bool) -> Result<bool, String> {
+        if !is_window(window) {
+            return Err("Windows window handle is no longer valid".to_owned());
+        }
+        unsafe {
+            EnableWindow(window as Handle, i32::from(enabled));
+        }
+        Ok(true)
+    }
+
+    pub fn invalidate_window(window: usize, erase: bool) -> Result<bool, String> {
+        if !is_window(window) {
+            return Err("Windows window handle is no longer valid".to_owned());
+        }
+        if unsafe { InvalidateRect(window as Handle, null(), i32::from(erase)) } == 0 {
+            return Err(format!(
+                "InvalidateRect failed with Windows error {}",
+                last_error()
+            ));
+        }
         Ok(true)
     }
 
@@ -3615,6 +3701,22 @@ mod platform {
         Err(unavailable())
     }
 
+    pub fn set_timer(_window: usize, _timer_id: usize, _interval_ms: u32) -> Result<bool, String> {
+        Err(unavailable())
+    }
+
+    pub fn kill_timer(_window: usize, _timer_id: usize) -> Result<bool, String> {
+        Err(unavailable())
+    }
+
+    pub fn enable_window(_window: usize, _enabled: bool) -> Result<bool, String> {
+        Err(unavailable())
+    }
+
+    pub fn invalidate_window(_window: usize, _erase: bool) -> Result<bool, String> {
+        Err(unavailable())
+    }
+
     pub fn destroy_icon(_icon: usize) -> Result<(), String> {
         Err(unavailable())
     }
@@ -4101,6 +4203,29 @@ mod tests {
         assert_eq!(event.control_id, 401);
         assert_eq!(event.source, 0);
         assert_eq!(event.code, 0);
+        host.destroy_window(window).unwrap();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn window_timers_are_reported_as_owned_events() {
+        let mut host = WindowsHost::default();
+        let window = host
+            .create_window("APL timer event test", 320, 200)
+            .unwrap();
+        while host.next_event().is_some() {}
+
+        assert!(host.set_timer(window, 601, 10).unwrap());
+        let event = host.wait_event().unwrap().expect("timer event");
+        assert_eq!(event.window, window);
+        assert_eq!(event.message, 0x0113);
+        assert_eq!(event.wparam, 601);
+        assert_eq!(event.source, 0);
+        assert_eq!(event.code, 0);
+        assert!(host.kill_timer(window, 601).unwrap());
+        assert!(host.enable_window(window, false).unwrap());
+        assert!(host.enable_window(window, true).unwrap());
+        assert!(host.invalidate_window(window, false).unwrap());
         host.destroy_window(window).unwrap();
     }
 

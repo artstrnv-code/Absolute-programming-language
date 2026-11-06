@@ -183,6 +183,21 @@ AVInt std::main() {
     VTime window = config.create()
     out ":"
     out window > 0
+    while (windows.next_event() != NONE) (-1) {
+    }
+    out ":"
+    out windows::enable_window(window, false)
+    out ":"
+    out windows::enable_window(window, true)
+    out ":"
+    out windows::invalidate_window(window, false)
+    out ":"
+    out windows::set_timer(window, 601, 10)
+    WindowEvent timer_event = WindowEvent(windows::wait_event())
+    out ":"
+    out timer_event.is_timer(601)
+    out ":"
+    out windows::kill_timer(window, 601)
     Menu menu_bar = Menu(false)
     Menu file_menu = Menu(true)
     file_menu.item(201, "Open")
@@ -311,7 +326,7 @@ fn windows_library_runs_through_portable_and_native_paths() {
     let expected = if cfg!(windows) {
         std::iter::once("true")
             .chain(std::iter::once("4"))
-            .chain(std::iter::repeat("true").take(51))
+            .chain(std::iter::repeat("true").take(57))
             .collect::<Vec<_>>()
             .join(":")
     } else {

@@ -2223,6 +2223,59 @@ impl<'a, 'debug> Runtime<'a, 'debug> {
                     ProtectionLevel::Av,
                 ))
             }
+            "windows_set_timer" => {
+                let changed = self
+                    .windows
+                    .set_timer(
+                        runtime_int(&args[0], "windows::set_timer window")?,
+                        runtime_int(&args[1], "windows::set_timer timer_id")?,
+                        runtime_int(&args[2], "windows::set_timer interval_ms")?,
+                    )
+                    .map_err(RuntimeError::Message)?;
+                Ok(RuntimeValue::new(
+                    RuntimeData::Bool(changed),
+                    ProtectionLevel::Av,
+                ))
+            }
+            "windows_kill_timer" => {
+                let changed = self
+                    .windows
+                    .kill_timer(
+                        runtime_int(&args[0], "windows::kill_timer window")?,
+                        runtime_int(&args[1], "windows::kill_timer timer_id")?,
+                    )
+                    .map_err(RuntimeError::Message)?;
+                Ok(RuntimeValue::new(
+                    RuntimeData::Bool(changed),
+                    ProtectionLevel::Av,
+                ))
+            }
+            "windows_enable_window" => {
+                let changed = self
+                    .windows
+                    .enable_window(
+                        runtime_int(&args[0], "windows::enable_window window")?,
+                        runtime_bool_value(&args[1], "windows::enable_window enabled")?,
+                    )
+                    .map_err(RuntimeError::Message)?;
+                Ok(RuntimeValue::new(
+                    RuntimeData::Bool(changed),
+                    ProtectionLevel::Av,
+                ))
+            }
+            "windows_invalidate_window" => {
+                let changed = self
+                    .windows
+                    .invalidate_window(
+                        runtime_int(&args[0], "windows::invalidate_window window")?,
+                        runtime_bool_value(&args[1], "windows::invalidate_window erase")?,
+                    )
+                    .map_err(RuntimeError::Message)?;
+                Ok(RuntimeValue::new(
+                    RuntimeData::Bool(changed),
+                    ProtectionLevel::Av,
+                ))
+            }
             "windows_destroy_icon" => {
                 let destroyed = self
                     .windows

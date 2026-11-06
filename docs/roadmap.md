@@ -35,7 +35,9 @@ counter and tainting effects performed under it.
     loop are also implemented. Native PE metadata and configurable application
     icons are linked into generated executables. Fixed WNDPROC, enumeration,
     timer, and thread callback endpoints are capability-gated and queued;
-    synchronous callback dispatch into arbitrary APL functions remains.
+    owned window timers, control enablement, and client invalidation are also
+    available for Studio orchestration. Synchronous callback dispatch into
+    arbitrary APL functions remains.
 5. After the Windows acceptance layer, remove the Rust bridge from the
    APL-written compiler path, then implement the Linux system backend.
 

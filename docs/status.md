@@ -124,6 +124,9 @@ Updated: 2026-11-06.
   queue foreign invocations without reentering the VM; direct synchronous APL
   function callbacks remain. Its current FFI supports integer/pointer
   signatures only and uses a fixed sixteen-argument bootstrap dispatcher.
+  Owned window timers now feed `WM_TIMER` through the decoded event queue, and
+  window/control enable plus invalidation operations cover Studio debounce and
+  repaint orchestration without exposing raw HWNDs.
 
 ## Open Regressions
 

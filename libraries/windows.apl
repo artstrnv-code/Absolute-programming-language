@@ -56,6 +56,7 @@ AVInt windows.WM_KEYDOWN = 256
 AVInt windows.WM_KEYUP = 257
 AVInt windows.WM_CHAR = 258
 AVInt windows.WM_COMMAND = 273
+AVInt windows.WM_TIMER = 275
 AVInt windows.WM_MOUSEMOVE = 512
 AVInt windows.WM_LBUTTONDOWN = 513
 AVInt windows.WM_LBUTTONUP = 514
@@ -170,6 +171,10 @@ class WindowEvent {
 
   func is_accelerator(command_id) {
     return (((self.message == 273) and (self.source == 0)) and (self.code == 1)) and (self.control_id == command_id)
+  }
+
+  func is_timer(timer_id) {
+    return (self.message == 275) and (self.wparam == timer_id)
   }
 
   func is_notification(control, code) {
@@ -339,6 +344,7 @@ class WindowApplication {
   AVInt _message_close = 16
   AVInt _message_notify = 78
   AVInt _message_command = 273
+  AVInt _message_timer = 275
 
   func __init__(window) {
     self.window = window
@@ -389,6 +395,9 @@ class WindowApplication {
     if event.message == self._message_notify {
       return self.on_notification(raw)
     }
+    if event.message == self._message_timer {
+      return self.on_timer(raw)
+    }
     return true
   }
 
@@ -417,6 +426,10 @@ class WindowApplication {
   }
 
   func on_notification(raw) {
+    return true
+  }
+
+  func on_timer(raw) {
     return true
   }
 
@@ -543,6 +556,22 @@ func windows.set_window_icon(window, icon) {
 
 func windows.set_deferred_close(window, enabled) {
   return std::windows_set_deferred_close(window, enabled)
+}
+
+func windows.set_timer(window, timer_id, interval_ms) {
+  return std::windows_set_timer(window, timer_id, interval_ms)
+}
+
+func windows.kill_timer(window, timer_id) {
+  return std::windows_kill_timer(window, timer_id)
+}
+
+func windows.enable_window(window, enabled) {
+  return std::windows_enable_window(window, enabled)
+}
+
+func windows.invalidate_window(window, erase) {
+  return std::windows_invalidate_window(window, erase)
 }
 
 func windows.destroy_icon(icon) {
