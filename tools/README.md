@@ -8,7 +8,8 @@
   builds discover this generated workspace directory automatically. Module
   dependencies are resolved through a clean compiler staging directory beside
   the selected internal CLI instead of source-adjacent or previously generated
-  artifacts.
+  artifacts. The script exercises the same `apl build-lib` command exposed to
+  library authors.
 - `build_release.ps1` creates the complete `dist/package/` payload, portable
   Windows ZIP, and SHA-256 checksum, after verifying the staged payload.
 - `build_installer.ps1` builds the Inno Setup installer from that payload.

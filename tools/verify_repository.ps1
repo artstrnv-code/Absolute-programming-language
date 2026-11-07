@@ -69,10 +69,13 @@ $markdownFiles = Invoke-Git @("ls-files", "--", "*.md")
 $brokenLinks = @()
 foreach ($markdownRelativePath in $markdownFiles) {
     $markdownPath = Join-Path $root $markdownRelativePath
-    $markdown = Get-Content -LiteralPath $markdownPath -Raw
+    $markdown = Get-Content -LiteralPath $markdownPath -Raw -Encoding UTF8
     $links = [regex]::Matches($markdown, '\[[^\]]*\]\(([^)]+)\)')
     foreach ($link in $links) {
         $target = $link.Groups[1].Value.Trim()
+        if ($target.StartsWith('<') -and $target.EndsWith('>')) {
+            $target = $target.Substring(1, $target.Length - 2)
+        }
         if ($target -match '^(?i)(https?://|mailto:|#)') {
             continue
         }

@@ -55,7 +55,7 @@ $libraries = Get-ChildItem -LiteralPath (Join-Path $root "libraries") -Filter "*
 foreach ($library in $libraries) {
     $source = Join-Path $root "libraries\$library.apl"
     $artifact = Join-Path $OutputDirectory "$library.aplmod"
-    & $cli emit-module $source $artifact
+    & $cli build-lib $source $artifact
     if ($LASTEXITCODE -ne 0) {
         throw "Failed to compile library '$library'."
     }

@@ -321,6 +321,54 @@ fn check_flag_uses_the_portable_apl_pipeline() {
 }
 
 #[test]
+fn build_lib_defaults_to_a_source_adjacent_module_and_links_it() {
+    let project = TestProject::new();
+    let source = project.path("libraries").join("sample.apl");
+    let artifact = source.with_extension("aplmod");
+    let main = project.path("main.apl");
+    fs::write(&source, "func sample.answer() {\n  return 42\n}").unwrap();
+    fs::write(
+        &main,
+        "include >> sample\nAVInt std::main() {\n  out sample::answer()\n  return 0\n}",
+    )
+    .unwrap();
+
+    let built = apl().arg("build-lib").arg(&source).output().unwrap();
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    assert!(artifact.is_file(), "{}", artifact.display());
+    assert_eq!(
+        String::from_utf8(built.stdout).unwrap(),
+        format!("built library: {}\n", artifact.display())
+    );
+
+    let run = apl().arg("run").arg(&main).output().unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8(run.stdout).unwrap(), "42");
+
+    let explicit = project.path("explicit.aplmod");
+    let rebuilt = apl()
+        .arg("build-lib")
+        .arg(&source)
+        .arg(&explicit)
+        .output()
+        .unwrap();
+    assert!(
+        rebuilt.status.success(),
+        "{}",
+        String::from_utf8_lossy(&rebuilt.stderr)
+    );
+    assert!(explicit.is_file(), "{}", explicit.display());
+}
+
+#[test]
 fn portable_match_while_handlers_and_error_return_are_end_to_end() {
     let project = TestProject::new();
     let main = project.path("control.apl");

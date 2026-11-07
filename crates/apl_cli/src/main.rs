@@ -137,6 +137,37 @@ fn main() {
                 Err(error) => exit_compile_error("emit-module", error),
             }
         }
+        "build-lib" => {
+            let Some(path) = args.next() else {
+                eprintln!("missing library source path");
+                process::exit(2);
+            };
+            if Path::new(&path)
+                .extension()
+                .and_then(|value| value.to_str())
+                != Some("apl")
+            {
+                eprintln!("build-lib source must use the `.apl` extension");
+                process::exit(2);
+            }
+            let output_path = args
+                .next()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| Path::new(&path).with_extension("aplmod"));
+            if output_path.extension().and_then(|value| value.to_str()) != Some("aplmod") {
+                eprintln!("build-lib output must use the `.aplmod` extension");
+                process::exit(2);
+            }
+            if let Some(extra) = args.next() {
+                eprintln!("unexpected build-lib argument `{extra}`");
+                process::exit(2);
+            }
+
+            match apl_compiler::emit_module_artifact_file(Path::new(&path), &output_path) {
+                Ok(()) => println!("built library: {}", output_path.display()),
+                Err(error) => exit_compile_error("build-lib", error),
+            }
+        }
         "emit-standard-module" => {
             let output_path = args
                 .next()
@@ -616,7 +647,7 @@ fn read_input_arguments(args: &mut impl Iterator<Item = String>) -> Vec<String> 
 
 fn print_usage() {
     eprintln!(
-        "usage: apl --check <file>\n       apl <check|run|emit|run-ir|emit-module|emit-standard-module|emit-bootstrap-compiler|extend-module|emit-linked|emit-linked-module|emit-linked-bootstrap|emit-linked-native-bootstrap|run-linked|inspect-linked|emit-native-ir|inspect-native-ir|emit-assembly|emit-assembly-native|build-native|compile-native|build-native-linked|compile-native-linked|build-native-bootstrap|compile-native-bootstrap|build-native-toolchain|compile-native-toolchain|build-native-selfhost|compile-native-selfhost|build|compile|build-linked|compile-linked|build-host|compile-host> <file> [-- -1 value -2 value ...]"
+        "usage: apl --check <file>\n       apl build-lib <source.apl> [output.aplmod]\n       apl <check|run|emit|run-ir|emit-module|emit-standard-module|emit-bootstrap-compiler|extend-module|emit-linked|emit-linked-module|emit-linked-bootstrap|emit-linked-native-bootstrap|run-linked|inspect-linked|emit-native-ir|inspect-native-ir|emit-assembly|emit-assembly-native|build-native|compile-native|build-native-linked|compile-native-linked|build-native-bootstrap|compile-native-bootstrap|build-native-toolchain|compile-native-toolchain|build-native-selfhost|compile-native-selfhost|build|compile|build-linked|compile-linked|build-host|compile-host> <file> [-- -1 value -2 value ...]"
     );
 }
 

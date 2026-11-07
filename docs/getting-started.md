@@ -104,6 +104,20 @@ Use `math::sqrt`, open one namespace with `using namespace math`, or use `nc`
 for several libraries whose export sets do not conflict. The linker checks
 those claims instead of accepting ambiguous names.
 
+Build a library source into a neighboring `.aplmod`:
+
+```powershell
+apl build-lib .\libraries\sample.apl
+```
+
+An explicit destination is optional:
+
+```powershell
+apl build-lib .\libraries\sample.apl .\package\sample.aplmod
+```
+
+`emit-module` remains available as the low-level module-emitter command.
+
 ## Portable And Native Paths
 
 `run` uses the APL-written frontend, linked artifact, and portable VM. In
