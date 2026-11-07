@@ -1593,6 +1593,39 @@ pub unsafe extern "C" fn apl_rt_builtin_windows_invalidate_window(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn apl_rt_builtin_windows_client_size(
+    context: *mut NativeContext,
+    _targets: *const *const AbiRecord,
+) -> i32 {
+    builtin(context, 1, |context, args| {
+        let (width, height) = context
+            .windows
+            .client_size(native_int(&args[0], "windows::client_size window")?)?;
+        Ok(Value::list(vec![
+            Value::new(Data::Int(width), Protection::Av),
+            Value::new(Data::Int(height), Protection::Av),
+        ]))
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn apl_rt_builtin_windows_set_minimum_size(
+    context: *mut NativeContext,
+    _targets: *const *const AbiRecord,
+) -> i32 {
+    builtin(context, 3, |context, args| {
+        Ok(Value::new(
+            Data::Bool(context.windows.set_minimum_size(
+                native_int(&args[0], "windows::set_minimum_size window")?,
+                native_int(&args[1], "windows::set_minimum_size width")?,
+                native_int(&args[2], "windows::set_minimum_size height")?,
+            )?),
+            Protection::Av,
+        ))
+    })
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn apl_rt_builtin_windows_destroy_icon(
     context: *mut NativeContext,
     _targets: *const *const AbiRecord,

@@ -33,6 +33,15 @@ events have message `WM_TIMER`, carry `timer_id` in `wparam`, and are recognized
 by `WindowEvent.is_timer(timer_id)`. `WindowApplication` routes them to
 `on_timer(raw)`. `windows::kill_timer(window, timer_id)` stops the timer.
 
+`windows::client_size(window)` returns the current drawable client area as
+`[width, height]`. `windows::set_minimum_size(window, width, height)` installs
+a positive minimum tracking size; passing zero for both dimensions clears it.
+Mixed zero/positive and negative dimensions are rejected. `WindowConfig`
+exposes the same policy through `minimum_width` and `minimum_height`, both zero
+by default, and applies it during `create()`. The host handles
+`WM_GETMINMAXINFO` internally: neither `RECT`, `MINMAXINFO`, nor an `HWND`
+pointer crosses the APL boundary.
+
 The module metadata declares `windows -> classes`. The compiler resolves this
 dependency transitively and independently of source `include` order. Class
 surface metadata is carried by `.aplmod`, so `WindowConfig` remains a real
@@ -279,8 +288,9 @@ wrapper instead of pretending that queued dispatch is synchronous.
   common Win32 widths. `qword` covers the nonnegative half representable by
   APL `Int`; values above signed 64-bit range need a future unsigned value type.
 - `windows::bool(value)` returns Win32 `TRUE` or `FALSE`.
-- `WindowConfig` supplies editable `title`, `width`, `height`, and optional
-  icon identity fields plus a `create()` method. It is a high-level
+- `WindowConfig` supplies editable `title`, `width`, `height`, optional
+  `minimum_width`/`minimum_height`, icon, and accelerator identity fields plus
+  a `create()` method. It is a high-level
   configuration object and avoids
   repeating the low-level creation arguments at every call site.
 - `ControlConfig` supplies editable class, text, numeric ID, position, size,

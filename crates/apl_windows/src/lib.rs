@@ -857,6 +857,32 @@ impl WindowsHost {
         platform::invalidate_window(self.window_handle(window)?, erase)
     }
 
+    pub fn client_size(&self, window: i64) -> Result<(i64, i64), String> {
+        platform::client_size(self.window_handle(window)?)
+            .map(|(width, height)| (i64::from(width), i64::from(height)))
+    }
+
+    pub fn set_minimum_size(&self, window: i64, width: i64, height: i64) -> Result<bool, String> {
+        let size = if width == 0 && height == 0 {
+            None
+        } else {
+            let width = i32::try_from(width)
+                .ok()
+                .filter(|width| *width > 0)
+                .ok_or_else(|| {
+                    "minimum window width must be positive or both sizes must be zero".to_owned()
+                })?;
+            let height = i32::try_from(height)
+                .ok()
+                .filter(|height| *height > 0)
+                .ok_or_else(|| {
+                    "minimum window height must be positive or both sizes must be zero".to_owned()
+                })?;
+            Some((width, height))
+        };
+        platform::set_minimum_size(self.window_handle(window)?, size)
+    }
+
     pub fn set_window_text(&self, window: i64, text: &str) -> Result<bool, String> {
         platform::set_window_text(self.window_handle(window)?, text)
     }
@@ -1902,6 +1928,7 @@ mod platform {
     const WM_SIZE: u32 = 0x0005;
     const WM_CLOSE: u32 = 0x0010;
     const WM_QUIT: u32 = 0x0012;
+    const WM_GETMINMAXINFO: u32 = 0x0024;
     const WM_NOTIFY: u32 = 0x004e;
     const WM_SETICON: u32 = 0x0080;
     const WM_COMMAND: u32 = 0x0111;
@@ -1921,6 +1948,7 @@ mod platform {
         static EVENTS: RefCell<VecDeque<RawWindowEvent>> = const { RefCell::new(VecDeque::new()) };
         static DEFERRED_CLOSES: RefCell<BTreeSet<usize>> = const { RefCell::new(BTreeSet::new()) };
         static ACCELERATORS: RefCell<BTreeMap<usize, usize>> = const { RefCell::new(BTreeMap::new()) };
+        static MINIMUM_SIZES: RefCell<BTreeMap<usize, (i32, i32)>> = const { RefCell::new(BTreeMap::new()) };
     }
 
     pub struct RawWindowEvent {
@@ -1937,6 +1965,23 @@ mod platform {
     struct Point {
         x: i32,
         y: i32,
+    }
+
+    #[repr(C)]
+    struct Rect {
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+    }
+
+    #[repr(C)]
+    struct MinMaxInfo {
+        reserved: Point,
+        maximum_size: Point,
+        maximum_position: Point,
+        minimum_track_size: Point,
+        maximum_track_size: Point,
     }
 
     #[repr(C)]
@@ -2165,6 +2210,7 @@ mod platform {
         fn DefWindowProcW(window: Handle, message: u32, wparam: WParam, lparam: LParam) -> LResult;
         fn DestroyWindow(window: Handle) -> i32;
         fn EnableWindow(window: Handle, enabled: i32) -> i32;
+        fn GetClientRect(window: Handle, rectangle: *mut Rect) -> i32;
         fn InvalidateRect(window: Handle, rectangle: *const core::ffi::c_void, erase: i32) -> i32;
         fn SetTimer(window: Handle, timer_id: usize, interval_ms: u32, callback: Handle) -> usize;
         fn KillTimer(window: Handle, timer_id: usize) -> i32;
@@ -2224,6 +2270,16 @@ mod platform {
         wparam: WParam,
         lparam: LParam,
     ) -> LResult {
+        if message == WM_GETMINMAXINFO && lparam != 0 {
+            let minimum =
+                MINIMUM_SIZES.with(|sizes| sizes.borrow().get(&(window as usize)).copied());
+            if let Some((width, height)) = minimum {
+                let info = unsafe { &mut *(lparam as *mut MinMaxInfo) };
+                info.minimum_track_size.x = width;
+                info.minimum_track_size.y = height;
+                return 0;
+            }
+        }
         if captures_event(message) {
             let (source, code, control_id) = if message == WM_COMMAND {
                 (
@@ -2256,6 +2312,9 @@ mod platform {
         if message == WM_DESTROY {
             ACCELERATORS.with(|accelerators| {
                 accelerators.borrow_mut().remove(&(window as usize));
+            });
+            MINIMUM_SIZES.with(|sizes| {
+                sizes.borrow_mut().remove(&(window as usize));
             });
             DEFERRED_CLOSES.with(|windows| {
                 windows.borrow_mut().remove(&(window as usize));
@@ -2823,6 +2882,52 @@ mod platform {
             ));
         }
         Ok(true)
+    }
+
+    pub fn client_size(window: usize) -> Result<(i32, i32), String> {
+        if !is_window(window) {
+            return Err("Windows window handle is no longer valid".to_owned());
+        }
+        let mut rectangle: Rect = unsafe { zeroed() };
+        if unsafe { GetClientRect(window as Handle, &mut rectangle) } == 0 {
+            return Err(format!(
+                "GetClientRect failed with Windows error {}",
+                last_error()
+            ));
+        }
+        Ok((
+            (rectangle.right - rectangle.left).max(0),
+            (rectangle.bottom - rectangle.top).max(0),
+        ))
+    }
+
+    pub fn set_minimum_size(window: usize, size: Option<(i32, i32)>) -> Result<bool, String> {
+        if !is_window(window) {
+            return Err("Windows window handle is no longer valid".to_owned());
+        }
+        MINIMUM_SIZES.with(|sizes| {
+            let mut sizes = sizes.borrow_mut();
+            if let Some(size) = size {
+                sizes.insert(window, size);
+            } else {
+                sizes.remove(&window);
+            }
+        });
+        Ok(true)
+    }
+
+    #[cfg(test)]
+    pub fn queried_minimum_size(window: usize) -> (i32, i32) {
+        let mut info: MinMaxInfo = unsafe { zeroed() };
+        unsafe {
+            SendMessageW(
+                window as Handle,
+                WM_GETMINMAXINFO,
+                0,
+                (&mut info as *mut MinMaxInfo) as LParam,
+            );
+        }
+        (info.minimum_track_size.x, info.minimum_track_size.y)
     }
 
     pub fn destroy_icon(icon: usize) -> Result<(), String> {
@@ -3717,6 +3822,14 @@ mod platform {
         Err(unavailable())
     }
 
+    pub fn client_size(_window: usize) -> Result<(i32, i32), String> {
+        Err(unavailable())
+    }
+
+    pub fn set_minimum_size(_window: usize, _size: Option<(i32, i32)>) -> Result<bool, String> {
+        Err(unavailable())
+    }
+
     pub fn destroy_icon(_icon: usize) -> Result<(), String> {
         Err(unavailable())
     }
@@ -4226,6 +4339,14 @@ mod tests {
         assert!(host.enable_window(window, false).unwrap());
         assert!(host.enable_window(window, true).unwrap());
         assert!(host.invalidate_window(window, false).unwrap());
+        let (width, height) = host.client_size(window).unwrap();
+        assert!(width > 0 && height > 0);
+        assert!(host.set_minimum_size(window, 320, 200).unwrap());
+        assert_eq!(
+            platform::queried_minimum_size(host.window_handle(window).unwrap()),
+            (320, 200)
+        );
+        assert!(host.set_minimum_size(window, 0, 0).unwrap());
         host.destroy_window(window).unwrap();
     }
 

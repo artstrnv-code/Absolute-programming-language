@@ -1,6 +1,6 @@
 # Implementation Status
 
-Updated: 2026-11-06.
+Updated: 2026-11-07.
 
 ## Implemented
 
@@ -126,7 +126,9 @@ Updated: 2026-11-06.
   signatures only and uses a fixed sixteen-argument bootstrap dispatcher.
   Owned window timers now feed `WM_TIMER` through the decoded event queue, and
   window/control enable plus invalidation operations cover Studio debounce and
-  repaint orchestration without exposing raw HWNDs.
+  repaint orchestration without exposing raw HWNDs. Client-area queries and
+  owned minimum-size constraints provide resize/layout state without exposing
+  `RECT` or `MINMAXINFO` pointers.
 
 ## Open Regressions
 

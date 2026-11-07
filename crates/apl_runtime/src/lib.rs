@@ -2276,6 +2276,30 @@ impl<'a, 'debug> Runtime<'a, 'debug> {
                     ProtectionLevel::Av,
                 ))
             }
+            "windows_client_size" => {
+                let (width, height) = self
+                    .windows
+                    .client_size(runtime_int(&args[0], "windows::client_size window")?)
+                    .map_err(RuntimeError::Message)?;
+                Ok(RuntimeValue::list(vec![
+                    RuntimeValue::new(RuntimeData::Int(width), ProtectionLevel::Av),
+                    RuntimeValue::new(RuntimeData::Int(height), ProtectionLevel::Av),
+                ]))
+            }
+            "windows_set_minimum_size" => {
+                let changed = self
+                    .windows
+                    .set_minimum_size(
+                        runtime_int(&args[0], "windows::set_minimum_size window")?,
+                        runtime_int(&args[1], "windows::set_minimum_size width")?,
+                        runtime_int(&args[2], "windows::set_minimum_size height")?,
+                    )
+                    .map_err(RuntimeError::Message)?;
+                Ok(RuntimeValue::new(
+                    RuntimeData::Bool(changed),
+                    ProtectionLevel::Av,
+                ))
+            }
             "windows_destroy_icon" => {
                 let destroyed = self
                     .windows

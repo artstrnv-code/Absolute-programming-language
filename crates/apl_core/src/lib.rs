@@ -1490,6 +1490,8 @@ impl Checker {
             | "windows_kill_timer"
             | "windows_enable_window"
             | "windows_invalidate_window"
+            | "windows_client_size"
+            | "windows_set_minimum_size"
             | "windows_create_accelerators"
             | "windows_set_accelerators"
             | "windows_destroy_accelerators"
@@ -1527,6 +1529,7 @@ impl Checker {
                     | "windows_event_mask"
                     | "windows_first_visible_line"
                     | "windows_focus"
+                    | "windows_client_size"
                     | "windows_create_menu"
                     | "windows_append_menu_separator"
                     | "windows_destroy_menu"
@@ -1557,7 +1560,8 @@ impl Checker {
                     | "windows_append_submenu"
                     | "windows_set_menu_item_enabled"
                     | "windows_set_menu_item_checked"
-                    | "windows_set_timer" => 3,
+                    | "windows_set_timer"
+                    | "windows_set_minimum_size" => 3,
                     "windows_load_icon" | "windows_load_resource_icon" => 3,
                     "windows_get_procedure"
                     | "windows_set_text_color"
@@ -1630,6 +1634,7 @@ impl Checker {
                     | "windows_kill_timer"
                     | "windows_enable_window"
                     | "windows_invalidate_window"
+                    | "windows_set_minimum_size"
                     | "windows_set_accelerators"
                     | "windows_destroy_accelerators" => ValueType::Bool,
                     "windows_get_procedure"
@@ -1639,6 +1644,7 @@ impl Checker {
                     | "windows_poll_process"
                     | "windows_wait_process"
                     | "windows_terminate_process" => ValueType::List,
+                    "windows_client_size" => ValueType::List,
                     "windows_utf16" => ValueType::Bytes,
                     "windows_window_text" => ValueType::Str,
                     _ => ValueType::Int,
@@ -2478,6 +2484,8 @@ const STANDARD_EXPORTS: &[&str] = &[
     "windows_kill_timer",
     "windows_enable_window",
     "windows_invalidate_window",
+    "windows_client_size",
+    "windows_set_minimum_size",
     "windows_create_accelerators",
     "windows_set_accelerators",
     "windows_destroy_accelerators",

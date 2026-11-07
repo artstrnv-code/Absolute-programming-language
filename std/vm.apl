@@ -954,6 +954,9 @@ func vm.is_builtin_call(name) {
   if (((name == "windows_set_timer") or (name == "windows_kill_timer")) or (name == "windows_enable_window")) or (name == "windows_invalidate_window") {
     return true
   }
+  if (name == "windows_client_size") or (name == "windows_set_minimum_size") {
+    return true
+  }
   if ((name == "windows_create_accelerators") or (name == "windows_set_accelerators")) or (name == "windows_destroy_accelerators") {
     return true
   }
@@ -1396,6 +1399,12 @@ func vm.call_builtin(name, arg_exprs, env, output, functions) {
   }
   if name == "windows_invalidate_window" {
     return vm.expr_ok(std::windows_invalidate_window(get(args, 0), get(args, 1)), env, output, "AV")
+  }
+  if name == "windows_client_size" {
+    return vm.expr_ok(std::windows_client_size(get(args, 0)), env, output, "AV")
+  }
+  if name == "windows_set_minimum_size" {
+    return vm.expr_ok(std::windows_set_minimum_size(get(args, 0), get(args, 1), get(args, 2)), env, output, "AV")
   }
   if name == "windows_create_accelerators" {
     return vm.expr_ok(std::windows_create_accelerators(get(args, 0)), env, output, "AV")

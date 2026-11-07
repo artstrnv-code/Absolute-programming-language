@@ -15,7 +15,9 @@ asynchronous process streaming/cancellation, and the overridable
 `WindowApplication` loop are implemented. Native builds also link APL metadata
 and an optional application icon. Fixed Win32 callback trampolines can safely
 queue WNDPROC, enumeration, timer, and thread invocations. Remaining Windows
-work is synchronous callback dispatch into arbitrary APL functions.
+work is synchronous callback dispatch into arbitrary APL functions. Owned
+client-size queries and minimum-size constraints now cover the first
+resize/layout contract needed by an APL-written Studio.
 
 Current priorities:
 
@@ -129,7 +131,9 @@ and initial-condition `while else`, plus non-catchable
 - Window timers are owned through the same checked window identities and emit
   decoded `WM_TIMER` events. Enable/disable and whole-client invalidation are
   exposed without accepting raw HWNDs, covering Studio highlight debounce and
-  repaint scheduling.
+  repaint scheduling. Client-area queries return ordinary dimensions, while
+  minimum-size constraints are enforced through an internal
+  `WM_GETMINMAXINFO` handler without exposing pointer-bearing Win32 structs.
 - Windows owns asynchronous child-process identities as well. Polling exposes
   accumulated stdout/stderr without blocking; wait and terminate consume the
   identity and return the same `ProcessResult` shape as synchronous execution.

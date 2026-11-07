@@ -179,10 +179,17 @@ AVInt std::main() {
     config.title = "APL test"
     config.width = 320
     config.height = 200
+    config.minimum_width = 240
+    config.minimum_height = 160
     config.accelerators = shortcuts.identity
     VTime window = config.create()
     out ":"
     out window > 0
+    VTime client = windows::client_size(window)
+    out ":"
+    out (std::get(client, 0) > 0) and (std::get(client, 1) > 0)
+    out ":"
+    out windows::set_minimum_size(window, 320, 200)
     while (windows.next_event() != NONE) (-1) {
     }
     out ":"
@@ -326,7 +333,7 @@ fn windows_library_runs_through_portable_and_native_paths() {
     let expected = if cfg!(windows) {
         std::iter::once("true")
             .chain(std::iter::once("4"))
-            .chain(std::iter::repeat("true").take(57))
+            .chain(std::iter::repeat("true").take(59))
             .collect::<Vec<_>>()
             .join(":")
     } else {

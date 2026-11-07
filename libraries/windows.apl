@@ -97,6 +97,8 @@ class WindowConfig {
   AVStr title = "APL"
   AVInt width = 960
   AVInt height = 640
+  AVInt minimum_width = 0
+  AVInt minimum_height = 0
   AVInt icon = 0
   AVInt accelerators = 0
 
@@ -105,6 +107,9 @@ class WindowConfig {
 
   func create() {
     VTime window = windows.create_window(self.title, self.width, self.height)
+    if (self.minimum_width != 0) or (self.minimum_height != 0) {
+      windows.set_minimum_size(window, self.minimum_width, self.minimum_height)
+    }
     if self.icon != 0 {
       windows.set_window_icon(window, self.icon)
     }
@@ -572,6 +577,14 @@ func windows.enable_window(window, enabled) {
 
 func windows.invalidate_window(window, erase) {
   return std::windows_invalidate_window(window, erase)
+}
+
+func windows.client_size(window) {
+  return std::windows_client_size(window)
+}
+
+func windows.set_minimum_size(window, width, height) {
+  return std::windows_set_minimum_size(window, width, height)
 }
 
 func windows.destroy_icon(icon) {

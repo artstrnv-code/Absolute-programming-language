@@ -207,6 +207,12 @@ func verifier.builtin_arity(name) {
   if ((name == "windows_kill_timer") or (name == "windows_enable_window")) or (name == "windows_invalidate_window") {
     return 2
   }
+  if name == "windows_client_size" {
+    return 1
+  }
+  if name == "windows_set_minimum_size" {
+    return 3
+  }
   if (name == "windows_create_accelerators") or (name == "windows_destroy_accelerators") {
     return 1
   }
