@@ -210,6 +210,8 @@ Generated data lives under `build/`, `target/`, and `dist/`. It is not source.
 
 ## Documentation
 
+- [Getting started](docs/getting-started.md)
+- [Russian user manual](docs/manual/README.md)
 - [Language reference](docs/language.md)
 - [Current implementation status](docs/status.md)
 - [Compiler architecture](docs/architecture.md)

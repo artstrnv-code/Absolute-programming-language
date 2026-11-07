@@ -218,8 +218,6 @@ Notes:
 Highest precedence is listed last in this table:
 
 ```text
-or
-and
 one comparison: == != > < >= <=
 + -
 * / %
@@ -246,8 +244,10 @@ index_or_slice = expr
 ```
 
 - Chained comparisons are not valid.
-- Nontrivial operands of `and`/`or` must be parenthesized. Valid example:
-  `(x < 4) and (y != 0)`.
+- `and` and `or` have no source-level precedence contract. Nontrivial operands
+  must be parenthesized, and nested logical combinations must be grouped to
+  state their order explicitly. Valid examples: `(x < 4) and (y != 0)` and
+  `((x < 4) and (y != 0)) or (ready)`.
 - Indexes and slice bounds/steps are integers; negative indexes and negative
   steps are implemented. A zero step is invalid at runtime.
 - `**` exponent must be an integer. Base may be Int or Float.

@@ -7,10 +7,13 @@ use std::{
 
 fn main() {
     let mut args = env::args().skip(1);
-    let Some(command) = args.next() else {
+    let Some(mut command) = args.next() else {
         print_usage();
         process::exit(2);
     };
+    if command == "--check" {
+        command = "check".to_owned();
+    }
 
     match command.as_str() {
         "check" | "run" => {
@@ -613,7 +616,7 @@ fn read_input_arguments(args: &mut impl Iterator<Item = String>) -> Vec<String> 
 
 fn print_usage() {
     eprintln!(
-        "usage: apl <check|run|emit|run-ir|emit-module|emit-standard-module|emit-bootstrap-compiler|extend-module|emit-linked|emit-linked-module|emit-linked-bootstrap|emit-linked-native-bootstrap|run-linked|inspect-linked|emit-native-ir|inspect-native-ir|emit-assembly|emit-assembly-native|build-native|compile-native|build-native-linked|compile-native-linked|build-native-bootstrap|compile-native-bootstrap|build-native-toolchain|compile-native-toolchain|build-native-selfhost|compile-native-selfhost|build|compile|build-linked|compile-linked|build-host|compile-host> <file> [-- -1 value -2 value ...]"
+        "usage: apl --check <file>\n       apl <check|run|emit|run-ir|emit-module|emit-standard-module|emit-bootstrap-compiler|extend-module|emit-linked|emit-linked-module|emit-linked-bootstrap|emit-linked-native-bootstrap|run-linked|inspect-linked|emit-native-ir|inspect-native-ir|emit-assembly|emit-assembly-native|build-native|compile-native|build-native-linked|compile-native-linked|build-native-bootstrap|compile-native-bootstrap|build-native-toolchain|compile-native-toolchain|build-native-selfhost|compile-native-selfhost|build|compile|build-linked|compile-linked|build-host|compile-host> <file> [-- -1 value -2 value ...]"
     );
 }
 

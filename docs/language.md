@@ -2,6 +2,27 @@
 
 This is a compact current reference, not a future-language proposal.
 
+## Source Text
+
+Identifiers use ASCII letters, digits, and `_`; the first character cannot be
+a digit. Strings may contain Unicode. `#` starts a comment through the end of
+the line.
+
+APL has no semicolons. A statement ends at a newline or at end of file. Several
+statements cannot be placed on one line. A block body starts on the line after
+`{`, and its closing `}` is on a later line after the final statement. Newlines
+inside unfinished parentheses or brackets continue that expression.
+
+```apl
+# This is one statement.
+AVInt total = (2 +
+  3) * 4
+```
+
+Integer literals must fit signed 64-bit range. A Float literal requires digits
+on both sides of its decimal point. String escapes are `\n`, `\r`, `\t`, `\0`,
+`\\`, and `\"`; an unknown escape is a parse error.
+
 ## Executables
 
 An executable declares exactly one entrypoint and returns public `AVInt`:
@@ -31,6 +52,108 @@ VTime value = std::int("42")
 `NONE`; known impossible typed operations are rejected by the checker. Finite
 Float-to-Int conversion truncates toward zero. JSON conversion and typed JSON
 input validate the complete value and return `NONE` for malformed JSON.
+
+Absolute variables keep their declaration type and protection level. `VTime`
+holds a dynamic value and is intended for values whose concrete type is not
+known at the declaration site. `List` is declared separately; its effective
+protection follows the values placed in it.
+
+`=self=` checks whether a public absolute variable still equals its initial
+value:
+
+```apl
+AVInt port = 8080
+out port =self=   # true
+port += 1
+out port =self=   # false
+```
+
+It is not assignment syntax. The current checker permits it only for AV
+absolute variables, not ASV/SASV values, `VTime`, lists, classes, or structs.
+
+## Input
+
+Each `input` expression consumes the next numbered input slot. On the CLI,
+slots may be supplied after `--`:
+
+```powershell
+.\apl.exe run .\program.apl -- -1 12 -2 "text"
+```
+
+`-1` supplies the first `input`, `-2` the second, and so on. Order on the
+command line does not matter, but every flag must have one value and duplicate
+flags are rejected. A slot without a flag reads the next line from standard
+input. Supplying one slot by flag does not consume a standard-input line.
+
+`secret input` deliberately cannot be supplied by a process argument because
+arguments are visible to the operating system and process-inspection tools. It
+must come from standard input or Studio's input pane. It may directly
+initialize an ASV value; direct AV and SASV targets are rejected.
+
+Typed declarations convert input text to their declared type. A failed
+conversion produces `NONE`; it does not silently substitute zero or terminate
+the process.
+
+## Expressions And Operators
+
+From lower to higher precedence:
+
+```text
+== != > < >= <=
++ -
+* / %
+**
+unary - and not
+indexing and slicing
+```
+
+`**` is right-associative and requires an integer exponent. Arithmetic and
+ordered comparisons require matching numeric types; APL does not silently
+widen Int to Float. Chained comparisons are not syntax.
+
+`and` and `or` deliberately have no source-level precedence contract. Logical
+operands containing comparisons or other operations must be grouped with
+parentheses, and nested logical combinations must use parentheses to state
+their evaluation order explicitly:
+
+```apl
+(x < 4) and (y != 0)
+((x < 4) and (y != 0)) or (ready)
+```
+
+Code must not depend on an implicit choice between `and` and `or`.
+
+Integer overflow and division or remainder by zero are runtime errors.
+Assignment operators are `=`, `+=`, `-=`, `*=`, `/=`, and `%=`. Statement-form
+`name++` and `name--` add or subtract one.
+
+## Lists, Indexes, And Slices
+
+Lists may contain mixed values and nested lists:
+
+```apl
+List values = [1, "two", [3, 4]]
+VTime first = values[0]
+VTime last = values[-1]
+VTime head = values[:2]
+VTime reversed = values[::-1]
+```
+
+Indexes and slice bounds are integers. Negative indexes and negative steps are
+implemented; a zero slice step is a runtime error. Indexing and slicing also
+work on strings where the corresponding operation is valid.
+
+An element literal may explicitly raise its protection:
+
+```apl
+List protected = [1:SASV, "public", "hidden":ASV]
+```
+
+Use `std::get(list, index)` to read dynamically, `std::add(name, value)` to
+append, `std::set(name, index, value)` to replace, and `std::pop(name)` to
+remove and return the final element. `add` and `set` are statement operations
+and require a named mutable target. List aliases retain protection changes;
+putting a secret value into a public-looking alias cannot make it public.
 
 ## Control Flow
 

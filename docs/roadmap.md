@@ -60,6 +60,12 @@ namespace, description, and transitive dependencies. An ordered multi-source
 or native-load manifest plus exported constructions remains package-format
 work. Source order does not control dependency resolution.
 
+The low-level `emit-module` command already writes one `.aplmod`. The intended
+user CLI adds `apl build-lib <source>` and `apl --check-lib <source>` (exact
+spelling may be finalized with the multi-source manifest). Those commands must
+discover metadata, resolve dependencies and exports, choose the default output
+name, and report library diagnostics without exposing module-emitter details.
+
 The package manager follows the network library rather than preceding it. It
 should be written primarily in APL and use the same TOML metadata consumed by
 the compiler. The installer-owned library directory is immutable; user

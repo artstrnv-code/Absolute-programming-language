@@ -17,10 +17,19 @@ directory and does not require administrator rights:
 - compiled standard `.aplmod` libraries and their APL sources;
 - examples, focused documentation, and the MIT license;
 - Start menu shortcuts and an `.apl` Open With registration;
-- an optional user `PATH` entry for the CLI.
+- a user `PATH` entry for the CLI, selected by default and optional during
+  installation.
 
 The uninstaller removes the registered file type, shortcuts, installed files,
 and only the exact PATH entry it added.
+
+Open a new terminal after installation. `apl` can then be called from any
+directory, for example:
+
+```powershell
+apl --check D:\projects\hello.apl
+apl run D:\projects\hello.apl
+```
 
 The installed tree carries `apl-distribution.toml`. Tools and future package
 management code must use that manifest instead of guessing repository paths.

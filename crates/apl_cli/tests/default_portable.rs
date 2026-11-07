@@ -299,6 +299,28 @@ fn default_check_and_run_use_the_portable_apl_pipeline() {
 }
 
 #[test]
+fn check_flag_uses_the_portable_apl_pipeline() {
+    let project = TestProject::new();
+    let main = project.path("check_flag.apl");
+    fs::write(
+        &main,
+        "AVInt std::main() {\n  out \"checked\"\n  return 0\n}",
+    )
+    .unwrap();
+
+    let checked = apl().arg("--check").arg(&main).output().unwrap();
+    assert!(
+        checked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(checked.stdout).unwrap(),
+        "ok: portable linked program\n"
+    );
+}
+
+#[test]
 fn portable_match_while_handlers_and_error_return_are_end_to_end() {
     let project = TestProject::new();
     let main = project.path("control.apl");

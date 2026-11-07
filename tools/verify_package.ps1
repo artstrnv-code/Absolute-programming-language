@@ -141,7 +141,7 @@ $cli = Join-Path $package "apl.exe"
 $example = Join-Path $package "examples\std_main.apl"
 Push-Location $package
 try {
-    $checkOutput = (& $cli check $example 2>&1 | Out-String).Trim()
+    $checkOutput = (& $cli --check $example 2>&1 | Out-String).Trim()
     if ($LASTEXITCODE -ne 0) {
         throw "Packaged APL CLI check failed: $checkOutput"
     }
